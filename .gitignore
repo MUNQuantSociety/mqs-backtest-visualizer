@@ -1,13 +1,12 @@
 # ---------------------------------------------------------------------------
 # Secrets & environment
 # ---------------------------------------------------------------------------
-# NOTE: .env.example is ignored here by explicit project decision. Most projects
-# commit it so new contributors get the template on clone. If you later want it
-# tracked, drop the line below or run: git add -f .env.example
+# Real secrets never get committed. The annotated template does — it ships with
+# every clone so a new contributor can `cp .env.example .env` and start.
+# The negation must come after `.env.*`, which would otherwise match it.
 .env
 .env.*
-.env.example
-!.env.sample
+!.env.example
 
 # ---------------------------------------------------------------------------
 # Virtual environments
