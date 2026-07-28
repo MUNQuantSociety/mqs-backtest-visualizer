@@ -308,9 +308,10 @@ annotated template — copy it to `.env` and fill in real values:
 cp .env.example .env
 ```
 
-It covers application settings, the application database, the read-only market
-data connection, Supabase/JWT verification, the job queue, artifact storage,
-engine defaults, and per-user limits.
+It covers application settings, the read-only market data connection,
+Supabase/JWT verification, per-user limits, and external data API keys. It is
+deliberately minimal — variables get added as the features that need them land,
+so the template always reflects what the code actually reads.
 
 Two rules worth stating up front:
 
@@ -320,10 +321,9 @@ Two rules worth stating up front:
 - **The market data connection is read-only.** Grant `SELECT` and nothing else.
   The platform simulates; it does not trade.
 
-> `.env`, `.env.example`, and `venv/` are all gitignored per project decision.
-> That means `.env.example` will not arrive with a fresh clone — share it
-> directly, or drop that line from `.gitignore` and commit it, which is the more
-> common practice for a template file.
+`.env` and `venv/` are gitignored; `.env.example` is tracked, so the template
+arrives with every clone. It holds placeholders only — never paste a real
+credential into it.
 
 ---
 
