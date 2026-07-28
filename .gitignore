@@ -1,0 +1,90 @@
+# ---------------------------------------------------------------------------
+# Secrets & environment
+# ---------------------------------------------------------------------------
+# NOTE: .env.example is ignored here by explicit project decision. Most projects
+# commit it so new contributors get the template on clone. If you later want it
+# tracked, drop the line below or run: git add -f .env.example
+.env
+.env.*
+.env.example
+!.env.sample
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+venv/
+.venv/
+env/
+ENV/
+MQS/
+mqs/
+.python-version
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+
+# ---------------------------------------------------------------------------
+# Testing & coverage
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# Backtest artifacts & local data
+# ---------------------------------------------------------------------------
+# Local artifact output. Created at runtime — not committed.
+.artifacts/
+*.csv
+*.parquet
+*.xlsx
+# ...but test fixtures are meant to be committed.
+!tests/fixtures/**/*.csv
+!tests/fixtures/**/*.parquet
+logs/
+*.log
+
+# ---------------------------------------------------------------------------
+# Editors & OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# Notebooks
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb
