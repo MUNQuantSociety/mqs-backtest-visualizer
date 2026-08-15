@@ -327,9 +327,58 @@ credential into it.
 
 ---
 
+## API endpoints
+
+Everything is mounted under `/api`, which is what the frontend's
+`VITE_API_BASE_URL` resolves to. Vite proxies that prefix to this server in
+development, so the browser sees a same-origin URL and CORS is never exercised.
+
+Responses are **camelCase** and the client parses each one with Zod. A renamed
+or snake_case key is a hard failure in the browser, not a cosmetic difference —
+`tests/unit/test_api_contract.py` guards the shapes.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/api/health` | Liveness. No database, no engine, no I/O. |
+| `GET` | `/api/backtests` | Paginated. Filters: `search`, `status`, `strategyId`, `page`, `pageSize` |
+| `GET` | `/api/backtests/{id}` | Detail — metrics, equity curve, trades |
+| `DELETE` | `/api/backtests/{id}` | `204`, or `404` if unknown |
+| `GET` | `/api/strategies` | Catalogue with per-strategy run aggregates |
+| `POST` | `/api/strategies` | Accepts source, stores a draft. Never executes it. |
+| `GET` | `/api/live/portfolios` | Live portfolio list |
+| `GET` | `/api/live/portfolios/{id}` | Detail — config, positions |
+| `GET` | `/api/live/portfolios/{id}/equity` | `days` |
+| `GET` | `/api/live/portfolios/{id}/composition` | `days`. Column-wise series. |
+| `GET` | `/api/live/portfolios/{id}/executions` | `ticker`, `page`, `pageSize` |
+| `GET` | `/api/live/portfolios/{id}/correlations` | Full square matrix |
+| `GET` | `/api/live/system/status` | Per-service health |
+| `GET` | `/api/live/system/logs` | `size`. Tail, not archive. |
+
+Interactive docs at `http://localhost:8000/docs` once the server is running.
+
+**These endpoints serve generated sample data, not real results.** `src/services/sample_data.py`
+stands in for the database so the frontend can develop against real HTTP —
+real status codes, real serialisation, real error paths — before any table
+exists. Routes call it through functions, so swapping in `src/repositories/`
+later touches nothing else. Data is deterministic from a fixed seed: a chart
+that changed on every refresh would make a backend bug indistinguishable from
+noise.
+
+---
+
 ## Getting started
 
-Nothing runs yet — this is a scaffold. Once implementation begins:
+```bash
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn server:app --reload --port 8000
+```
+
+Then start the frontend in its own repo (`npm run dev`). It proxies `/api` to
+port 8000, so both must be running to see data.
+
+Once the rest of the implementation begins:
 
 ```bash
 python -m venv venv
