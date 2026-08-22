@@ -1,31 +1,86 @@
 # Backend Build Plan — Backtest Visualizer
 
-**Session scope:** backend only. Real API endpoints, a real database, and the
-MQSMaster backtest engine adapted to run inside this application. Auth is
-explicitly out of scope (handled in a parallel session — Supabase + OAuth, not
-yet committed); everything here leaves clean seams for it to plug into.
-
-**Source of truth for the contract:** `Backtest_Visualiser_FE/src/features/*/types.ts`
-(Zod schemas) and the `*-api.ts` modules (endpoints called). The FE parses every
-response; a wrong key name is a hard runtime failure in the browser. The
-existing `tests/unit/test_api_contract.py` guards this and must stay green
-throughout.
+**This document is the work order for building the backend.** It is written to
+be executed task-by-task by a model (or human) with no other context. Read
+section 0 before writing any code. Each task states its goal, why it exists in
+the bigger picture, the exact files it touches, and a concrete acceptance check.
 
 ---
 
-## 1. Where things stand
+## 0. Ground rules for the implementing model
+
+These exist to prevent guessing. Violating any of them produces code that
+looks right and fails in the browser or against the production database.
+
+1. **The frontend contract is law, and it lives in another repo.** Before
+   creating or changing any response field, open the matching Zod schema in
+   `C:/Users/user/OneDrive/Desktop/Backtest_Visualiser_FE/src/features/<feature>/types.ts`
+   and copy the field names exactly. Every response key is **camelCase**. The
+   FE parses every payload; an invented or renamed key is a runtime failure in
+   the browser, not a style issue. Do not invent fields the FE does not read.
+2. **`tests/unit/test_api_contract.py` must pass after every task.** Run
+   `venv/Scripts/python.exe -m pytest -q`. If a task legitimately changes
+   behavior (e.g. list becomes DB-backed and empty), adjust the test in the
+   same commit and say so in the commit message.
+3. **The database is the production MQS trading database.** Verified facts are
+   in section 2 — trust them over any assumption. The app may **read**
+   `public.market_data` and **own** everything under the `app` schema. It must
+   never read or write `positions_book`, `cash_equity_book`, `pnl_book`,
+   `risk_book`, `portfolio_weights`, `trade_execution_logs`, `news_sentiment`,
+   `rbp_forecasts`, or `user_creds`. The credentials in `.env` are admin-level,
+   so nothing enforces this except this rule.
+4. **Never print, log, or commit credentials.** `.env` is gitignored; keep it
+   that way. Config is read only via `src/core/config.py`.
+5. **When reality disagrees with this plan, reality wins** — then update this
+   file in the same commit so the next session inherits the correction.
+6. **MQSMaster is read-only reference material.** Copy from
+   `C:/Users/user/OneDrive/Desktop/MQSMaster`, never modify it, never import
+   from it at runtime. Everything the engine needs gets vendored into this
+   repo (task 3).
+7. **Do not touch the `/live/*` routes** (`portfolios.py`, `system.py`) or
+   their sample data — they describe the live trading system, which is out of
+   scope. They keep serving generated sample data.
+8. **Auth is out of scope.** A parallel session builds Supabase OAuth.
+   Leave the seams described in task 2 (`owner_id` column, `for_user()`
+   repository filter) and add nothing else — no JWT parsing, no login routes.
+9. **Commit after each task** to `dev`, message format in the task. Do not
+   batch tasks into one commit.
+10. **Engine version pins are hard requirements:** `pandas==2.2.2`,
+    `numpy<=1.26.4`. The engine's math was validated against these; do not
+    upgrade them.
+
+### The bigger picture (why any of this exists)
+
+MQS (a student quant society) has a trading system, `MQSMaster`, containing a
+proven backtest engine — but running it requires cloning that repo, editing
+constants in `main_backtest.py`, and reading CSVs off disk. This project turns
+that into a full-stack web app for students: pick a strategy, set dates and
+capital, click **Run Backtest**, watch progress, explore the results as charts
+and tables. A React frontend (separate repo, separate session) renders it; this
+repo is the entire backend: HTTP API, database persistence, and the engine
+itself, adapted to run as a service instead of a CLI.
+
+The centerpiece is **`POST /backtests`** — the Run Backtest endpoint. Every
+task below either builds toward it, persists its output, or exposes its
+results. When in doubt about scope, ask: does this help a student submit a run
+and see its results? If no, it is not this session's work.
+
+---
+
+## 1. Current state (verified 2026-08-21)
 
 | Piece | State |
 |---|---|
-| 13 routes under `/api` | Built, serving deterministic **sample data** |
-| Pydantic schemas mirroring the FE Zod types | Built (`src/schemas/`) |
-| Contract tests | 18 passing |
-| Database | None |
-| Engine | Untouched, lives in `MQSMaster/src/backtest` |
-| Run submission (`POST /backtests`) | Does not exist on either side yet |
+| 13 routes under `/api` (`src/api/routes/`) | Built, all serving deterministic **sample data** from `src/services/sample_data.py` |
+| Pydantic schemas mirroring FE Zod types (`src/schemas/`) | Built and correct |
+| Contract tests | 18 passing (`tests/unit/test_api_contract.py`) |
+| DB connectivity | **Verified working** (section 2) |
+| Engine | Not yet vendored; lives in MQSMaster |
+| `POST /backtests` (Run Backtest) | **Does not exist yet — the point of this plan** |
+| Auth | Out of scope (parallel session, Supabase OAuth) |
 
-The FE calls exactly these endpoints today (verified by grep over its
-`*-api.ts` modules — unchanged since the routes were built):
+Endpoints the FE calls today (verified by grep over its `*-api.ts`; the FE has
+no run-submission call yet — it will be built against task 7's endpoint):
 
 ```
 GET    /backtests                 GET /live/portfolios
@@ -37,238 +92,470 @@ GET    /live/system/status        GET /live/portfolios/{id}/correlations
 GET    /live/system/logs
 ```
 
-**Scope decision:** the `/live/*` group describes the *live trading system*
-(MQS Master views). Live trading is not part of the backtest application —
-those endpoints stay on generated sample data this session, clearly marked.
-The backtest group (`/backtests`, `/strategies`) becomes real end to end.
+---
+
+## 2. Verified database facts (do not re-derive; connection already proven)
+
+Connected 2026-08-21 with the credentials now in `.env` (`POSTGRES_*` keys,
+`sslmode=prefer` — the server **rejects** `require`):
+
+- PostgreSQL **17.6**, database `mqsdb`, schemas `public` and `cair`.
+- `public` tables: `market_data`, `cash_equity_book`, `news_sentiment`,
+  `pnl_book`, `portfolio_weights`, `positions_book`, `rbp_forecasts`,
+  `risk_book`, `trade_execution_logs`, `user_creds`.
+- `market_data` columns (from MQSMaster `schemaDefinitions.py`, confirmed
+  live): `id serial PK · ticker varchar(10) · timestamp timestamptz ·
+  date date · exchange varchar(50) · open_price numeric · high_price numeric ·
+  low_price numeric · close_price numeric · volume bigint ·
+  avg_sentiment numeric · created_at`.
+- The engine's historical query (`MQSMaster/src/backtest/utils.py`) filters to
+  NY trading hours (`09:30–16:00 America/New_York`) and aggregates to daily
+  bars. All engine timestamps are `America/New_York`.
+- The engine reaches the DB through **one interface**:
+  `portfolio.db.execute_query(sql, params, fetch=True)` returning
+  `{"status": "success"|"error", "data": [dict, ...]}` (dict rows). That is
+  the only surface our adapter must reproduce (task 3).
+- Coverage caveat: ticker/date coverage of `market_data` was still being
+  measured when this was written. **Task 1 includes measuring it** and
+  recording the result in this file. The engine's parquet cache layer
+  (`backfill_cache/cache.py`) already handles partially-missing DB data by
+  querying only missing ranges; a run over a window with no data must fail
+  loudly (task 4), not return an empty success.
+
+The app's own tables live in a new **`app` schema** in this same database —
+one instance, clean namespace separation. This mirrors the platform plan in
+`MQSMaster/docs/platform/BACKTEST_PLATFORM_PLAN.md` (same-instance,
+grants-not-servers).
 
 ---
 
-## 2. Target architecture
+## 3. Target architecture
 
 ```
-                 POST /backtests
+                 POST /backtests  (Run Backtest)
 Frontend ──────────────────────────► FastAPI (src/api)
-   │                                    │ validate params against strategy schema
-   │ poll GET /backtests/{id}           │ insert run row (status=queued)
+   │                                    │ validate params against strategy
+   │ poll GET /backtests/{id}           │ registry → insert run row
+   │ until status is terminal           │ (status=queued) → submit job → 202
    │                                    ▼
-   │                              Job manager (src/workers)
-   │                              ProcessPoolExecutor, N=2
-   │                                    │ status=running, progress updates
+   │                              Job manager (src/workers/job_manager.py)
+   │                              ProcessPoolExecutor, max_workers=2
+   │                                    │ claim run (queued→running),
+   │                                    │ progress writes ~1/sec
    │                                    ▼
-   │                              engine/ (vendored from MQSMaster)
-   │                              BacktestEngine + BacktestRunner
-   │                                    │ market data: parquet cache (+ optional
-   │                                    │ MQS Postgres for missing ranges)
+   │                              engine/  (vendored from MQSMaster)
+   │                              run_single() → BacktestRunner event loop
+   │                                    │ market data: public.market_data
+   │                                    │ via db adapter + parquet cache
    │                                    ▼
-   └── reads results ◄──────────  PostgreSQL (SQLAlchemy)
-                                  runs / metrics / equity points / trades
-                                  raw CSVs → .artifacts/<run_id>/
+   └── reads results ◄──────────  PostgreSQL  (one instance)
+                                    public.market_data   ← read-only
+                                    app.*                ← this app owns
+                                  raw CSVs → .artifacts/<run_id>/  (gitignored)
 ```
 
-Request flow stays layered: **routes → services → repositories → DB**. Routes
-never touch SQLAlchemy directly; `sample_data.py` gets swapped out behind the
-same function seam it was built for.
+Layering rule (already established in this codebase): **routes → services →
+repositories → DB**. Routes never import SQLAlchemy. `sample_data.py` is
+swapped out behind the same function seam it was built for; it keeps serving
+`/live/*` indefinitely.
 
-### Why a process pool and not inline requests
-
-An event-mode backtest steps timestamp-by-timestamp — minutes of single-core,
-GIL-holding work. Run inline it would freeze every other request; run in a
-thread it still starves the event loop. `ProcessPoolExecutor(max_workers=2)`
-keeps the API responsive, gives natural queueing, and needs zero infrastructure
-(no Redis/SQS — right-sized for a club deployment). The FE already polls:
-`BacktestStatus` includes `queued | running`, and `useBacktest` refetches until
-terminal.
+**Why a process pool:** an event-mode backtest is minutes of GIL-holding,
+single-core CPU. Inline would freeze the API; a thread would starve the event
+loop. `ProcessPoolExecutor(max_workers=2)` gives queueing and API
+responsiveness with zero extra infrastructure. The FE polls
+`GET /backtests/{id}` (its `useBacktest` hook already refetches while
+non-terminal) — no SSE/websockets this phase.
 
 ---
 
-## 3. Database
+## 4. Task list
 
-**Engine:** PostgreSQL. **Recommendation: the Supabase project's Postgres** —
-auth already lives there, one managed instance, nothing to install, and the
-`owner_id` link to `auth.users` becomes trivial when auth lands. Standard
-`DATABASE_URL` in `.env` means a local Postgres or Docker service works
-identically if the club prefers. **SQLAlchemy 2.0**, async engine in the API,
-sync engine in the worker processes (workers are synchronous by nature).
-
-Schema (`app` schema, created via `create_all` at startup for now — Alembic
-gets added when the schema stabilizes, per the earlier decision to drop the
-migrations folder):
-
-```
-strategies            key PK · name · class_path · description · tags[]
-                      universe[] · param_specs jsonb · enabled · status
-backtest_runs         id uuid PK · name · strategy_key FK · status
-                      params jsonb · start_date · end_date · timeframe
-                      symbol (display label: first ticker or "MULTI")
-                      initial_capital · final_equity · total_return
-                      sharpe · max_drawdown       <- denormalized for list view
-                      progress_pct · error_message · engine_version
-                      owner_id uuid NULL          <- ready for auth, unused now
-                      created_at · started_at · finished_at
-run_metrics           run_id PK/FK · total_return · cagr · sharpe · sortino
-                      max_drawdown · volatility · win_rate · profit_factor
-                      total_trades · extra jsonb
-run_equity_points     run_id FK · seq · date · equity · benchmark
-run_trades            run_id FK · seq · symbol · side · entry/exit date+price
-                      quantity · pnl · return_pct · fees
-strategy_drafts       id · name · description · source text · filename
-                      status=draft · created_at        <- POST /strategies target
-```
-
-Design rules carried over from the platform plan: wide columns for the metrics
-the UI sorts on, `jsonb` for the long tail; `engine_version` recorded on every
-run (a result is uninterpretable without the code that produced it); index on
-`(status)` for the reconciler and `(created_at DESC)` for the list.
+Execute in order. Every task ends with: run
+`venv/Scripts/python.exe -m pytest -q` (all green), commit to `dev`.
 
 ---
 
-## 4. Engine adaptation (the core of the session)
+### Task 1 — Settings + database layer + `app` schema
 
-### 4.1 How it comes in
+**Goal:** the app connects to Postgres from typed settings; `app` schema and
+tables exist; strategy registry seeded.
 
-**Vendor the needed modules into `engine/`** (copy, not pip-install): the
-engine must be modified (progress, cancellation, error propagation) and this
-repo owns the fork. Provenance pinned by recording the MQSMaster commit SHA in
-`engine/VENDORED_FROM` and on every run row.
+**Bigger picture:** every later task persists into or reads from these tables;
+the run pipeline (task 6) claims and updates rows here.
 
-What gets vendored, mapped to the folders that already exist:
+**Files:**
+- `src/core/config.py` — extend the existing `Settings` with `POSTGRES_*`
+  fields (host, port, db, user, password, sslmode) loaded via
+  `python-dotenv`; build two SQLAlchemy URLs with `sqlalchemy.engine.URL.create`
+  (never string-format the password — it contains URL-special characters):
+  `database_url_async` (`postgresql+asyncpg`) and `database_url_sync`
+  (`postgresql+psycopg2`).
+- `src/db/engine.py` — async engine + session factory for the API; sync
+  engine factory for workers. `pool_pre_ping=True`, small pool (5).
+- `src/models/` — SQLAlchemy 2.0 `DeclarativeBase` models, all with
+  `__table_args__ = {"schema": "app"}`:
 
-| From MQSMaster | To | Why |
-|---|---|---|
-| `src/backtest/backtest_engine.py`, `runner.py`, `executor.py`, `cost_model.py`, `utils.py` | `engine/core/` | Simulation kernel |
-| `src/backtest/reporting.py`, `vectorized_backtest.py`, `vector_strategy_adapters.py`, `cscv.py`, `purged_kfold.py` | `engine/analytics/` | Metrics + fast mode |
-| `src/backtest/data/backfill_cache/cache.py` | `engine/data/` | Parquet cache layer |
-| `src/portfolios/portfolio_BASE`, `portfolio_1..3`, `portfolio_dummy`, `order_interface.py`, `portfolio_interface.py`, `market_data_api.py`, `toolkit.py`, `common.py` | `engine/strategies/` | Strategy classes + the `StrategyContext` seam |
-| `src/portfolios/indicators/*` | `engine/indicators/` | Loaded by name via importlib |
+  | Model | Columns |
+  |---|---|
+  | `Strategy` | `key` text PK · `name` · `class_path` · `description` · `tags` JSONB · `universe` JSONB · `param_specs` JSONB · `status` text · `enabled` bool |
+  | `BacktestRun` | `id` UUID PK default uuid4 · `name` · `strategy_key` FK · `status` text (`queued/running/completed/failed`) · `params` JSONB · `start_date` date · `end_date` date · `timeframe` text default `1d` · `symbol` text · `initial_capital` numeric · `final_equity` numeric nullable · `total_return` nullable · `sharpe` nullable · `max_drawdown` nullable · `progress_pct` smallint default 0 · `error_message` text nullable · `engine_version` text · `owner_id` UUID nullable · `cancel_requested` bool default false · `created_at` / `started_at` / `finished_at` timestamptz |
+  | `RunMetrics` | `run_id` UUID PK/FK · `total_return` · `cagr` · `sharpe` · `sortino` · `max_drawdown` · `volatility` · `win_rate` · `profit_factor` · `total_trades` int · `extra` JSONB |
+  | `RunEquityPoint` | `run_id` FK + `seq` int (composite PK) · `date` date · `equity` numeric · `benchmark` numeric nullable |
+  | `RunTrade` | `run_id` FK + `seq` int (composite PK) · `symbol` · `side` text · `entry_date` · `exit_date` nullable · `entry_price` · `exit_price` nullable · `quantity` · `pnl` · `return_pct` · `fees` |
+  | `StrategyDraft` | `id` UUID PK · `name` · `description` · `source` text · `filename` nullable · `status` default `draft` · `created_at` |
 
-**v1 strategy set: portfolios 1, 2, 3 (+ dummy for tests).** Portfolios 4-8
-drag heavier dependency chains (RBP model, screener, NLP feeds); they join once
-the pipeline works. The registry is data-driven so adding one is a row + a
-vendored folder, not a code change.
+  Indexes: `backtest_runs(created_at desc)`, `backtest_runs(status)`.
+- `src/db/init.py` — `CREATE SCHEMA IF NOT EXISTS app` then
+  `Base.metadata.create_all` (sync engine; called from a FastAPI lifespan
+  hook and importable by scripts/tests). No Alembic yet — schema is young;
+  add it when it stabilizes.
+- `scripts/seed_strategies.py` — upsert 4 registry rows: `portfolio_1`
+  (VolMomentum), `portfolio_2` (MomentumStrategy), `portfolio_3`
+  (RegimeAdaptiveStrategy), `portfolio_dummy` (CrossoverRmiStrategy, marked
+  `enabled=false` — test-only). `param_specs` follow the FE `ParameterSpec`
+  shape exactly (`key/label/type/default/min/max`); derive sensible specs from
+  each portfolio's `config.json` in MQSMaster (`LOOKBACK_DAYS`, capital etc.).
+  `universe` = the config's `TICKERS`.
+- Also in this task: measure `market_data` coverage (distinct tickers,
+  min/max date per seeded universe ticker) with a short script, and **record
+  the numbers in section 2 of this file**.
+- `requirements.txt` add: `sqlalchemy>=2.0`, `asyncpg`, `psycopg2-binary`,
+  `python-dotenv`, `pandas==2.2.2`, `numpy<=1.26.4`, `pytz`.
 
-Import rewrite: the vendored tree uses `engine.*` absolute imports only — kills
-MQSMaster's dual-import idiom, which exists for a repo layout we do not have.
+**Accept:** `python scripts/seed_strategies.py` exits 0; a psql-free check
+script prints the 4 strategy rows; app boots with lifespan creating schema;
+pytest green.
 
-### 4.2 The five refactors (each small, each load-bearing)
-
-1. **Data access.** `utils.fetch_historical_data` is already cache-first
-   (parquet per ticker, DB only for missing ranges). Formalize the fallback as
-   a `MarketDataSource` protocol in `engine/contracts/`:
-   - `ParquetOnlySource` (v1 default): serves from the cache; a missing
-     ticker/range **fails the run with an actionable message** ("no data for
-     NVDA 2024-01..2024-03") instead of silently proceeding.
-   - `MQSPostgresSource` (optional): wraps the read-only MQS `market_data`
-     connection when creds exist in `.env`, and back-fills the cache exactly
-     as today.
-
-   Seed data: `scripts/seed_market_data.py` copies the 13 parquet files
-   (AAPL, MSFT, NVDA, TSLA, AMZN, GLD, TLT, JPM, CAT, UNH, WMT, XOM, _VIX)
-   from the MQSMaster cache into this repo's gitignored `data/` dir.
-2. **Results as data.** `BacktestEngine.run()` returns only a trade-log list;
-   metrics exist solely as CSVs. New `engine/contracts/RunResult`:
-   `status · metrics dict · equity_curve · fills · error`. Reporting still
-   writes its CSVs (to `.artifacts/<run_id>/` via the existing
-   `BACKTEST_OUTPUT_DIR` override) — but the numbers come back as objects and
-   land in Postgres.
-3. **Errors surface.** `run()` currently catches per-portfolio exceptions,
-   logs, and continues — a hosted API would report *succeeded with empty
-   results* for a crashed run. The single-portfolio entrypoint re-raises; the
-   worker marks the run `failed` with the message.
-4. **Progress + cancellation.** Replace the tqdm bar in `_run_event_loop` with
-   an injected `on_progress(pct, stage)` callback (worker throttles writes to
-   the run row, about 1/sec max). The same hook checks a cancel flag and raises
-   `RunCancelled` — cooperative cancellation, checked per timestamp group.
-   `DELETE /backtests/{id}` on a queued/running run sets the flag.
-5. **One job = one portfolio.** The ProcessPool fan-out in `main_backtest.py`
-   is a CLI concern and does not come over. The worker calls a new
-   `engine/run_single.py` entrypoint; parallelism belongs to the job manager.
-
-### 4.3 Contract friction to resolve (needs FE awareness)
-
-The FE `Trade` is a **round trip** (entry/exit, pnl, returnPct). The engine
-logs **fills** (one leg). The worker pairs fills FIFO per ticker into round
-trips at completion time; unclosed positions become open trades
-(`exitDate: null` — the Zod schema already allows it). Fills also persist raw
-in the artifacts CSV, so nothing is lost by the pairing.
-
-The FE summary has `symbol: string` (singular) — engine runs are multi-ticker
-portfolios. v1: `symbol` = the ticker for single-ticker runs, `"MULTI"`
-otherwise; the real ticker list rides in `parameters`. Flagged to the FE
-session as a schema evolution candidate (`symbols: string[]`).
+**Commit:** `Add database layer, app schema models, and strategy seed`
 
 ---
 
-## 5. New/changed endpoints
+### Task 2 — Repositories + flip the read endpoints to the DB
 
-Everything existing keeps its exact shape. New:
+**Goal:** `GET /strategies`, `GET /backtests`, `GET /backtests/{id}`,
+`DELETE /backtests/{id}`, `POST /strategies` read/write Postgres.
+`/live/*` untouched.
 
-```
-POST /backtests            202 {id}   body: { name, strategyKey, startDate,
-                                      endDate, initialCapital,
-                                      mode: "event"|"fast", params: {...} }
-                                      validated against the strategy's
-                                      param_specs
-DELETE /backtests/{id}     204        completed run -> delete rows + artifacts
-                                      queued/running -> cancel, then mark
-GET  /backtests/{id}       unchanged shape; status/progress now real
-                                      (FE polls this — no SSE this session)
-```
+**Bigger picture:** the FE stops seeing fiction for everything backtest-shaped;
+after task 6 writes real runs, they appear here with zero further changes.
 
-`GET /backtests`, `GET /backtests/{id}`, `GET /strategies` flip from
-`sample_data` to repositories. `POST /strategies` writes `strategy_drafts`
-(still stores source only — sandboxed execution remains out of scope, response
-keeps saying so).
+**Files:**
+- `src/repositories/strategies.py`, `src/repositories/runs.py` — async
+  SQLAlchemy. Runs repo exposes `list_runs(filters, page, page_size)`,
+  `get_run(id)` (joined-load metrics/equity/trades), `create_run(...)`,
+  `delete_run(id)`, `request_cancel(id)`, and a `for_user(owner_id)` filter
+  seam that currently no-ops (auth lands later).
+- `src/services/backtests.py`, `src/services/strategies.py` — translate ORM
+  rows into the **existing** Pydantic schemas (`src/schemas/`) — those match
+  the FE and do not change. Strategy aggregates (`runCount`, `bestSharpe`,
+  `bestReturn`, `lastRunAt`) computed with SQL aggregates in the repo, not
+  Python loops.
+- Routes: swap `sample_data` calls for service calls. `POST /strategies`
+  persists a `StrategyDraft` (keeps returning `status="draft"` + the message
+  that validation/execution is not built).
+- Tests: adjust contract tests where behavior legitimately changed (empty DB
+  → empty list is valid). Add repo tests behind a `db` pytest marker that
+  skip cleanly when the DB is unreachable.
 
-Status vocabulary: FE knows `queued|running|completed|failed`. Cancelled runs
-map to `failed` with `error_message="Cancelled by user"` until the FE adds the
-enum member (flagged below).
+**Accept:** with the seed applied, `GET /api/strategies` returns the 3 enabled
+strategies from Postgres; `GET /api/backtests` returns `[]` (no runs yet);
+pytest green.
+
+**Commit:** `Back strategies and runs endpoints with Postgres repositories`
 
 ---
 
-## 6. Order of work
+### Task 3 — Vendor the engine
 
-| # | Deliverable | Proof |
-|---|---|---|
-| 1 | DB layer: settings, async+sync engines, models, `create_all`, strategy seed | app boots, tables exist |
-| 2 | Vendor engine into `engine/`, import rewrite, parquet seed script | `engine/run_single.py` runs portfolio_dummy over cached data from a bare script |
-| 3 | Contracts: `MarketDataSource`, `RunResult`, progress/cancel hooks wired through runner | smoke test asserts progress ticks + clean error on missing data |
-| 4 | Job manager: pool, submit, claim (queued->running conditional update), heartbeat progress writes, startup reconciler (orphaned running->failed) | two concurrent runs queue correctly |
-| 5 | `POST /backtests` + params validation; worker persists metrics/equity/trades; FIFO pairing | run submitted via HTTP finishes and reads back |
-| 6 | Flip GET routes to repositories; `/live/*` stays sample | contract tests green untouched |
-| 7 | Tests: worker integration (tiny 5-day window), pairing unit tests, cancellation test | full suite green |
-| 8 | `.env.example`, README endpoint table, requirements pins (`pandas==2.2.2`, `numpy<=1.26.4` — engine hard requirement), compose Postgres service (optional) | fresh-clone instructions work |
+**Goal:** the MQSMaster backtest engine lives in this repo under `engine/`,
+imports rewritten, talking to our DB through a thin adapter — no MQSMaster
+import anywhere.
 
-Each step commits separately to `dev`.
+**Bigger picture:** this is the algorithm the whole product exists to expose.
+Vendoring (copy + own) is deliberate: task 4 modifies engine internals, and a
+pip dependency on the trading repo would make that impossible.
 
-## 7. Risks / gotchas
+**Copy map (from `C:/Users/user/OneDrive/Desktop/MQSMaster`):**
 
-- **Windows + ProcessPoolExecutor:** spawn (not fork) — pool created lazily
-  inside the app factory, guarded so uvicorn `--reload` does not double-spawn.
-- **Engine pins:** pandas `2.2.2` / numpy `<=1.26.4` are MQSMaster
-  requirements; both have cp312 wheels, but the pin goes in requirements.txt
-  verbatim so nobody upgrades the engine's math out from under it.
-- **OneDrive:** parquet + artifact IO under a synced folder is slow; artifacts
-  dir stays small and gitignored (`.artifacts/`).
-- **Timezones:** all engine timestamps are `America/New_York`; the API layer
-  emits ISO dates and never re-zones.
-- **Auth landing later:** `owner_id` column exists now; run queries get a
-  `for_user()` seam in the repository from day one, returning everything until
-  auth wires in.
+| From `src/...` | To |
+|---|---|
+| `backtest/backtest_engine.py`, `runner.py`, `executor.py`, `cost_model.py`, `utils.py` | `engine/core/` |
+| `backtest/reporting.py`, `vectorized_backtest.py`, `vector_strategy_adapters.py`, `cscv.py`, `purged_kfold.py` | `engine/analytics/` |
+| `backtest/data/backfill_cache/cache.py` | `engine/data/cache.py` |
+| `portfolios/portfolio_BASE/`, `portfolio_1/`, `portfolio_2/`, `portfolio_3/`, `portfolio_dummy/` (each: `strategy.py` + `config.json`) | `engine/strategies/<same name>/` |
+| `portfolios/order_interface.py`, `portfolio_interface.py`, `market_data_api.py`, `toolkit.py`, `common.py` | `engine/strategies/` |
+| `portfolios/indicators/*.py` | `engine/indicators/` |
 
-## 8. Needed from the FE session (forward this list)
+**Rules:**
+- Rewrite all imports to absolute `engine.*`. MQSMaster's
+  try-relative-then-absolute idiom dies here — single import path only.
+- Indicators load dynamically by name via importlib in `portfolio_BASE`
+  (`AddIndicator`/`RegisterIndicatorSet`) — update the module-path string it
+  uses to `engine.indicators`, and keep snake_case-file → CamelCase-class
+  naming (`relative_strength_index.py` → `RelativeStrengthIndex`).
+- Config loading: `BasePortfolio` finds `config.json` via
+  `inspect.getfile(cls)` sibling lookup. Copying each strategy folder whole
+  preserves this; do not refactor it.
+- `engine/data/db_adapter.py` — new, ~40 lines: class `EngineDBAdapter` with
+  `execute_query(sql, params=None, fetch=False)` returning
+  `{"status": "success", "data": [dict-rows]}` — the exact shape
+  `MQSDBConnector` returns and `engine/core/utils.py` expects. psycopg2 +
+  `RealDictCursor`, settings from `src/core/config.py`, autocommit reads.
+  Do **not** copy `MQSDBConnector` itself (pool + env coupling not needed).
+- Parquet cache path: point `engine/data/cache.py` at `<repo>/data/backfill_cache/`
+  (gitignored). Optional warm-start: `scripts/seed_market_cache.py` copies the
+  13 parquet files from `MQSMaster/src/backtest/data/backfill_cache/` if
+  present.
+- Record provenance: `engine/VENDORED_FROM` = MQSMaster commit SHA
+  (`git -C <MQSMaster> rev-parse HEAD` at copy time).
+- `engine/__init__.py` exposes `ENGINE_VERSION = "vendored-<shortsha>"`.
 
-1. **`POST /backtests` request shape** — proposed in section 5; confirm field
-   names (`strategyKey` vs `strategyId`) before they build the New Run form.
-2. **`cancelled` status** — add to `backtestStatusSchema` enum when convenient;
-   until then cancelled arrives as `failed` + message.
-3. **`symbol` vs multi-ticker** — see section 4.3; propose `symbols: string[]`
-   later.
-4. **Polling is the progress mechanism** — `GET /backtests/{id}` carries
-   `status` plus a new nullable `progressPct` field (additive; Zod ignores
-   unknown keys by default, but flag it so they can render a progress bar).
-5. **Supabase JWT claims** — which claim becomes `owner_id` (`sub` assumed);
-   backend already reserves the column.
-6. **Delete semantics** — DELETE on a running run cancels it (then it stays
-   listed as failed/cancelled) vs only deletable when terminal. Backend
-   implements cancel-then-mark; shout if the UX assumes hard delete.
+**Accept:** a throwaway script (`scripts/smoke_engine.py`, kept) instantiates
+`portfolio_dummy` with the adapter, calls `fetch_historical_data` for its
+tickers over a 10-trading-day window, prints a non-empty DataFrame shape from
+the real `market_data` table. No MQSMaster path in `sys.path`. pytest green.
+
+**Commit:** `Vendor MQSMaster backtest engine (SHA <shortsha>) with DB adapter`
+
+---
+
+### Task 4 — Engine contracts: results-as-data, errors, progress, cancel
+
+**Goal:** a single function
+`engine.run_single.run_single(request: RunRequest) -> RunResult` that runs ONE
+portfolio and returns structured data. No CSVs-as-API, no swallowed
+exceptions, no tqdm.
+
+**Bigger picture:** this is the seam the worker (task 6) calls. Everything the
+FE eventually renders — equity curve, trades, metrics, error banners, progress
+bars — originates from this function's return value.
+
+**Files:** `engine/contracts.py`, `engine/run_single.py`, surgical edits in
+`engine/core/backtest_engine.py`, `engine/core/runner.py`,
+`engine/analytics/reporting.py`.
+
+**Contracts (dataclasses):**
+```python
+RunRequest:  run_id · strategy_key · class_path · start_date · end_date
+             initial_capital · mode ("event"|"fast") · params dict
+             artifact_dir · on_progress: Callable[[int, str], None]
+             should_cancel: Callable[[], bool]
+RunResult:   status ("completed"|"failed"|"cancelled") · error: str|None
+             metrics: dict            # keys = RunMetrics columns
+             equity_curve: list[(date, equity, benchmark|None)]
+             fills: list[dict]        # raw executor fills
+             final_equity: float|None
+```
+
+**Engine edits (keep them minimal and marked with `# VISUALIZER:` comments):**
+1. `runner._run_event_loop`: replace tqdm with `on_progress(pct, stage)`
+   computed from timestamp index; call `should_cancel()` per timestamp group,
+   raise `RunCancelled(Exception)` when true.
+2. `backtest_engine.run()` swallows per-portfolio exceptions (logs + continues)
+   — in `run_single` path, re-raise instead. `RunResult.status="failed"`,
+   `error=str(exc)` with class name.
+3. Reporting: `aggregate_final_metrics` + rolling/monthly outputs still write
+   CSVs into `request.artifact_dir` (`BACKTEST_OUTPUT_DIR` env override
+   already exists — set it per-run), but the headline numbers now ALSO return
+   as the `metrics` dict. Map to FE names: `total_return, cagr, sharpe,
+   sortino, max_drawdown, volatility, win_rate, profit_factor, total_trades`
+   (win_rate/profit_factor/total_trades computed in task 6 from paired
+   trades if reporting lacks them — check `aggregate_final_metrics` first).
+4. Empty-data guard: if `fetch_historical_data` returns an empty frame,
+   raise `NoMarketData(tickers, start, end)` with the missing set in the
+   message — never return an empty success.
+5. `run_single` builds the portfolio class from `class_path`
+   (`importlib`), monkeypatches nothing globally, and is **process-safe**:
+   no module-level mutable state.
+
+**Accept:** `tests/unit/test_run_single.py` — runs `portfolio_dummy`, event
+mode, over a short window against the real DB (marked `db`): asserts
+status=completed, monotonic progress calls ending at 100, non-empty
+equity_curve, metrics keys complete; a second test over a window with a fake
+ticker asserts status=failed with the ticker named in `error`; a third
+cancels after the first progress call and asserts status=cancelled.
+
+**Commit:** `Add run_single engine entrypoint: structured results, progress, cancellation`
+
+---
+
+### Task 5 — Trade pairing (fills → round trips)
+
+**Goal:** pure function `pair_fills(fills) -> list[TradeRow]` turning the
+engine's one-leg fills into the FE's round-trip `Trade` shape.
+
+**Bigger picture:** the FE trade table and P&L histogram consume round trips
+(`entryDate/exitDate/pnl/returnPct`). The engine only knows fills. This module
+is the translation, and it must be boring and heavily tested because wrong
+P&L numbers destroy trust in every chart above them.
+
+**Files:** `src/services/trade_pairing.py`,
+`tests/unit/test_trade_pairing.py`.
+
+**Rules:** FIFO per ticker. BUY opens/extends long, SELL closes long first
+then opens short (and mirror). Partial fills split lots; each closed lot emits
+one round trip (`pnl = (exit-entry)*qty` sign-adjusted for shorts;
+`return_pct = pnl / (entry*qty)`; fees pro-rated if present). Open lots at end
+→ rows with `exit_date=None, exit_price=None`, pnl = unrealized 0 (leave 0,
+document). Deterministic `seq` ordering.
+
+**Accept:** unit tests cover: simple long round trip, partial close, short
+round trip, flip long→short in one fill, unclosed remainder. pytest green (no
+DB needed).
+
+**Commit:** `Add FIFO fill-pairing service with unit tests`
+
+---
+
+### Task 6 — Job manager + persistence of results
+
+**Goal:** submitted runs execute in worker processes; progress, results,
+errors, and cancellation all land in `app.*` tables.
+
+**Bigger picture:** this is the machinery behind the Run Backtest button —
+API stays responsive while the engine burns a core.
+
+**Files:** `src/workers/job_manager.py`, `src/workers/run_job.py`,
+`src/workers/reconciler.py`.
+
+**Requirements:**
+- `JobManager` singleton created lazily in the FastAPI lifespan (never at
+  import — Windows spawn + `uvicorn --reload` double-import would fork-bomb).
+  `ProcessPoolExecutor(max_workers=settings.max_concurrent_runs, default 2)`.
+- `run_job(run_id)` executes **in the worker process**: own sync DB
+  connection; claim with
+  `UPDATE app.backtest_runs SET status='running', started_at=now() WHERE id=%s AND status='queued'`
+  — zero rows affected → someone else claimed → return (idempotency).
+- `on_progress`: throttled UPDATE of `progress_pct` (≥1s between writes).
+  `should_cancel`: SELECT `cancel_requested` (same throttle).
+- On completion: single transaction writes `run_metrics`, bulk-insert
+  `run_equity_points` (`executemany`/`COPY`), paired `run_trades` (task 5),
+  updates run row (`status`, `final_equity`, denormalized `total_return`,
+  `sharpe`, `max_drawdown`, `finished_at`, `progress_pct=100`).
+- On exception: `status='failed'`, `error_message` (truncate 2000 chars).
+- Artifacts: engine CSVs land in `.artifacts/<run_id>/` (dir per run,
+  gitignored already via `.artifacts/`).
+- `reconciler.py`: at startup, any run stuck `running` (process died) →
+  `failed`, message "Interrupted by server restart". Called from lifespan.
+- Equity curve size guard: event mode records per poll-interval; downsample to
+  daily last-value before insert (FE charts are daily; keeps rows ≈ trading
+  days).
+
+**Accept:** integration test (marker `db`): create run row directly, invoke
+`run_job(run_id)` synchronously in-process, assert row transitions and
+metrics/equity/trades rows exist and are internally consistent
+(`final_equity == last equity point`). pytest green.
+
+**Commit:** `Add process-pool job manager persisting engine results`
+
+---
+
+### Task 7 — The Run Backtest endpoint
+
+**Goal:** `POST /api/backtests` — the reason this application exists.
+
+**Request** (Pydantic, camelCase aliases, mirrors what the FE New Run form
+will send — this shape is already communicated to the FE session):
+```json
+{
+  "name": "Regime adaptive — 2025 H1",
+  "strategyKey": "portfolio_3",
+  "startDate": "2025-01-02",
+  "endDate": "2025-06-30",
+  "initialCapital": 1000000,
+  "mode": "event",
+  "params": {"LOOKBACK_DAYS": 90}
+}
+```
+
+**Behavior:**
+1. Strategy must exist and be `enabled` → else 422 with plain message.
+2. Dates: ISO, `start < end`, window ≤ `MAX_BACKTEST_WINDOW_DAYS` (env,
+   default 1825), `initialCapital > 0`.
+3. `params` validated against the strategy's `param_specs` (unknown key →
+   422 naming it; type/min/max enforced). Params overlay the strategy's
+   `config.json` at run time (merge in `run_single`, task 4 already accepts
+   `params`).
+4. Insert run row: `status=queued`, `symbol` = single ticker if universe has
+   one else `"MULTI"`, `timeframe="1d"`, `engine_version` from
+   `engine.ENGINE_VERSION`.
+5. Submit to JobManager. **Submit failure must not lose the row** — wrap; on
+   executor rejection mark run `failed`.
+6. Return **`202`** with the full `BacktestSummary` payload (FE can insert it
+   into its list cache immediately).
+7. `DELETE /backtests/{id}`: terminal run → delete rows + artifact dir;
+   `queued/running` → set `cancel_requested=true`, return 204 (run becomes
+   `failed`/`cancelled` via engine hook). Document both in the docstring.
+8. `GET /backtests/{id}` response gains `progressPct` (int, nullable) — 
+   **additive** field; FE Zod ignores unknown keys, and the FE session is
+   notified to render it.
+
+**Accept:** contract tests: 202 + immediate GET shows `queued|running`;
+polling (short dummy run) reaches `completed` with metrics + equity + trades
+present; invalid strategy 422; bad params 422 naming the key; DELETE on
+running sets cancel and the run terminates; pytest green.
+
+**Commit:** `Add POST /backtests run submission with validation and 202 flow`
+
+---
+
+### Task 8 — Docs, env template, requirements truth
+
+**Goal:** a fresh clone + `.env` + two commands = working app. No tribal
+knowledge.
+
+- `.env.example`: exactly the `POSTGRES_*` block (no secrets), worker knobs
+  (`MAX_CONCURRENT_RUNS`, `MAX_BACKTEST_WINDOW_DAYS`), artifact dir.
+- `README.md`: update endpoint table (add POST /backtests + example curl from
+  task 7), replace the "sample data" paragraph — backtest group is now real,
+  `/live/*` remains sample and says so; run pipeline diagram; startup:
+  `uvicorn server:app --reload --port 8000` (reload is safe because the pool
+  is lifespan-lazy — state why).
+- `requirements.txt`: complete and pinned where it matters (`pandas==2.2.2`,
+  `numpy<=1.26.4`); everything imported must be listed.
+- Update **this file**: mark tasks done, record `market_data` coverage
+  numbers (task 1), note deviations.
+
+**Accept:** on a machine with only `.env`: `pip install -r requirements.txt`,
+`python scripts/seed_strategies.py`, `uvicorn server:app` → submit a dummy
+run via curl → completed with results. pytest green.
+
+**Commit:** `Document run pipeline; finalize env template and requirements`
+
+---
+
+## 5. Message for the FE session (forward verbatim)
+
+1. **`POST /api/backtests` exists after task 7** — request shape in section 4
+   task 7. Field names final: `strategyKey`, `startDate`, `endDate`,
+   `initialCapital`, `mode`, `params`. Returns `202` + full `BacktestSummary`.
+2. **Progress:** poll `GET /api/backtests/{id}`; new nullable `progressPct`
+   field (0–100). Render a bar when non-null and status=running.
+3. **Cancelled runs** surface as `status="failed"` with
+   `errorMessage="Cancelled by user"` until you add `cancelled` to
+   `backtestStatusSchema` — your call when.
+4. **`symbol`** on multi-ticker runs is the literal string `"MULTI"`; ticker
+   list rides in `parameters`. Propose `symbols: string[]` schema evolution
+   when convenient.
+5. **DELETE semantics:** on a running run = cancel (row remains, terminal);
+   on a terminal run = permanent delete. Confirm the UI matches.
+6. **Auth:** backend reserves `owner_id`; tell us which Supabase JWT claim to
+   trust (`sub` assumed) and the header format when your auth lands.
+
+## 6. Risks / gotchas (read before task 3 and 6)
+
+- **Windows spawn:** worker code must be importable without side effects;
+  everything under `if TYPE_CHECKING` / functions; pool built in lifespan only.
+- **OneDrive IO:** parquet cache + artifacts under a synced folder are slow;
+  keep artifact CSVs minimal (skip minute-by-minute file if
+  `_minute_resample_too_large` — reporting already guards this).
+- **DB is remote (university network):** engine backfill queries can be
+  minutes on first run per ticker set; the parquet cache makes rerun fast.
+  First-run slowness is expected — progress stage label should say
+  "loading data".
+- **`sslmode=require` fails** against this server; `prefer` works. Already
+  encoded in config default.
+- **pandas 2.2.2 API** — no `Series.map(na_action=...)` newness beyond 2.2,
+  no pandas 3 idioms. Engine code is validated on these pins.
+- **Do not "fix" engine math** while vendoring — copy faithfully, adapt only
+  the seams listed in task 4.
