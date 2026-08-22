@@ -13,11 +13,19 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.router import api_router
 from src.core.config import settings
+from src.workers.job_manager import application_lifespan
 
 app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
     description="Backend for the MQS backtest visualizer.",
+    # Schema creation belongs to startup, not to whichever request happens to
+    # arrive first: a CREATE SCHEMA / create_all against the production
+    # instance is not something to run on the request path. The composed
+    # lifespan also builds the worker pool, in that order — the reconciler it
+    # runs first has to find the tables it corrects. Without this, POST
+    # /backtests would insert rows nothing ever picks up.
+    lifespan=application_lifespan,
 )
 
 # Browsers block :5173 → :8000 unless the API allows the frontend origin.
