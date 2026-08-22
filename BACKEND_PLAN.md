@@ -43,7 +43,9 @@ looks right and fails in the browser or against the production database.
 8. **Auth is out of scope.** A parallel session builds Supabase OAuth.
    Leave the seams described in task 2 (`owner_id` column, `for_user()`
    repository filter) and add nothing else — no JWT parsing, no login routes.
-9. **Commit after each task** to `dev`, message format in the task. Do not
+9. **Commit after each task** — lane tasks (T1-T5, T8) to their lane branch,
+    convergence tasks (T0, T6+) to `dev`; protocol in the execution-graph
+    section. Message format in the task. Do not
    batch tasks into one commit.
 10. **Engine version pins are hard requirements:** `pandas==2.2.2`,
     `numpy<=1.26.4`. The engine's math was validated against these; do not
@@ -200,12 +202,121 @@ non-terminal) — no SSE/websockets this phase.
 
 ## 4. Task list
 
-Execute in order. Every task ends with: run
-`venv/Scripts/python.exe -m pytest -q` (all green), commit to `dev`.
+### Execution graph — what can run in parallel
+
+Tasks are numbered for reference, **not** for sequence. The true dependencies:
+
+```
+        ┌──────────────────────────────────────────────────────┐
+        │ T0  Bootstrap: config, requirements, conftest, env   │  ← first, alone,
+        └───────────────┬──────────────────────────────────────┘    on dev
+        ┌───────────────┼──────────────┬──────────────┐
+        ▼               ▼              ▼              ▼
+   LANE A          LANE B         LANE C         LANE D
+   T1 DB layer     T3 Vendor      T5 Trade       T8 Strategy
+   models/seed     engine         pairing        store
+        │               │         (pure fn)     (local impl)
+        ▼               ▼              │              │
+   T2 Repos +      T4 run_single      done           done
+   read routes     contracts
+        │               │
+        └───────┬───────┴──────────────┴──────────────┘
+                ▼   (needs T1 + T4 + T5; T2/T8 may still be in flight)
+           T6 Job manager + persistence
+                ▼   (needs T6 + T2)
+           T7 POST /backtests  ← Run Backtest live end-to-end
+                ▼   (needs T7 + T8 + T3's loader seam)
+           T9 User strategy pipeline
+                ▼
+           T10 Docs + plan truth-up
+```
+
+**Independent (start simultaneously after T0):** T1→T2, T3→T4, T5, T8 —
+four lanes, four parallel sessions max. T5 and T8 are small; one session can
+take both. **Convergence:** T6 is the merge point and must not start until
+T1, T4, T5 are merged to `dev`. T7 additionally waits for T2. T9 waits for
+T7 + T8. T10 is last.
+
+### Parallel execution protocol (multi-session, no collisions)
+
+- **Branch per lane off `dev`:** `feat/lane-a-db`, `feat/lane-b-engine`,
+  `feat/lane-c-pairing`, `feat/lane-d-store`. Convergence tasks (T6+) happen
+  directly on `dev` after merging every prerequisite lane. Merge lanes into
+  `dev` as soon as their final task passes — short-lived branches, no long
+  divergence. Before merging: `git pull origin dev && git rebase dev`, run
+  full pytest, then merge.
+- **File ownership is exclusive.** A lane touches only the files its tasks
+  name plus its own new test files. The matrix:
+
+  | Lane | Owns (writes) | Must not touch |
+  |---|---|---|
+  | A (T1→T2) | `src/db/`, `src/models/`, `src/repositories/`, `src/services/{backtests,strategies}.py`, `src/api/routes/{backtests,strategies}.py`, `scripts/seed_strategies.py`, `tests/unit/test_api_contract.py`, `tests/integration/test_repositories.py` | `engine/`, `src/workers/`, `src/integrations/` |
+  | B (T3→T4) | `engine/` (everything), `scripts/smoke_engine.py`, `scripts/seed_market_cache.py`, `tests/unit/test_run_single.py` | `src/` except nothing — zero `src/` edits |
+  | C (T5) | `src/services/trade_pairing.py`, `tests/unit/test_trade_pairing.py` | everything else |
+  | D (T8) | `src/integrations/strategy_store.py`, `tests/unit/test_strategy_store.py` | everything else |
+
+- **Frozen after T0 (edit only on `dev`, never in a lane):**
+  `src/core/config.py`, `requirements.txt`, `.env.example`, `pytest.ini`,
+  `tests/conftest.py`, `.gitignore`. T0 adds every setting, dependency, and
+  marker any task needs (list in T0). If a lane discovers a missing
+  setting/dependency, it commits that one change to `dev` directly and
+  rebases — never inside the lane branch.
+- **This plan file:** lanes do not edit it. Status updates happen on `dev`
+  at merge time (tick the task in section 1, note deviations).
+- **Contract tests:** only Lane A edits `test_api_contract.py` (its T2
+  legitimately changes list behavior). Lanes B/C/D add new test files only —
+  keeps pytest merges trivial.
+- Every lane, before its merge: full `venv/Scripts/python.exe -m pytest -q`
+  green (db-marked tests skip cleanly off-DB; that logic ships in T0).
 
 ---
 
-### Task 1 — Settings + database layer + `app` schema
+### Task 0 — Bootstrap (single session, on `dev`, before any lane forks)
+
+**Goal:** freeze every shared file so the four lanes never write the same
+path.
+
+**Bigger picture:** the only true couplers between lanes are settings,
+dependencies, and test scaffolding. Land them once, first, and the rest of
+the plan parallelizes cleanly.
+
+**Files (the complete frozen set):**
+- `src/core/config.py` — extend `Settings` with every knob the whole plan
+  needs (values from env via `python-dotenv`; do not read env anywhere else):
+  `postgres_host/port/db/user/password/sslmode` ·
+  `database_url_async` / `database_url_sync` properties built with
+  `sqlalchemy.engine.URL.create` (password has URL-special characters —
+  never string-format) · `max_concurrent_runs` (default 2) ·
+  `max_backtest_window_days` (1825) · `validation_timeout_seconds` (600) ·
+  `strategy_store_backend` (`local`) · `strategy_store_root`
+  (`.strategy_store`) · `artifact_dir` (`.artifacts`) ·
+  `market_cache_dir` (`data/backfill_cache`).
+- `requirements.txt` — full list, one pass: existing four +
+  `sqlalchemy>=2.0`, `asyncpg`, `psycopg2-binary`, `python-dotenv`,
+  `pandas==2.2.2`, `numpy<=1.26.4`, `pytz`, `greenlet` (SQLAlchemy async).
+- `.env.example` — sync new keys (no secrets).
+- `pytest.ini` — add `markers = db: needs the live MQS PostgreSQL`.
+- `tests/conftest.py` — session fixture: attempt a 3-second DB connect; if it
+  fails, auto-skip `db`-marked tests with a clear reason. Nothing else.
+- `.gitignore` — add `data/`, `.strategy_store/` (`.artifacts/` already
+  present).
+- `pip install -r requirements.txt` into `venv/` and verify
+  `import sqlalchemy, asyncpg, psycopg2, pandas, numpy` succeeds.
+
+**Accept:** app boots (`uvicorn server:app`), settings import cleanly, pytest
+green (18 existing tests untouched), fresh deps importable.
+
+**Commit (to `dev`):** `Bootstrap shared config, dependencies, and test scaffolding for parallel lanes`
+
+---
+
+Every task below ends the same way: full
+`venv/Scripts/python.exe -m pytest -q` green, then commit (lane branch for
+T1–T5/T8; `dev` for T6+), message as given.
+
+---
+
+### Task 1 (Lane A) — Database layer + `app` schema
 
 **Goal:** the app connects to Postgres from typed settings; `app` schema and
 tables exist; strategy registry seeded.
@@ -213,13 +324,10 @@ tables exist; strategy registry seeded.
 **Bigger picture:** every later task persists into or reads from these tables;
 the run pipeline (task 6) claims and updates rows here.
 
+Settings and dependencies already exist (T0) — this task adds no shared-file
+edits.
+
 **Files:**
-- `src/core/config.py` — extend the existing `Settings` with `POSTGRES_*`
-  fields (host, port, db, user, password, sslmode) loaded via
-  `python-dotenv`; build two SQLAlchemy URLs with `sqlalchemy.engine.URL.create`
-  (never string-format the password — it contains URL-special characters):
-  `database_url_async` (`postgresql+asyncpg`) and `database_url_sync`
-  (`postgresql+psycopg2`).
 - `src/db/engine.py` — async engine + session factory for the API; sync
   engine factory for workers. `pool_pre_ping=True`, small pool (5).
 - `src/models/` — SQLAlchemy 2.0 `DeclarativeBase` models, all with
@@ -260,8 +368,6 @@ the run pipeline (task 6) claims and updates rows here.
 - Also in this task: measure `market_data` coverage (distinct tickers,
   min/max date per seeded universe ticker) with a short script, and **record
   the numbers in section 2 of this file**.
-- `requirements.txt` add: `sqlalchemy>=2.0`, `asyncpg`, `psycopg2-binary`,
-  `python-dotenv`, `pandas==2.2.2`, `numpy<=1.26.4`, `pytz`.
 
 **Accept:** `python scripts/seed_strategies.py` exits 0; a psql-free check
 script prints the 4 strategy rows; app boots with lifespan creating schema;
@@ -271,7 +377,7 @@ pytest green.
 
 ---
 
-### Task 2 — Repositories + flip the read endpoints to the DB
+### Task 2 (Lane A) — Repositories + flip the read endpoints to the DB
 
 **Goal:** `GET /strategies`, `GET /backtests`, `GET /backtests/{id}`,
 `DELETE /backtests/{id}`, `POST /strategies` read/write Postgres.
@@ -310,7 +416,7 @@ pytest green.
 
 ---
 
-### Task 3 — Vendor the engine
+### Task 3 (Lane B) — Vendor the engine
 
 **Goal:** the MQSMaster backtest engine lives in this repo under `engine/`,
 imports rewritten, talking to our DB through a thin adapter — no MQSMaster
@@ -364,7 +470,7 @@ the real `market_data` table. No MQSMaster path in `sys.path`. pytest green.
 
 ---
 
-### Task 4 — Engine contracts: results-as-data, errors, progress, cancel
+### Task 4 (Lane B) — Engine contracts: results-as-data, errors, progress, cancel
 
 **Goal:** a single function
 `engine.run_single.run_single(request: RunRequest) -> RunResult` that runs ONE
@@ -426,7 +532,7 @@ cancels after the first progress call and asserts status=cancelled.
 
 ---
 
-### Task 5 — Trade pairing (fills → round trips)
+### Task 5 (Lane C) — Trade pairing (fills → round trips)
 
 **Goal:** pure function `pair_fills(fills) -> list[TradeRow]` turning the
 engine's one-leg fills into the FE's round-trip `Trade` shape.
@@ -454,7 +560,7 @@ DB needed).
 
 ---
 
-### Task 6 — Job manager + persistence of results
+### Task 6 (convergence: needs T1+T4+T5 merged) — Job manager + persistence
 
 **Goal:** submitted runs execute in worker processes; progress, results,
 errors, and cancellation all land in `app.*` tables.
@@ -497,7 +603,7 @@ metrics/equity/trades rows exist and are internally consistent
 
 ---
 
-### Task 7 — The Run Backtest endpoint
+### Task 7 (convergence: needs T6+T2) — The Run Backtest endpoint
 
 **Goal:** `POST /api/backtests` — the reason this application exists.
 
@@ -546,7 +652,7 @@ running sets cancel and the run terminates; pytest green.
 
 ---
 
-### Task 8 — Strategy store (S3-shaped, local for now)
+### Task 8 (Lane D) — Strategy store (S3-shaped, local for now)
 
 **Goal:** one small interface every strategy read/write goes through, so the
 later S3 move is a new implementation, not a refactor.
@@ -587,7 +693,7 @@ tmp dir; pytest green.
 
 ---
 
-### Task 9 — User strategy pipeline: upload → validation backtest → activate → rerun
+### Task 9 (convergence: needs T7+T8) — User strategy pipeline: upload → validate → activate → rerun
 
 **Goal:** the full loop the product owner described: upload a `.py`, the
 system proves it works by running a backtest, stores it, and from then on the
@@ -656,7 +762,7 @@ gets 422; a third POSTs source raising in `OnData` and sees
 
 ---
 
-### Task 10 — Docs, env template, requirements truth
+### Task 10 (last) — Docs, env template, requirements truth
 
 **Goal:** a fresh clone + `.env` + two commands = working app. No tribal
 knowledge.
