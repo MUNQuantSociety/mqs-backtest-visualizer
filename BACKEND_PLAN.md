@@ -48,6 +48,25 @@ looks right and fails in the browser or against the production database.
 10. **Engine version pins are hard requirements:** `pandas==2.2.2`,
     `numpy<=1.26.4`. The engine's math was validated against these; do not
     upgrade them.
+11. **Folder structure is fixed — place code by role, not convenience:**
+
+    | Location | Role | Hard rule |
+    |---|---|---|
+    | `src/api/routes/` | HTTP only: parse, authorize (later), delegate, serialize | Never imports SQLAlchemy or `engine.*` |
+    | `src/schemas/` | Pydantic request/response models (the FE contract) | camelCase serialization via `CamelModel`; mirrors FE Zod types |
+    | `src/services/` | Business logic | No SQL strings; talks to repositories and integrations |
+    | `src/repositories/` | All database access | Only place SQLAlchemy queries live; owner-scoping seam lives here |
+    | `src/models/` | SQLAlchemy ORM models (`app` schema) | No behavior beyond columns/relationships |
+    | `src/db/` | Engine/session plumbing, schema init | — |
+    | `src/workers/` | Job execution processes | Sync DB only; may import `engine.*` |
+    | `src/integrations/` | Adapters to external systems (strategy store/S3) | Vendor SDK types never leak past this layer |
+    | `src/core/` | Settings, cross-cutting infra | Only module reading the environment |
+    | `engine/` | The vendored backtest engine | Zero FastAPI/SQLAlchemy/`src.*` imports — engine must stay runnable standalone; DB access only through its `engine/data/db_adapter.py` seam |
+    | `tests/unit` / `tests/integration` | Mirror the package they test | `db` marker on anything needing the live database |
+    | `scripts/` | Operational one-offs | Import from `src`/`engine`, never duplicate logic |
+
+    New files go where the table says. A file that needs two roles is two
+    files.
 
 ### The bigger picture (why any of this exists)
 
@@ -64,6 +83,17 @@ The centerpiece is **`POST /backtests`** — the Run Backtest endpoint. Every
 task below either builds toward it, persists its output, or exposes its
 results. When in doubt about scope, ask: does this help a student submit a run
 and see its results? If no, it is not this session's work.
+
+The second pillar is **user-uploaded strategies** (tasks 8–9). A student
+uploads a `.py` strategy; the system proves it compatible **by running a
+backtest on it**; if that validation run succeeds, the source is saved to the
+strategy store (an S3-shaped interface — local disk now, real S3 bucket later
+with zero call-site changes) and the strategy appears in the catalogue. Next
+time, the student just selects it: the store fetches the source and the same
+run pipeline executes it. Built-ins and uploads flow through one pipeline —
+the only difference is where the class is loaded from. (A sample
+"expected .py" template shown in the UI comes after this works; deferred
+task, noted in section 7.)
 
 ---
 
@@ -197,12 +227,23 @@ the run pipeline (task 6) claims and updates rows here.
 
   | Model | Columns |
   |---|---|
-  | `Strategy` | `key` text PK · `name` · `class_path` · `description` · `tags` JSONB · `universe` JSONB · `param_specs` JSONB · `status` text · `enabled` bool |
+  | `Strategy` | `key` text PK · `name` · `description` · `tags` JSONB · `universe` JSONB · `param_specs` JSONB · `kind` text (`builtin`\|`user`) · `class_path` text nullable (builtin only) · `storage_key` text nullable (user only — key into the strategy store) · `validation_run_id` UUID nullable FK → backtest_runs (the run that proved a user strategy works) · `status` text (`active`\|`validating`\|`failed_validation`\|`archived`) · `enabled` bool · `created_at` |
   | `BacktestRun` | `id` UUID PK default uuid4 · `name` · `strategy_key` FK · `status` text (`queued/running/completed/failed`) · `params` JSONB · `start_date` date · `end_date` date · `timeframe` text default `1d` · `symbol` text · `initial_capital` numeric · `final_equity` numeric nullable · `total_return` nullable · `sharpe` nullable · `max_drawdown` nullable · `progress_pct` smallint default 0 · `error_message` text nullable · `engine_version` text · `owner_id` UUID nullable · `cancel_requested` bool default false · `created_at` / `started_at` / `finished_at` timestamptz |
   | `RunMetrics` | `run_id` UUID PK/FK · `total_return` · `cagr` · `sharpe` · `sortino` · `max_drawdown` · `volatility` · `win_rate` · `profit_factor` · `total_trades` int · `extra` JSONB |
   | `RunEquityPoint` | `run_id` FK + `seq` int (composite PK) · `date` date · `equity` numeric · `benchmark` numeric nullable |
   | `RunTrade` | `run_id` FK + `seq` int (composite PK) · `symbol` · `side` text · `entry_date` · `exit_date` nullable · `entry_price` · `exit_price` nullable · `quantity` · `pnl` · `return_pct` · `fees` |
-  | `StrategyDraft` | `id` UUID PK · `name` · `description` · `source` text · `filename` nullable · `status` default `draft` · `created_at` |
+
+  `BacktestRun` additionally carries `purpose` text default `'user'`
+  (`user`|`validation`) — a validation run for an uploaded strategy is a
+  normal run through the whole pipeline, distinguishable so the list endpoint
+  can filter it if the FE wants. There is **no separate drafts table**: an
+  uploaded strategy is a `Strategy` row with `kind='user'`, and its lifecycle
+  lives in `status`.
+
+  FE status mapping (their Zod enum knows only `active|draft|archived`):
+  `validating` and `failed_validation` both serialize as `draft`; the
+  submission-result `message` explains which. Richer statuses flagged to the
+  FE session in section 5.
 
   Indexes: `backtest_runs(created_at desc)`, `backtest_runs(status)`.
 - `src/db/init.py` — `CREATE SCHEMA IF NOT EXISTS app` then
@@ -250,9 +291,13 @@ after task 6 writes real runs, they appear here with zero further changes.
   the FE and do not change. Strategy aggregates (`runCount`, `bestSharpe`,
   `bestReturn`, `lastRunAt`) computed with SQL aggregates in the repo, not
   Python loops.
-- Routes: swap `sample_data` calls for service calls. `POST /strategies`
-  persists a `StrategyDraft` (keeps returning `status="draft"` + the message
-  that validation/execution is not built).
+- Routes: swap `sample_data` calls for service calls. `POST /strategies` in
+  this task only persists the row (`kind='user'`, `status='validating'`,
+  source held in the store from task 8 if already built, else a `source`
+  staging column is acceptable **only** until task 9 replaces it) and returns
+  `status="draft"` + a message that validation is pending. The real
+  upload→validate→activate flow is task 9 — do not build it early, it needs
+  the run pipeline.
 - Tests: adjust contract tests where behavior legitimately changed (empty DB
   → empty list is valid). Add repo tests behind a `db` pytest marker that
   skip cleanly when the DB is unreachable.
@@ -330,7 +375,9 @@ exceptions, no tqdm.
 FE eventually renders — equity curve, trades, metrics, error banners, progress
 bars — originates from this function's return value.
 
-**Files:** `engine/contracts.py`, `engine/run_single.py`, surgical edits in
+**Files:** `engine/contracts/` package (`run.py` with the dataclasses,
+`errors.py` with `RunCancelled` / `NoMarketData`, `__init__.py` re-exporting
+all of it), `engine/run_single.py`, surgical edits in
 `engine/core/backtest_engine.py`, `engine/core/runner.py`,
 `engine/analytics/reporting.py`.
 
@@ -499,7 +546,117 @@ running sets cancel and the run terminates; pytest green.
 
 ---
 
-### Task 8 — Docs, env template, requirements truth
+### Task 8 — Strategy store (S3-shaped, local for now)
+
+**Goal:** one small interface every strategy read/write goes through, so the
+later S3 move is a new implementation, not a refactor.
+
+**Bigger picture:** the user asked for uploaded strategies to live in an S3
+bucket. The bucket does not exist yet and must not block the flow — so the
+call sites are written against the S3 shape today, backed by local disk.
+
+**Files:** `src/integrations/strategy_store.py`,
+`tests/unit/test_strategy_store.py`.
+
+**Interface (mirror S3 semantics exactly — keys, not paths):**
+```python
+class StrategyStore(Protocol):
+    def put(self, key: str, filename: str, content: str) -> None: ...
+    def get(self, key: str, filename: str) -> str: ...          # KeyError if absent
+    def exists(self, key: str) -> bool: ...
+    def delete(self, key: str) -> None: ...
+    def materialize(self, key: str, dest_dir: Path) -> Path: ...
+    # ^ downloads every file under the key into dest_dir and returns it —
+    #   this is what the engine loader consumes (S3 impl will download;
+    #   local impl copies). Keys look like "strategies/<strategy_key>/".
+```
+- `LocalStrategyStore(root=".strategy_store/")` — root gitignored; layout
+  `<root>/strategies/<strategy_key>/strategy.py` (+ `config.json`). This
+  layout is deliberately identical to `engine/strategies/<portfolio_n>/`, so
+  the engine's config-by-sibling-file discovery works unchanged on
+  materialized user strategies.
+- `S3StrategyStore` — **stub only**: class exists, constructor takes bucket
+  name, every method raises `NotImplementedError("S3 backend arrives with
+  infrastructure")`. Selection via `STRATEGY_STORE_BACKEND=local|s3` in
+  settings, default `local`.
+
+**Accept:** unit tests for put/get/exists/delete/materialize round-trip on a
+tmp dir; pytest green.
+
+**Commit:** `Add S3-shaped strategy store with local backend`
+
+---
+
+### Task 9 — User strategy pipeline: upload → validation backtest → activate → rerun
+
+**Goal:** the full loop the product owner described: upload a `.py`, the
+system proves it works by running a backtest, stores it, and from then on the
+student selects it and reruns like any built-in.
+
+**Bigger picture:** this is what makes the platform a *platform* rather than a
+viewer for nine fixed portfolios. It reuses every prior task: store (8), run
+pipeline (6/7), engine entrypoint (4), persistence (1/2).
+
+**Security disclosure (do not skip, do not soften):** validating means
+**executing user-supplied Python** in a worker process that holds admin
+database credentials. Product decision is to ship functional-first — but the
+implementing model must include the cheap guardrails and the loud comments:
+these are speed bumps, not a sandbox; real isolation (container, no-egress,
+scoped DB role) is deferred work, recorded in section 7.
+Guardrails now: (a) AST scan rejecting imports outside an allowlist
+(`engine.*`, `pandas`, `numpy`, `math`, `datetime`, `typing`,
+`collections`, `statistics`) and rejecting `exec`/`eval`/`__import__`/
+`open`/`subprocess`/`os.` usage; (b) wall-clock timeout on validation runs
+(`VALIDATION_TIMEOUT_SECONDS`, default 600 — enforced by the existing cancel
+mechanism from a watchdog timer); (c) validation window kept short.
+
+**Flow (`src/services/strategy_validation.py` + rework of
+`src/api/routes/strategies.py`):**
+1. `POST /strategies` body (unchanged FE shape): `name`, `description`,
+   `source`, `filename`. Plus optional `config` dict (tickers/interval/
+   lookback) — FE not sending it yet; default config used when absent:
+   `{TICKERS: ["AAPL","MSFT"], INTERVAL: 60, LOOKBACK_DAYS: 30, WEIGHTS: equal, DATA_FEEDS: ["market_data"]}`.
+2. AST guardrail scan → violation = 422 naming the offending line, nothing
+   stored.
+3. Source must define exactly one `BasePortfolio` subclass (checked by AST
+   class-def scan for the name in bases; ambiguous/zero = 422).
+4. Store: `put("strategies/<key>/", "strategy.py", source)` +
+   generated `config.json`. Key = slugified name + short uuid.
+5. Insert `Strategy` row: `kind='user'`, `status='validating'`,
+   `storage_key`, `enabled=false`.
+6. Create a `BacktestRun` with `purpose='validation'`, short window (last 30
+   calendar days of available data), small capital, and submit through the
+   normal JobManager. Response to the FE **immediately**: existing
+   `StrategySubmissionResult` shape, `status="draft"`,
+   `message="Validation backtest started — the strategy activates when it passes."`
+7. Worker side (`run_job`): when the run's strategy is `kind='user'`, the
+   loader materializes the store key into a per-run temp dir, imports
+   `strategy.py` via `importlib.util.spec_from_file_location`, finds the
+   `BasePortfolio` subclass by inspection, and hands it to `run_single`
+   exactly like a built-in class. (Loader lives in
+   `engine/strategies/user_loader.py`; ~50 lines.)
+8. On validation run completion, a post-run hook (in `run_job`, keyed off
+   `purpose='validation'`): run `completed` → strategy `status='active'`,
+   `enabled=true`, `validation_run_id` set; run `failed` →
+   `status='failed_validation'`, error preserved on the run row the user can
+   open.
+9. Rerun path needs **no new code**: `POST /backtests` with the user
+   strategy's key already works — task 7's endpoint checks `enabled`, and the
+   worker loader (step 7) branches on `kind`. Add one contract test proving
+   it.
+
+**Accept (marker `db`):** end-to-end test — POST a valid minimal strategy
+(template from `engine/strategies/portfolio_dummy` adapted), poll until the
+strategy row goes `active`, then `POST /backtests` against it and see
+`completed` with metrics; a second test POSTs source with `import os` and
+gets 422; a third POSTs source raising in `OnData` and sees
+`failed_validation` with the error retrievable. pytest green.
+
+**Commit:** `Add user strategy upload, validation-by-backtest, and rerun from store`
+
+---
+
+### Task 10 — Docs, env template, requirements truth
 
 **Goal:** a fresh clone + `.env` + two commands = working app. No tribal
 knowledge.
@@ -507,8 +664,10 @@ knowledge.
 - `.env.example`: exactly the `POSTGRES_*` block (no secrets), worker knobs
   (`MAX_CONCURRENT_RUNS`, `MAX_BACKTEST_WINDOW_DAYS`), artifact dir.
 - `README.md`: update endpoint table (add POST /backtests + example curl from
-  task 7), replace the "sample data" paragraph — backtest group is now real,
-  `/live/*` remains sample and says so; run pipeline diagram; startup:
+  task 7), document the strategy upload→validation→activate lifecycle and the
+  store layout (task 8–9), replace the "sample data" paragraph — backtest
+  group is now real, `/live/*` remains sample and says so; run pipeline
+  diagram; startup:
   `uvicorn server:app --reload --port 8000` (reload is safe because the pool
   is lifespan-lazy — state why).
 - `requirements.txt`: complete and pinned where it matters (`pandas==2.2.2`,
@@ -541,6 +700,19 @@ run via curl → completed with results. pytest green.
    on a terminal run = permanent delete. Confirm the UI matches.
 6. **Auth:** backend reserves `owner_id`; tell us which Supabase JWT claim to
    trust (`sub` assumed) and the header format when your auth lands.
+7. **Strategy upload is becoming real (tasks 8–9).** `POST /strategies` keeps
+   its exact request/response shape, but semantics change: submission kicks
+   off a **validation backtest**; the strategy appears in `GET /strategies`
+   as `draft` while validating, flips to `active` when the run passes, stays
+   `draft` on failure (message says why). Your existing
+   invalidate-list-on-submit already picks this up — consider polling the
+   list briefly after submit, or ask us for `GET /strategies/{key}` if you
+   want a detail poll. Longer term: `validating`/`failed` statuses in
+   `strategyStatusSchema` would let you show real state.
+8. **Sample strategy template:** deferred but planned — we will expose the
+   expected `.py` shape (a `BasePortfolio` subclass with `OnData(context)`)
+   for your editor's "Reset to template" button; coordinate when tasks 8–9
+   land.
 
 ## 6. Risks / gotchas (read before task 3 and 6)
 
@@ -559,3 +731,21 @@ run via curl → completed with results. pytest green.
   no pandas 3 idioms. Engine code is validated on these pins.
 - **Do not "fix" engine math** while vendoring — copy faithfully, adapt only
   the seams listed in task 4.
+- **User code execution (task 9) is the biggest risk in the plan.** The AST
+  allowlist is a speed bump a determined student walks around; the worker
+  process holds admin DB credentials. Acceptable only because the audience is
+  a small authenticated club and the product decision is functional-first.
+  Mark every guardrail with a comment saying it is not a security boundary.
+
+## 7. Deferred — explicitly not this plan, do not build early
+
+| Item | Arrives when |
+|---|---|
+| Real `S3StrategyStore` (bucket, IAM, presigned URLs) | Infrastructure repo provisions the bucket; swap = implement the task-8 protocol |
+| Sample/template `.py` endpoint for the FE editor | After tasks 8–9 prove the upload loop |
+| Real sandboxing for user code (container isolation, no-egress network, scoped DB role instead of admin creds) | Before the app is exposed beyond the club |
+| Portfolios 4–8 as built-ins (RBP/screener/NLP dependency chains) | After the v1 pipeline is stable |
+| `/live/*` backed by real trading tables | Separate product decision — read-only queries exist in this DB but live trading is not this app's scope |
+| Auth enforcement (`owner_id` filters, JWT verification) | Parallel session's auth work merges |
+| SSE / websocket progress (replaces polling) | Only if polling proves insufficient |
+| Alembic migrations | First schema change after other people depend on `app.*` |
