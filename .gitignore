@@ -62,6 +62,13 @@ htmlcov/
 # ---------------------------------------------------------------------------
 # Local artifact output. Created at runtime — not committed.
 .artifacts/
+# Parquet market-data cache the engine backfills into (data/backfill_cache/).
+# Leading slash matters: an unanchored `data/` would also ignore the vendored
+# engine's own `engine/data/` package, silently dropping its source files.
+/data/
+# Uploaded user strategies held by the local strategy store. The S3 backend
+# replaces this directory, not the layout inside it.
+/.strategy_store/
 *.csv
 *.parquet
 *.xlsx

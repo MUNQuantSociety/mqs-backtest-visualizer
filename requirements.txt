@@ -1,4 +1,40 @@
+# Web layer
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
-httpx>=0.27.0
+
+# Database. asyncpg drives the API, psycopg2 drives worker processes, scripts,
+# and the engine's raw-SQL adapter. greenlet is SQLAlchemy's async bridge and
+# is not pulled in automatically on every platform.
+sqlalchemy>=2.0
+asyncpg>=0.29
+psycopg2-binary>=2.9
+greenlet>=3.0
+
+# Configuration
+python-dotenv>=1.0
+
+# Engine. These pins are hard requirements, not preferences: the vendored
+# backtest math was validated against exactly these versions.
+pandas==2.2.2
+numpy<=1.26.4
+pytz>=2024.1
+
+# Parquet backend for the engine's market-data cache (data/backfill_cache/).
+# pandas reaches for it inside read_parquet/to_parquet, so it never appears in
+# an import statement — and the cache layer swallows the failure, so without it
+# the only symptom is that every run silently re-queries a remote database
+# instead of hitting a warm cache.
+pyarrow>=15.0
+
+# Not installed, listed so the omission is a decision rather than an oversight.
+# Both are imported by vendored engine code, inside the functions that need
+# them rather than at module level, and nothing on the run pipeline reaches
+# either: matplotlib only by VectorizedBacktest's two plotting methods, scipy
+# only by toolkit.gaussian_smooth (which no vendored strategy calls) and by the
+# CSCV analytics. Install them by hand if you call that code directly.
+#   matplotlib>=3.8
+#   scipy>=1.11
+
+# Testing
 pytest>=8.3.0
+httpx>=0.27.0
