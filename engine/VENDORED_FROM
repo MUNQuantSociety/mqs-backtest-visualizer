@@ -1,0 +1,51 @@
+source_repo: MQSMaster
+source_path: C:/Users/user/OneDrive/Desktop/MQSMaster
+commit: 31d957075fa2c61a84e131afb6f278a70ac4c9cf
+short_sha: 31d9570
+commit_date: 2026-08-16 19:31:22 -0230
+commit_subject: feat(deploy): gate ECS deploy on CI, drop the nonexistent NLP workload
+vendored_on: 2026-08-21
+vendored_by: BACKEND_PLAN.md task 3 (lane B)
+
+Copy map (upstream path -> path here):
+  src/backtest/backtest_engine.py            -> engine/core/backtest_engine.py
+  src/backtest/runner.py                     -> engine/core/runner.py
+  src/backtest/executor.py                   -> engine/core/executor.py
+  src/backtest/cost_model.py                 -> engine/core/cost_model.py
+  src/backtest/utils.py                      -> engine/core/utils.py
+  src/backtest/reporting.py                  -> engine/analytics/reporting.py
+  src/backtest/vectorized_backtest.py        -> engine/analytics/vectorized_backtest.py
+  src/backtest/vector_strategy_adapters.py   -> engine/analytics/vector_strategy_adapters.py
+  src/backtest/cscv.py                       -> engine/analytics/cscv.py
+  src/backtest/purged_kfold.py               -> engine/analytics/purged_kfold.py
+  src/backtest/data/backfill_cache/cache.py  -> engine/data/cache.py
+  src/portfolios/order_interface.py          -> engine/strategies/order_interface.py
+  src/portfolios/portfolio_interface.py      -> engine/strategies/portfolio_interface.py
+  src/portfolios/market_data_api.py          -> engine/strategies/market_data_api.py
+  src/portfolios/toolkit.py                  -> engine/strategies/toolkit.py
+  src/portfolios/common.py                   -> engine/strategies/common.py
+  src/portfolios/indicators/*.py             -> engine/indicators/
+  src/portfolios/portfolio_BASE/             -> engine/strategies/portfolio_BASE/
+  src/portfolios/portfolio_1/                -> engine/strategies/portfolio_1/
+  src/portfolios/portfolio_2/                -> engine/strategies/portfolio_2/
+  src/portfolios/portfolio_3/                -> engine/strategies/portfolio_3/
+  src/portfolios/portfolio_dummy/            -> engine/strategies/portfolio_dummy/
+
+Written here, not copied:
+  engine/data/db_adapter.py   reproduces MQSDBConnector.execute_query's contract
+                              on psycopg2 (the connector itself, with its pool
+                              and its env coupling, was deliberately not copied)
+  engine/contracts/           RunRequest / RunResult / RunCancelled / NoMarketData
+  engine/run_single.py        the one entrypoint the job worker calls
+
+Deliberately NOT copied:
+  src/oms/*                   order-management (TWAP/VWAP child orders) belongs
+                              to the live trading system; the vendored engine
+                              always takes upstream's documented
+                              "None => direct execution" branch
+  src/common/database/MQSDBConnector.py    replaced by engine/data/db_adapter.py
+  portfolio_4 .. portfolio_8  depend on RBP / screener / NLP chains that are not
+                              part of this product yet
+
+Every local modification is marked with a "# VISUALIZER:" comment, so
+`git diff` against the upstream files above shows exactly what this repo owns.
