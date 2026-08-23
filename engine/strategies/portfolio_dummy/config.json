@@ -1,0 +1,23 @@
+{
+    "PORTFOLIO_ID": "portfolio_dummy",
+    "TICKERS": ["AAPL", "TSLA", "NVDA", "MSFT"],
+    "WEIGHTS": {
+        "AAPL": 0.25,
+        "TSLA": 0.25,
+        "NVDA": 0.25,
+        "MSFT": 0.25
+    },
+    "INTERVAL": 3600,
+    "LOOKBACK_DAYS": 50,
+    "DATA_FEEDS": ["MARKET_DATA", "POSITIONS", "CASH_EQUITY", "PORT_NOTIONAL"],
+    "OMS": {
+        "enabled": true,
+        "default_algo": "VWAP",
+        "duration_minutes": 30,
+        "twap_num_slices": 10,
+        "vwap_bucket_minutes": 15,
+        "vwap_lookback_days": 20,
+        "min_order_notional": 100.0,
+        "fallback_to_market": true
+    }
+}
