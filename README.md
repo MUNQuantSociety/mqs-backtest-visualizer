@@ -720,6 +720,10 @@ never share a connection.
 
 ## Repository layout
 
+> For the call-by-call flow — startup, submitting a run, worker execution,
+> strategy upload — with rendered diagrams and `file:line` references, see
+> **[docs/ARCHITECTURE_FLOW.md](docs/ARCHITECTURE_FLOW.md)**.
+
 Code is placed by role. A file that needs two roles is two files.
 
 ```
