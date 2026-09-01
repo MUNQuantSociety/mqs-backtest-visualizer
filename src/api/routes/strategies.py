@@ -10,6 +10,8 @@ from fastapi import APIRouter, HTTPException, status
 
 from src.schemas.strategies import (
     MAX_SOURCE_BYTES,
+    StrategyCheckRequest,
+    StrategyCheckResult,
     StrategyListResponse,
     StrategySubmission,
     StrategySubmissionResult,
@@ -65,3 +67,32 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+
+
+@router.post("/check", response_model=StrategyCheckResult)
+async def check_strategy(request: StrategyCheckRequest) -> StrategyCheckResult:
+    """Say whether this source would run here. Always 200 when the check ran.
+
+    The editor calls this before submitting so a student finds out about a
+    banned import or a missing ``OnData`` in a millisecond, rather than minutes
+    later when the validation backtest reports it.
+
+    **Incompatible source still answers 200.** The request was well formed and
+    the check completed; the verdict lives in the body, where ``ok`` is false
+    and ``issues`` lists every problem with its line. A 4xx would say the
+    request was wrong, and would flatten that list into one ``detail`` string.
+    The two real failures keep their codes: source over the size limit is a
+    413, and a malformed body is FastAPI's own 422.
+
+    Nothing is stored and nothing is executed: the source is read with ``ast``.
+    A pass therefore means "this can be loaded and has the right shape", not
+    "this works"; ``POST /strategies`` is what queues the run that proves it.
+    """
+    size = len(request.source.encode("utf-8"))
+    if size > MAX_SOURCE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"Strategy source is {size} bytes; the limit is {MAX_SOURCE_BYTES}.",
+        )
+
+    return strategies_service.check_strategy(request)

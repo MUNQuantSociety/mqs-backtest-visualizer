@@ -77,3 +77,48 @@ class StrategySubmissionResult(CamelModel):
     name: str
     status: StrategyStatus
     message: str = ""
+
+
+class StrategyCheckRequest(CamelModel):
+    """Source to read for compatibility, and nothing else.
+
+    No name and no description: this asks "would this run here?", it does not
+    create anything, so the fields that identify a strategy are not needed yet.
+    """
+
+    source: str = Field(min_length=1)
+    filename: str | None = None
+
+
+class CompatibilityIssue(CamelModel):
+    """One reason a file would not run, tied to the line that causes it.
+
+    ``line`` is 0 when the problem is the file as a whole rather than any
+    particular line, which the client renders without a line number.
+    """
+
+    line: int
+    message: str
+
+
+class CompatibilityStatus(str, Enum):
+    COMPATIBLE = "compatible"
+    INCOMPATIBLE = "incompatible"
+
+
+class StrategyCheckResult(CamelModel):
+    """The verdict, always delivered with 200.
+
+    Incompatible source is a *successful* check, not a failed request. The
+    endpoint did exactly what it was asked to do and the answer is "no". A 4xx
+    here would also collapse a list of problems into one ``detail`` string,
+    which is the thing the check exists to avoid.
+    """
+
+    status: CompatibilityStatus
+    ok: bool
+    class_name: str | None = None
+    issues: list[CompatibilityIssue] = []
+    # Reported, never disqualifying: `ok` can be True with warnings present.
+    warnings: list[CompatibilityIssue] = []
+    message: str = ""

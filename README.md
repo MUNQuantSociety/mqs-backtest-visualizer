@@ -329,6 +329,7 @@ Pydantic models in `src/schemas/`.
 | `DELETE` | `/api/backtests/{id}` | **Postgres** | Delete or cancel — see the table above. `204`, or `404`. |
 | `GET` | `/api/strategies` | **Postgres** | Catalogue of enabled strategies with SQL-computed run aggregates. |
 | `POST` | `/api/strategies` | **Postgres + store + worker pool** | Upload source. Scans it, stores it, and queues its validation backtest. `201` + `status: "draft"`; `422` for a rejected source; `413` over 256 KB. |
+| `POST` | `/api/strategies/check` | *nothing* | Pre-flight: would this source run here? Reads it with `ast`; stores nothing, executes nothing. Always `200` when the check ran, verdict in `ok`/`issues`; `413` over 256 KB. |
 | `GET` | `/api/live/portfolios` | *sample data* | Live portfolio list. |
 | `GET` | `/api/live/portfolios/{id}` | *sample data* | Detail — config, positions. |
 | `GET` | `/api/live/portfolios/{id}/equity` | *sample data* | `days`. |
@@ -854,6 +855,7 @@ around a minute rather than a second.
 | Runs stay `queued` forever | The worker pool lives in the lifespan. If the app was constructed without it (e.g. a bare `TestClient(app)` with no `with`), nothing dispatches. |
 | A run says "Interrupted by server restart" | Exactly what it says — `--reload` or a deploy killed its worker. The reconciler wrote that message on the next boot. Re-submit. |
 | `POST /strategies` returns 422 naming a line | The AST scan refused the source. The message names the line and what would be accepted. |
+| `POST /strategies/check` answers `200` for source that is plainly wrong | By design: the check ran, and its answer is in the body. `ok: false` with every problem in `issues`; a status code could carry only one of them. |
 | Parquet cache silently never populates | `pyarrow` is missing. It is in `requirements.txt`; the cache layer swallows the failure, so the only symptom is that every run re-queries the database. |
 
 ---

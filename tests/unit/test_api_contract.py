@@ -38,7 +38,11 @@ from src.schemas.backtests import (
     PerformanceMetrics,
     Trade,
 )
-from src.schemas.strategies import Strategy
+from src.schemas.strategies import (
+    CompatibilityIssue,
+    Strategy,
+    StrategyCheckResult,
+)
 
 
 @pytest.fixture(scope="module")
@@ -307,6 +311,230 @@ def test_strategy_submission_rejects_source_that_is_not_a_strategy(
     # A string, not FastAPI's list of error objects: the client shows it as-is.
     assert isinstance(detail, str)
     assert "BasePortfolio" in detail
+
+
+# ---------------------------------------------------------------------------
+# POST /strategies/check: the pre-flight the editor calls before submitting.
+# Static, so no database, no store and no worker: every case here runs offline.
+# ---------------------------------------------------------------------------
+
+# A strategy written the way the engine expects one. Kept whole rather than
+# assembled per test so "compatible" is asserted against something a student
+# could actually paste in.
+COMPATIBLE_SOURCE = """
+from engine.strategies.order_interface import StrategyContext
+from engine.strategies.portfolio_BASE.strategy import BasePortfolio
+
+
+class ContractCheckStrategy(BasePortfolio):
+    def OnData(self, context: StrategyContext):
+        for ticker in self.tickers:
+            context.Order.SetHoldings(ticker, 1 / len(self.tickers))
+"""
+
+
+def _check(client: TestClient, source: str) -> dict:
+    """POST the source and assert the endpoint itself succeeded.
+
+    Every caller asserts 200 first: a verdict of "incompatible" is a successful
+    check, and a non-200 means the endpoint broke rather than the source.
+    """
+    response = client.post("/api/strategies/check", json={"source": source})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_check_accepts_a_strategy_written_against_the_engine(
+    client: TestClient,
+) -> None:
+    body = _check(client, COMPATIBLE_SOURCE)
+    assert body["status"] == "compatible"
+    assert body["ok"] is True
+    assert body["className"] == "ContractCheckStrategy"
+    assert body["issues"] == []
+    assert body["message"]
+
+
+def test_check_keys_are_camel_case() -> None:
+    assert _aliases(StrategyCheckResult) == {
+        "status",
+        "ok",
+        "className",
+        "issues",
+        "warnings",
+        "message",
+    }
+    assert _aliases(CompatibilityIssue) == {"line", "message"}
+
+
+def test_incompatible_source_still_answers_200(client: TestClient) -> None:
+    """The contract the client depends on: a verdict, not an HTTP error.
+
+    The editor lists every problem at once. A 4xx would flatten them into one
+    ``detail`` string and would also say the *request* was wrong, which it was
+    not.
+    """
+    body = _check(client, "print(1)")
+    assert body["status"] == "incompatible"
+    assert body["ok"] is False
+    assert body["className"] is None
+    assert "BasePortfolio" in body["issues"][0]["message"]
+
+
+def test_check_reports_every_problem_with_its_line(client: TestClient) -> None:
+    source = "import os\n" + COMPATIBLE_SOURCE
+    body = _check(client, source)
+
+    assert body["ok"] is False
+    # The banned import *and* the strategy class: finding one does not stop the
+    # read, and the class name is still reported so the editor can name it.
+    assert body["className"] == "ContractCheckStrategy"
+    assert len(body["issues"]) == 1
+    assert body["issues"][0]["line"] == 1
+    assert "os" in body["issues"][0]["message"]
+
+
+def test_check_catches_the_lowercase_ondata(client: TestClient) -> None:
+    """The single most likely reason a correct-looking strategy does not run."""
+    source = COMPATIBLE_SOURCE.replace("def OnData", "def on_data")
+    body = _check(client, source)
+
+    assert body["ok"] is False
+    assert "OnData" in body["issues"][0]["message"]
+
+
+def test_check_reports_a_missing_super_init_as_a_warning(client: TestClient) -> None:
+    """Warnings inform; they never make the answer "no"."""
+    source = COMPATIBLE_SOURCE.replace(
+        "    def OnData",
+        "    def __init__(self, db_connector, executor, debug=False,\n"
+        "                 config_dict=None, backtest_start_date=None,\n"
+        "                 order_manager=None):\n"
+        "        self.tickers = []\n"
+        "\n"
+        "    def OnData",
+    )
+    body = _check(client, source)
+
+    assert body["ok"] is True
+    assert body["issues"] == []
+    assert "super().__init__" in body["warnings"][0]["message"]
+
+
+# Each of the four below is a case that shipped wrong and was caught by running
+# the same source past the real engine loader. They assert agreement with what
+# the loader actually does, not with what the check reads nicely as.
+
+
+def test_check_follows_inheritance_through_the_file(client: TestClient) -> None:
+    """A shared base counts as a strategy, because the loader counts it.
+
+    Matching on ``class X(BasePortfolio)`` alone made a factored-out base look
+    like one strategy that forgot ``OnData``: the wrong class named and the
+    wrong fix suggested, for a file the loader refuses as ambiguous.
+    """
+    source = COMPATIBLE_SOURCE.replace(
+        "class ContractCheckStrategy(BasePortfolio):",
+        "class SharedBase(BasePortfolio):\n"
+        "    def helper(self):\n"
+        "        return 1\n"
+        "\n"
+        "\n"
+        "class ContractCheckStrategy(SharedBase):",
+    )
+    body = _check(client, source)
+
+    assert body["ok"] is False
+    message = body["issues"][0]["message"]
+    assert "2 strategies" in message
+    assert "SharedBase" in message and "ContractCheckStrategy" in message
+
+
+def test_check_accepts_ondata_bound_by_assignment(client: TestClient) -> None:
+    """``OnData = some_function`` is a method the engine runs, so it passes.
+
+    Nothing about the target is readable from the assignment, and rejecting it
+    would refuse code that demonstrably works.
+    """
+    source = COMPATIBLE_SOURCE.replace(
+        "    def OnData(self, context: StrategyContext):\n"
+        "        for ticker in self.tickers:\n"
+        "            context.Order.SetHoldings(ticker, 1 / len(self.tickers))\n",
+        "    OnData = _on_data\n",
+    ).replace(
+        "class ContractCheckStrategy(BasePortfolio):",
+        "def _on_data(self, context):\n"
+        "    for ticker in self.tickers:\n"
+        "        context.buy(ticker)\n"
+        "\n"
+        "\n"
+        "class ContractCheckStrategy(BasePortfolio):",
+    )
+    body = _check(client, source)
+
+    assert body["ok"] is True, body["issues"]
+
+
+def test_check_accepts_a_staticmethod_ondata(client: TestClient) -> None:
+    """``self.OnData(context)`` on a staticmethod passes one argument, not two."""
+    source = COMPATIBLE_SOURCE.replace(
+        "    def OnData(self, context: StrategyContext):",
+        "    @staticmethod\n    def OnData(context):",
+    ).replace("self.tickers", "context.Portfolio.positions")
+    body = _check(client, source)
+
+    assert body["ok"] is True, body["issues"]
+
+
+def test_a_staticmethod_ondata_still_needs_its_context(client: TestClient) -> None:
+    """The staticmethod allowance is one argument fewer, not no check at all."""
+    source = COMPATIBLE_SOURCE.replace(
+        "    def OnData(self, context: StrategyContext):\n"
+        "        for ticker in self.tickers:\n"
+        "            context.Order.SetHoldings(ticker, 1 / len(self.tickers))\n",
+        "    @staticmethod\n    def OnData():\n        pass\n",
+    )
+    body = _check(client, source)
+
+    assert body["ok"] is False
+    assert "OnData(context)" in body["issues"][0]["message"]
+
+
+def test_check_reports_invalid_python_without_crashing(client: TestClient) -> None:
+    body = _check(client, "class Broken(BasePortfolio)\n    pass\n")
+    assert body["ok"] is False
+    assert "not valid Python" in body["issues"][0]["message"]
+
+
+def test_check_agrees_with_what_submission_accepts(client: TestClient) -> None:
+    """The check must not pass source the upload endpoint then refuses.
+
+    The two share one scan; this pins that they stay shared. Asserted on a
+    rejection because it needs no database; the accepting path is covered end
+    to end in ``tests/integration/test_user_strategies.py``.
+    """
+    source = "import socket\n" + COMPATIBLE_SOURCE
+    assert _check(client, source)["ok"] is False
+
+    submission = client.post(
+        "/api/strategies",
+        json={"name": "Check agreement", "description": "", "source": source,
+              "filename": None},
+    )
+    assert submission.status_code == 422
+
+
+def test_oversized_source_is_rejected_by_the_check_too(client: TestClient) -> None:
+    """The one case that is a real HTTP error: the request is too big to read."""
+    response = client.post(
+        "/api/strategies/check", json={"source": "x" * (256 * 1024 + 1)}
+    )
+    assert response.status_code == 413
+
+
+def test_check_needs_a_source(client: TestClient) -> None:
+    response = client.post("/api/strategies/check", json={"source": ""})
+    assert response.status_code == 422
 
 
 def test_oversized_strategy_source_is_rejected(client: TestClient) -> None:
