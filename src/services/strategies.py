@@ -18,8 +18,12 @@ from src.db.init import ensure_schema
 from src.repositories import strategies as strategies_repo
 from src.repositories.strategies import StrategyRow
 from src.schemas.strategies import (
+    CompatibilityIssue,
+    CompatibilityStatus,
     ParameterSpec,
     Strategy,
+    StrategyCheckRequest,
+    StrategyCheckResult,
     StrategyListResponse,
     StrategyStatus,
     StrategySubmission,
@@ -110,6 +114,74 @@ async def list_strategies(include_disabled: bool = False) -> StrategyListRespons
         )
         items = [to_schema(row) for row in rows]
     return StrategyListResponse(items=items, total=len(items))
+
+
+def check_strategy(request: StrategyCheckRequest) -> StrategyCheckResult:
+    """Answer whether a file would run here, without creating anything.
+
+    Synchronous and side-effect free on purpose: it reads the source with
+    ``ast`` and touches no database, no store and no worker, so the editor can
+    call it as often as a student presses the button. Nothing is stored, so a
+    failed check leaves no trace and a passing one still has to be submitted.
+
+    A pass is not a promise that the strategy works, only that it can be
+    loaded and has the shape the engine drives. The proof is the validation
+    backtest that :func:`submit_strategy` queues.
+    """
+    report = strategy_validation.check_compatibility(request.source)
+
+    issues = [
+        CompatibilityIssue(line=issue.line, message=issue.message)
+        for issue in report.issues
+    ]
+    warnings = [
+        CompatibilityIssue(line=warning.line, message=warning.message)
+        for warning in report.warnings
+    ]
+
+    return StrategyCheckResult(
+        status=(
+            CompatibilityStatus.COMPATIBLE
+            if report.compatible
+            else CompatibilityStatus.INCOMPATIBLE
+        ),
+        ok=report.compatible,
+        class_name=report.class_name,
+        issues=issues,
+        warnings=warnings,
+        message=_check_message(report.compatible, report.class_name, issues, warnings),
+    )
+
+
+def _check_message(
+    compatible: bool,
+    class_name: str | None,
+    issues: list[CompatibilityIssue],
+    warnings: list[CompatibilityIssue],
+) -> str:
+    """The one sentence shown beside the verdict.
+
+    The issues are listed in full underneath it, so this counts rather than
+    repeats them, and it says what a pass does *not* mean, because "compatible"
+    read as "this works" is the misunderstanding worth heading off.
+    """
+    if not compatible:
+        count = len(issues)
+        return (
+            f"{count} problem{'' if count == 1 else 's'} to fix before this can "
+            "run here."
+        )
+
+    subject = class_name or "This strategy"
+    tail = (
+        f" {len(warnings)} warning{'' if len(warnings) == 1 else 's'} worth reading."
+        if warnings
+        else ""
+    )
+    return (
+        f"{subject} is compatible with the engine. Submitting it starts the "
+        f"validation backtest that proves it runs.{tail}"
+    )
 
 
 async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionResult:

@@ -27,6 +27,12 @@ _LATEST_BAR_SQL = text(
     "WHERE ticker = :ticker ORDER BY date DESC LIMIT 1"
 ).bindparams(bindparam("ticker"))
 
+# The other end of the same index, read the same way and for the same reason.
+_EARLIEST_BAR_SQL = text(
+    "SELECT date FROM public.market_data "
+    "WHERE ticker = :ticker ORDER BY date ASC LIMIT 1"
+).bindparams(bindparam("ticker"))
+
 
 @dataclass(frozen=True)
 class StrategyRow:
@@ -244,3 +250,31 @@ async def latest_market_data_date(
             return None
         latest = row[0] if latest is None else min(latest, row[0])
     return latest
+
+
+async def ticker_coverage(
+    session: AsyncSession, tickers: list[str]
+) -> dict[str, tuple[date, date] | None]:
+    """First and last bar per ticker, or None for a ticker with no bars.
+
+    Read-only against ``public.market_data``, like its sibling above, and
+    queried one ticker at a time for the same measured reason: the per-ticker
+    form is answered from the date index, the aggregate form walks it.
+
+    Both of these belong in ``src/repositories/market_data.py`` once that
+    module exists (recorded as deferred item H8). They are kept together here
+    rather than split across two modules in the meantime.
+    """
+    wanted = [str(ticker).strip() for ticker in tickers if str(ticker).strip()]
+
+    coverage: dict[str, tuple[date, date] | None] = {}
+    for ticker in wanted:
+        if ticker in coverage:
+            continue
+        first = (await session.execute(_EARLIEST_BAR_SQL, {"ticker": ticker})).first()
+        last = (await session.execute(_LATEST_BAR_SQL, {"ticker": ticker})).first()
+        if first is None or last is None or first[0] is None or last[0] is None:
+            coverage[ticker] = None
+            continue
+        coverage[ticker] = (first[0], last[0])
+    return coverage
