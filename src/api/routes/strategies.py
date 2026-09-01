@@ -6,10 +6,12 @@ Backed by the ``app.strategies`` registry through
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from pydantic import ValidationError
 
 from src.schemas.strategies import (
     MAX_SOURCE_BYTES,
+    Strategy,
     StrategyCheckRequest,
     StrategyCheckResult,
     StrategyListResponse,
@@ -107,3 +109,128 @@ async def check_strategy(request: StrategyCheckRequest) -> StrategyCheckResult:
         )
 
     return strategies_service.check_strategy(request)
+
+
+# ---------------------------------------------------------------------------
+# File uploads. Same pipeline as the JSON endpoints above; only the transport
+# differs. The frontend normally reads a chosen file in the browser and sends
+# its text, so these exist for clients that hold an actual file — a script,
+# a CLI, a future drag-and-drop that streams instead of reading.
+# ---------------------------------------------------------------------------
+
+_SOURCE_SUFFIX = ".py"
+
+
+async def _read_source_file(upload: UploadFile) -> tuple[str, str]:
+    """Extract UTF-8 source from an uploaded ``.py`` file, or say why not.
+
+    Every refusal is a 422 with one plain sentence in ``detail``, because that
+    is the only error shape the client renders verbatim. The size check is a
+    413 to match the JSON endpoints, which reject the same limit the same way.
+    """
+    filename = (upload.filename or "").strip()
+    if not filename.lower().endswith(_SOURCE_SUFFIX):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Expected a Python file ending in {_SOURCE_SUFFIX}, got "
+                f"{filename or 'a file with no name'!r}."
+            ),
+        )
+
+    # Read one byte past the limit rather than the whole file: a stray 2 GB
+    # upload is refused after 256 KB, not after it has been buffered.
+    raw = await upload.read(MAX_SOURCE_BYTES + 1)
+    await upload.close()
+    if len(raw) > MAX_SOURCE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"{filename} is over the {MAX_SOURCE_BYTES} byte limit.",
+        )
+    if not raw.strip():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"{filename} is empty.",
+        )
+
+    try:
+        return raw.decode("utf-8"), filename
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"{filename} is not UTF-8 text (byte {exc.start}).",
+        ) from exc
+
+
+@router.post("/upload/check", response_model=StrategyCheckResult)
+async def check_strategy_file(file: UploadFile = File(...)) -> StrategyCheckResult:
+    """``POST /strategies/check`` for a file instead of a JSON body.
+
+    Identical verdict semantics: the check ran, so it is a 200 even when the
+    answer is "no". Nothing is stored and nothing is executed.
+    """
+    source, filename = await _read_source_file(file)
+    return strategies_service.check_strategy(
+        StrategyCheckRequest(source=source, filename=filename)
+    )
+
+
+@router.post(
+    "/upload",
+    response_model=StrategySubmissionResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def submit_strategy_file(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    description: str = Form(""),
+) -> StrategySubmissionResult:
+    """``POST /strategies`` for a multipart file instead of a JSON body.
+
+    The file is read, decoded and handed to the same submission path — the
+    same scan, the same store, the same validation backtest. ``name`` and
+    ``description`` travel as form fields beside it. Same responses: 201 with
+    ``validationRunId`` to poll, 422 for anything the student has to fix, 413
+    over the size limit.
+    """
+    source, filename = await _read_source_file(file)
+    try:
+        submission = StrategySubmission(
+            name=name, description=description, source=source, filename=filename
+        )
+    except ValidationError as exc:
+        # One sentence, not Pydantic's list: the first problem is enough to act on.
+        first = exc.errors()[0]
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"{'.'.join(str(p) for p in first['loc'])}: {first['msg']}",
+        ) from exc
+
+    try:
+        return await strategies_service.submit_strategy(submission)
+    except StrategyValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+
+
+# Declared last on purpose: a path parameter would otherwise swallow
+# ``/template``, ``/check`` and ``/upload`` above it.
+@router.get("/{key}", response_model=Strategy)
+async def get_strategy(key: str) -> Strategy:
+    """One strategy, **including the ones the catalogue hides**.
+
+    ``GET /strategies`` shows only enabled rows, so an upload that is still
+    validating — or one that failed — is invisible there. This is how a
+    client watches a submission: ``validationState`` carries the real
+    lifecycle (``validating`` / ``active`` / ``failed_validation``) and
+    ``validationRunId`` is the backtest to open for progress or the failure
+    reason. ``status`` stays within the client's enum (``draft`` until active).
+    """
+    strategy = await strategies_service.get_strategy(key)
+    if strategy is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No strategy with id {key!r}.",
+        )
+    return strategy

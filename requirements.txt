@@ -1,6 +1,8 @@
 # Web layer
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
+# Multipart form parsing for POST /strategies/upload (UploadFile).
+python-multipart>=0.0.9
 
 # Database. asyncpg drives the API, psycopg2 drives worker processes, scripts,
 # and the engine's raw-SQL adapter. greenlet is SQLAlchemy's async bridge and

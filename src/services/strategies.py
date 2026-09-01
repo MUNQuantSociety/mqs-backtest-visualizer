@@ -93,6 +93,10 @@ def to_schema(row: StrategyRow) -> Strategy:
         best_sharpe=_float(row.best_sharpe),
         best_return=_float(row.best_return),
         last_run_at=_iso(row.last_run_at),
+        validation_state=strategy.status,
+        validation_run_id=(
+            str(strategy.validation_run_id) if strategy.validation_run_id else None
+        ),
     )
 
 
@@ -116,6 +120,19 @@ async def list_strategies(include_disabled: bool = False) -> StrategyListRespons
         )
         items = [to_schema(row) for row in rows]
     return StrategyListResponse(items=items, total=len(items))
+
+
+async def get_strategy(key: str) -> Strategy | None:
+    """One strategy by key, including ones the catalogue hides.
+
+    This is the endpoint behind "is my upload done yet?": a validating or
+    failed upload is disabled and therefore absent from the list, so a client
+    that only has the list has no way to watch it. None when the key is unknown.
+    """
+    await ensure_schema()
+    async with session_scope() as session:
+        row = await strategies_repo.get_strategy_row(session, key)
+    return to_schema(row) if row is not None else None
 
 
 def strategy_template() -> StrategyTemplate:
@@ -245,24 +262,32 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
             class_path=None,
         )
 
-    message = await _begin_validation(key, submission.name, config, scan.class_name)
+    message, run_id = await _begin_validation(
+        key, submission.name, config, scan.class_name
+    )
     return StrategySubmissionResult(
         id=key,
         name=submission.name,
         status=StrategyStatus.DRAFT,
         message=message,
+        validation_run_id=run_id,
     )
 
 
 async def _begin_validation(
     key: str, name: str, config: dict, class_name: str
-) -> str:
-    """Queue the validation run and report what a student should expect.
+) -> tuple[str, str | None]:
+    """Queue the validation run; return the student-facing message and its id.
 
     A failure to *start* the run is not a failure of the upload, but it must
     not read as "still validating" either: the strategy is parked in
     ``failed_validation`` and the message says the run never started, so the
     student re-uploads instead of waiting for a result that is not coming.
+
+    The run id is written onto the strategy row here, at submit time. The
+    worker also writes it when the run finishes, but a client polling
+    ``GET /strategies/{key}`` *during* validation needs it now — otherwise
+    the only place it exists is inside this sentence.
     """
     try:
         summary = await strategy_validation.start_validation(
@@ -276,12 +301,21 @@ async def _begin_validation(
         return (
             f"Saved {class_name}, but its validation backtest could not be "
             f"started ({exc}). Try uploading it again."
+        ), None
+
+    async with session_scope() as session:
+        await strategies_repo.set_validation_state(
+            session,
+            key,
+            status="validating",
+            enabled=False,
+            validation_run_id=uuid.UUID(summary.id),
         )
 
     return (
         f"Validation backtest started for {class_name} — the strategy "
         f"activates when it passes. Follow run {summary.id} for progress."
-    )
+    ), summary.id
 
 
 async def delete_strategy(key: str) -> bool:

@@ -67,32 +67,49 @@ async def list_strategies(
     owner_id: uuid.UUID | None = None,
 ) -> list[StrategyRow]:
     """Every strategy the catalogue should show, newest aggregates included."""
-    aggregates = _aggregate_subquery()
-    statement = (
-        select(
-            Strategy,
-            func.coalesce(aggregates.c.run_count, 0),
-            aggregates.c.best_sharpe,
-            aggregates.c.best_return,
-            aggregates.c.last_run_at,
-        )
-        .outerjoin(aggregates, aggregates.c.strategy_key == Strategy.key)
-        .order_by(Strategy.key)
-    )
+    statement = _catalogue_statement().order_by(Strategy.key)
     if not include_disabled:
         statement = statement.where(Strategy.enabled.is_(True))
 
     result = await session.execute(for_user(statement, owner_id))
-    return [
-        StrategyRow(
-            strategy=strategy,
-            run_count=int(run_count),
-            best_sharpe=best_sharpe,
-            best_return=best_return,
-            last_run_at=last_run_at,
-        )
-        for strategy, run_count, best_sharpe, best_return, last_run_at in result.all()
-    ]
+    return [_to_row(record) for record in result.all()]
+
+
+async def get_strategy_row(
+    session: AsyncSession, key: str, *, owner_id: uuid.UUID | None = None
+) -> StrategyRow | None:
+    """One strategy with its aggregates, whatever its lifecycle state.
+
+    Deliberately ignores ``enabled``: this is how a student watches an upload
+    that is still validating, or reads why one failed — both of which the
+    catalogue hides on purpose.
+    """
+    statement = _catalogue_statement().where(Strategy.key == key)
+    record = (await session.execute(for_user(statement, owner_id))).one_or_none()
+    return _to_row(record) if record is not None else None
+
+
+def _catalogue_statement():
+    """Registry rows joined to their run aggregates. Filters are added by callers."""
+    aggregates = _aggregate_subquery()
+    return select(
+        Strategy,
+        func.coalesce(aggregates.c.run_count, 0),
+        aggregates.c.best_sharpe,
+        aggregates.c.best_return,
+        aggregates.c.last_run_at,
+    ).outerjoin(aggregates, aggregates.c.strategy_key == Strategy.key)
+
+
+def _to_row(record) -> StrategyRow:
+    strategy, run_count, best_sharpe, best_return, last_run_at = record
+    return StrategyRow(
+        strategy=strategy,
+        run_count=int(run_count),
+        best_sharpe=best_sharpe,
+        best_return=best_return,
+        last_run_at=last_run_at,
+    )
 
 
 async def get_strategy(session: AsyncSession, key: str) -> Strategy | None:

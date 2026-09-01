@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from src.schemas.common import CamelModel
 
@@ -52,6 +52,15 @@ class Strategy(CamelModel):
     best_return: float | None = None
     last_run_at: str | None = None
 
+    # Additive, so the client's Zod schema (which knows only active/draft/
+    # archived) keeps parsing. ``validation_state`` is the registry's real
+    # lifecycle value — ``validating``, ``active``, ``failed_validation``,
+    # ``archived`` — and ``validation_run_id`` is the backtest that proves or
+    # disproves an upload. Together they let the editor watch a submission
+    # instead of waiting for it to appear in the catalogue.
+    validation_state: str | None = None
+    validation_run_id: str | None = None
+
 
 class StrategyListResponse(CamelModel):
     items: list[Strategy]
@@ -71,12 +80,26 @@ class StrategySubmission(CamelModel):
     source: str = Field(min_length=1)
     filename: str | None = None
 
+    @field_validator("name", "description", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        """Trim before the length rules run, so ``"   "`` is empty, not valid.
+
+        The client's Zod schema does ``.trim().min(1)``; without the same here a
+        whitespace name slips past ``min_length`` and becomes a real row.
+        """
+        return value.strip() if isinstance(value, str) else value
+
 
 class StrategySubmissionResult(CamelModel):
     id: str
     name: str
     status: StrategyStatus
     message: str = ""
+    # The validation backtest queued for this upload. The message mentions it
+    # in prose for a human; this field is the one a client can actually poll
+    # (``GET /backtests/{id}``). Null only when the run could not be started.
+    validation_run_id: str | None = None
 
 
 class StrategyTemplate(CamelModel):
