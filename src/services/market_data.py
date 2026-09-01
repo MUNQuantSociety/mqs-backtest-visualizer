@@ -11,6 +11,7 @@ from datetime import date
 
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
+from src.repositories import market_data as market_data_repo
 from src.repositories import strategies as strategies_repo
 from src.schemas.market_data import CoverageResponse, TickerCoverage
 
@@ -27,7 +28,7 @@ async def coverage_for(tickers: list[str]) -> CoverageResponse:
     ``app`` schema is not this endpoint's business.
     """
     async with session_scope() as session:
-        spans = await strategies_repo.ticker_coverage(session, tickers)
+        spans = await market_data_repo.ticker_coverage(session, tickers)
 
     items: list[TickerCoverage] = []
     missing: list[str] = []

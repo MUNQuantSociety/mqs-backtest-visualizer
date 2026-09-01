@@ -61,16 +61,12 @@ FAST_PARAMS = {"LOOKBACK_DAYS": 5, "TICKERS": ["AAPL"], "WEIGHTS": {"AAPL": 1.0}
 
 
 @pytest.fixture(scope="module")
-def db_engine(database_available: tuple[bool, str]):
+def db_engine(require_database: None):
     """A sync engine for the test's own reads and writes.
 
-    ``database_available`` is requested explicitly because module-scoped
-    fixtures are set up before the function-scoped ``db``-marker skip: without
-    it, an offline machine would fail to connect here instead of skipping.
+    ``require_database`` is requested because module-scoped fixtures are
+    set up before the function-scoped skip can fire. See tests/conftest.py.
     """
-    reachable, reason = database_available
-    if not reachable:
-        pytest.skip(reason)
 
     init_database()
     engine = create_sync_engine()

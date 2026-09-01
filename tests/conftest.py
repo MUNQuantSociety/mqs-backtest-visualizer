@@ -54,6 +54,24 @@ def database_available() -> tuple[bool, str]:
     return _probe_database()
 
 
+@pytest.fixture(scope="session")
+def require_database(database_available: tuple[bool, str]) -> None:
+    """Skip from inside a module- or session-scoped fixture.
+
+    The autouse skip below is function-scoped, and pytest sets broader-scoped
+    fixtures up first. A module-scoped fixture that opens a connection would
+    therefore run before that skip ever fires: an offline machine gets a
+    connection error instead of a skip, and an online one can burn a full
+    backtest before printing "skipped".
+
+    Depend on this from any fixture wider than function scope. That is the
+    whole fix; deferred item B9 in the plan.
+    """
+    reachable, reason = database_available
+    if not reachable:
+        pytest.skip(reason)
+
+
 @pytest.fixture(autouse=True)
 def _skip_when_database_unreachable(request: pytest.FixtureRequest) -> None:
     """Skip ``db``-marked tests when the database cannot be reached.

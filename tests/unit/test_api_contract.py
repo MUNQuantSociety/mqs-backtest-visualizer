@@ -500,6 +500,84 @@ def test_a_staticmethod_ondata_still_needs_its_context(client: TestClient) -> No
     assert "OnData(context)" in body["issues"][0]["message"]
 
 
+def test_the_template_passes_our_own_compatibility_check(client: TestClient) -> None:
+    """The one test that keeps the editor honest.
+
+    The starter source is the first thing a member sees. If it does not pass
+    the check we run against their work, it teaches the wrong contract on the
+    first screen, which is exactly how the previous template ended up written
+    against a base class that never existed.
+    """
+    template = client.get("/api/strategies/template")
+    assert template.status_code == 200
+
+    body = template.json()
+    assert body["filename"].endswith(".py")
+
+    verdict = _check(client, body["source"])
+    assert verdict["ok"] is True, verdict["issues"]
+    assert verdict["warnings"] == [], verdict["warnings"]
+
+
+def test_template_keys_are_camel_case(client: TestClient) -> None:
+    assert set(client.get("/api/strategies/template").json()) == {"filename", "source"}
+
+
+def test_check_rejects_an_indicator_the_engine_does_not_have(
+    client: TestClient,
+) -> None:
+    """The last common way to pass the check and still fail the run.
+
+    A bad indicator name gets past every other rule here and then raises
+    ModuleNotFoundError at construction, which reads as a broken platform
+    rather than a typo.
+    """
+    source = COMPATIBLE_SOURCE.replace(
+        "class ContractCheckStrategy(BasePortfolio):",
+        "class ContractCheckStrategy(BasePortfolio):\n"
+        "    def __init__(self, db, ex, debug=False, config_dict=None,\n"
+        "                 backtest_start_date=None, order_manager=None):\n"
+        "        super().__init__(db, ex, debug, config_dict,\n"
+        "                         backtest_start_date, order_manager)\n"
+        '        self.RegisterIndicatorSet({"st": ("SuperTrend", {"period": 10})})\n',
+    )
+    body = _check(client, source)
+
+    assert body["ok"] is False
+    message = body["issues"][0]["message"]
+    assert "SuperTrend" in message
+    # Names the file the engine would import, which is the whole diagnosis.
+    assert "super_trend.py" in message
+
+
+def test_check_accepts_the_indicators_the_engine_ships(client: TestClient) -> None:
+    source = COMPATIBLE_SOURCE.replace(
+        "class ContractCheckStrategy(BasePortfolio):",
+        "class ContractCheckStrategy(BasePortfolio):\n"
+        "    def __init__(self, db, ex, debug=False, config_dict=None,\n"
+        "                 backtest_start_date=None, order_manager=None):\n"
+        "        super().__init__(db, ex, debug, config_dict,\n"
+        "                         backtest_start_date, order_manager)\n"
+        '        self.RegisterIndicatorSet({"sma": ("SimpleMovingAverage", {"period": 20})})\n'
+        '        self.AddIndicator("RelativeStrengthIndex", "AAPL", period=14)\n',
+    )
+    body = _check(client, source)
+
+    assert body["ok"] is True, body["issues"]
+
+
+def test_the_indicator_set_is_discovered_not_hardcoded() -> None:
+    """A new file in engine/indicators has to become valid with no edit here."""
+    from src.services.strategy_validation.scanning import known_indicators
+
+    discovered = known_indicators()
+    assert "SimpleMovingAverage" in discovered
+    # Reads as VWAP, not Vwap: the class name is taken from the source, not
+    # guessed from the filename.
+    assert "VWAP" in discovered
+    assert "Indicator" not in discovered
+
+
 def test_check_reports_invalid_python_without_crashing(client: TestClient) -> None:
     body = _check(client, "class Broken(BasePortfolio)\n    pass\n")
     assert body["ok"] is False

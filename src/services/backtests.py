@@ -35,6 +35,7 @@ from src.models import BacktestRun, RunEquityPoint, RunMetrics, RunTrade
 from src.repositories import runs as runs_repo
 from src.repositories import strategies as strategies_repo
 from src.repositories.runs import TERMINAL_STATUSES, RunFilters, RunListRow
+from src.services import market_data as market_data_service
 from src.schemas.backtests import (
     BacktestDetail,
     BacktestListResponse,
@@ -428,6 +429,38 @@ def _validated_window(request: BacktestRunRequest) -> tuple[date, date]:
     return start, end
 
 
+async def _validated_coverage(universe: list[str], start: date, end: date) -> None:
+    """Refuse a window the universe has no prices for.
+
+    Market data ends weeks behind the calendar, so a window that looks
+    reasonable can contain no bars at all. Without this the run is accepted,
+    queued, executed, and fails deep in the engine with an error about empty
+    data, which reads as a broken strategy rather than a bad date.
+
+    Reuses the coverage service so there is one definition of a valid window,
+    shared with ``GET /market-data/coverage`` and therefore with the run form's
+    date picker. A universe with no tickers is skipped rather than guessed at.
+    """
+    if not universe:
+        return
+
+    coverage = await market_data_service.coverage_for(universe)
+
+    if coverage.missing:
+        raise RunSubmissionError(
+            f"There is no market data for {', '.join(coverage.missing)}, so this "
+            "strategy cannot be backtested over any window."
+        )
+    if coverage.start is None or coverage.end is None:
+        return
+
+    if start.isoformat() < coverage.start or end.isoformat() > coverage.end:
+        raise RunSubmissionError(
+            f"There is only data from {coverage.start} to {coverage.end} for "
+            f"{', '.join(universe)}. Pick a window inside that range."
+        )
+
+
 def _validated_capital(raw: float) -> float:
     """Capital has to be positive and finite — it divides every return."""
     capital = float(raw)
@@ -582,6 +615,9 @@ async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
     name = _validated_name(request.name)
     strategy = await _load_runnable_strategy(request.strategy_key)
     start_date, end_date = _validated_window(request)
+    # After the cheap checks and after the strategy is known, because it needs
+    # both the universe and a database round trip per ticker.
+    await _validated_coverage(list(strategy.universe or []), start_date, end_date)
     initial_capital = _validated_capital(request.initial_capital)
     mode = _validated_mode(request.mode)
     params = _validated_params(strategy, request.params)

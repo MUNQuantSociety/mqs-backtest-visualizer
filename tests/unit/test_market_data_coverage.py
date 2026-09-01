@@ -23,8 +23,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server import app
-from src.repositories import strategies as strategies_repo
+from src.repositories import market_data as market_data_repo
 from src.schemas.market_data import CoverageResponse, TickerCoverage
+from src.services import backtests as backtests_service
 from src.services import market_data as market_data_service
 
 
@@ -53,7 +54,7 @@ def stub_repo(monkeypatch: pytest.MonkeyPatch):
             async def __aexit__(self, *exc):
                 return False
 
-        monkeypatch.setattr(strategies_repo, "ticker_coverage", fake_coverage)
+        monkeypatch.setattr(market_data_repo, "ticker_coverage", fake_coverage)
         monkeypatch.setattr(
             market_data_service, "session_scope", lambda: _NullSession()
         )
@@ -145,3 +146,80 @@ def test_an_empty_ticker_list_is_422(client: TestClient) -> None:
     response = client.get("/api/market-data/coverage", params={"tickers": " , ,"})
     assert response.status_code == 422
     assert "No tickers" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# The same coverage, enforced at submission
+# ---------------------------------------------------------------------------
+#
+# The endpoint bounds the run form's picker. This is the other half: a window
+# typed past those bounds is refused with a reason, instead of being queued and
+# failing deep in the engine with an error about empty data.
+
+
+@pytest.fixture
+def stub_coverage(monkeypatch: pytest.MonkeyPatch):
+    """Answer `coverage_for` directly, since the arithmetic is tested above."""
+
+    def install(response: CoverageResponse) -> None:
+        async def fake(_tickers):
+            return response
+
+        monkeypatch.setattr(market_data_service, "coverage_for", fake)
+
+    return install
+
+
+COVERED = CoverageResponse(tickers=[], start="2020-01-02", end="2026-07-15", missing=[])
+
+
+def test_a_window_inside_coverage_is_accepted(stub_coverage) -> None:
+    stub_coverage(COVERED)
+    asyncio.run(
+        backtests_service._validated_coverage(
+            ["AAPL"], date(2025, 1, 2), date(2026, 1, 2)
+        )
+    )
+
+
+def test_a_window_running_past_the_last_bar_is_refused(stub_coverage) -> None:
+    stub_coverage(COVERED)
+    with pytest.raises(backtests_service.RunSubmissionError) as excinfo:
+        asyncio.run(
+            backtests_service._validated_coverage(
+                ["AAPL"], date(2025, 1, 2), date(2026, 9, 1)
+            )
+        )
+    # The message carries the range, so the fix is obvious without a second try.
+    assert "2020-01-02 to 2026-07-15" in str(excinfo.value)
+
+
+def test_a_window_starting_before_the_first_bar_is_refused(stub_coverage) -> None:
+    stub_coverage(COVERED)
+    with pytest.raises(backtests_service.RunSubmissionError):
+        asyncio.run(
+            backtests_service._validated_coverage(
+                ["AAPL"], date(2019, 1, 2), date(2026, 1, 2)
+            )
+        )
+
+
+def test_a_universe_with_no_data_is_refused_by_name(stub_coverage) -> None:
+    stub_coverage(
+        CoverageResponse(tickers=[], start=None, end=None, missing=["NOPE"])
+    )
+    with pytest.raises(backtests_service.RunSubmissionError) as excinfo:
+        asyncio.run(
+            backtests_service._validated_coverage(
+                ["AAPL", "NOPE"], date(2025, 1, 2), date(2026, 1, 2)
+            )
+        )
+    assert "NOPE" in str(excinfo.value)
+
+
+def test_an_empty_universe_is_skipped_not_guessed_at(stub_coverage) -> None:
+    """Nothing to check against, and refusing every such run would be wrong."""
+    stub_coverage(COVERED)
+    asyncio.run(
+        backtests_service._validated_coverage([], date(2025, 1, 2), date(2026, 1, 2))
+    )

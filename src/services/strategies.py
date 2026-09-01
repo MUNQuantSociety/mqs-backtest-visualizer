@@ -28,8 +28,10 @@ from src.schemas.strategies import (
     StrategyStatus,
     StrategySubmission,
     StrategySubmissionResult,
+    StrategyTemplate,
 )
 from src.services import strategy_validation
+from src.services.strategy_validation import template
 
 # The registry tracks four states; the client's Zod enum knows three. Both
 # in-flight states collapse to ``draft`` — the submission message is what tells
@@ -114,6 +116,13 @@ async def list_strategies(include_disabled: bool = False) -> StrategyListRespons
         )
         items = [to_schema(row) for row in rows]
     return StrategyListResponse(items=items, total=len(items))
+
+
+def strategy_template() -> StrategyTemplate:
+    """The starter source, straight from the module the check tests against."""
+    return StrategyTemplate(
+        filename=template.STARTER_FILENAME, source=template.STARTER_SOURCE
+    )
 
 
 def check_strategy(request: StrategyCheckRequest) -> StrategyCheckResult:

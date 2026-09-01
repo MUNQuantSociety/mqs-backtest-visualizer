@@ -323,13 +323,15 @@ Pydantic models in `src/schemas/`.
 | Method | Path | Backed by | Notes |
 | --- | --- | --- | --- |
 | `GET` | `/api/health` | — | Liveness. No database, no engine, no I/O. |
-| `POST` | `/api/backtests` | **Postgres + worker pool** | Submit a run. `202` + `BacktestSummary`; `422` with a one-sentence `detail` for anything the student can fix. |
+| `POST` | `/api/backtests` | **Postgres + worker pool** | Submit a run. `202` + `BacktestSummary`; `422` with a one-sentence `detail` for anything the student can fix, including a window outside the universe's market-data coverage. |
 | `GET` | `/api/backtests` | **Postgres** | Paginated, newest first. Filters: `search`, `status`, `strategyId`, `page`, `pageSize`. |
 | `GET` | `/api/backtests/{id}` | **Postgres** | Detail: metrics, equity curve, trades, `parameters`, plus `progressPct` and `errorMessage`. `404` if unknown. |
 | `DELETE` | `/api/backtests/{id}` | **Postgres** | Delete or cancel — see the table above. `204`, or `404`. |
 | `GET` | `/api/strategies` | **Postgres** | Catalogue of enabled strategies with SQL-computed run aggregates. |
 | `POST` | `/api/strategies` | **Postgres + store + worker pool** | Upload source. Scans it, stores it, and queues its validation backtest. `201` + `status: "draft"`; `422` for a rejected source; `413` over 256 KB. |
+| `GET` | `/api/strategies/template` | *nothing* | Starter source for the editor. Served so the contract it teaches cannot drift from the engine; a test asserts it passes the check below. |
 | `POST` | `/api/strategies/check` | *nothing* | Pre-flight: would this source run here? Reads it with `ast`; stores nothing, executes nothing. Always `200` when the check ran, verdict in `ok`/`issues`; `413` over 256 KB. |
+| `GET` | `/api/market-data/coverage` | **Postgres** | Which dates have prices, by `tickers` or `strategyKey`. `start`/`end` are the window safe for the whole universe, null when a ticker has none. Read-only against `public.market_data`. |
 | `GET` | `/api/live/portfolios` | *sample data* | Live portfolio list. |
 | `GET` | `/api/live/portfolios/{id}` | *sample data* | Detail — config, positions. |
 | `GET` | `/api/live/portfolios/{id}/equity` | *sample data* | `days`. |

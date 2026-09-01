@@ -15,6 +15,7 @@ from src.schemas.strategies import (
     StrategyListResponse,
     StrategySubmission,
     StrategySubmissionResult,
+    StrategyTemplate,
 )
 from src.services import strategies as strategies_service
 from src.services.strategy_validation import StrategyValidationError
@@ -67,6 +68,16 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+
+
+@router.get("/template", response_model=StrategyTemplate)
+async def get_template() -> StrategyTemplate:
+    """Starter source for the editor.
+
+    Served so the contract the editor teaches cannot drift from the engine that
+    runs it. A test asserts this passes the compatibility check below.
+    """
+    return strategies_service.strategy_template()
 
 
 @router.post("/check", response_model=StrategyCheckResult)

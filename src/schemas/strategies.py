@@ -79,6 +79,17 @@ class StrategySubmissionResult(CamelModel):
     message: str = ""
 
 
+class StrategyTemplate(CamelModel):
+    """Starter source for the editor.
+
+    Served rather than hardcoded in the client so the contract it teaches
+    cannot drift from the engine that has to run it.
+    """
+
+    filename: str
+    source: str
+
+
 class StrategyCheckRequest(CamelModel):
     """Source to read for compatibility, and nothing else.
 
