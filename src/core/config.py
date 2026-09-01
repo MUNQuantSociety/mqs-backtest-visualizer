@@ -34,6 +34,23 @@ def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _env_first(*names: str, default: str = "") -> str:
+    """First non-empty value among several variable names.
+
+    The deploy stack (MQS_AWS_INFRA) injects the database credentials under the
+    names the .env template used before it was rewritten — MARKET_DATA_HOST and
+    friends — while this codebase reads POSTGRES_*. Until the two repositories
+    agree, accepting both means a deploy wired against either naming reaches
+    the database instead of booting with no credentials and failing on the
+    first backtest. POSTGRES_* wins when both are set.
+    """
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if raw:
+            return raw
+    return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -88,16 +105,22 @@ class Settings:
     # ------------------------------------------------------------------
     # Read-only on ``public.market_data``; owner of the ``app`` schema. The
     # credentials are admin-level, so the boundary is a rule, not a grant.
-    postgres_host: str = os.getenv("POSTGRES_HOST", "")
-    postgres_port: int = _env_int("POSTGRES_PORT", 25060)
-    postgres_db: str = os.getenv("POSTGRES_DB", "mqsdb")
-    postgres_user: str = os.getenv("POSTGRES_USER", "")
-    postgres_password: str = os.getenv("POSTGRES_PASSWORD", "")
+    postgres_host: str = _env_first("POSTGRES_HOST", "MARKET_DATA_HOST")
+    postgres_port: int = int(_env_first("POSTGRES_PORT", "MARKET_DATA_PORT", default="25060"))
+    postgres_db: str = _env_first("POSTGRES_DB", "MARKET_DATA_DB", default="mqsdb")
+    postgres_user: str = _env_first("POSTGRES_USER", "MARKET_DATA_USER")
+    postgres_password: str = _env_first("POSTGRES_PASSWORD", "MARKET_DATA_PASSWORD")
 
-    # ``require`` is rejected by this server's TLS negotiation; ``prefer``
-    # connects and still encrypts. Verified against the live instance — do not
-    # "harden" this without retesting.
-    postgres_sslmode: str = os.getenv("POSTGRES_SSLMODE", "prefer")
+    # The live server has SSL switched off (``SHOW ssl`` → off, checked
+    # 2026-09-01), so ``require`` fails outright and ``prefer`` connects in
+    # PLAINTEXT — the password crosses the network unencrypted. That is
+    # tolerable on the university network and not across the public internet;
+    # the deploy stack rightly insists on ``require``, which cannot succeed
+    # until SSL is enabled on the CAIR instance. Nothing here should paper
+    # over that: a required-SSL deploy must fail loudly, not downgrade.
+    postgres_sslmode: str = _env_first(
+        "POSTGRES_SSLMODE", "MARKET_DATA_SSLMODE", default="prefer"
+    )
 
     # The API holds a handful of connections; the heavy lifting happens in
     # worker processes with their own short-lived sync connections.

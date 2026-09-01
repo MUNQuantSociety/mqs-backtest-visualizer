@@ -40,6 +40,7 @@ as a service instead of a CLI.
 - [Tests](#tests)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations and deferred work](#known-limitations-and-deferred-work)
+- [Readiness report](docs/READINESS.md) — measured database latency, data horizon, and the ranked gap list
 
 ---
 
@@ -871,6 +872,11 @@ around a minute rather than a second.
 ---
 
 ## Known limitations and deferred work
+
+> The measured, dated picture — smoke-test numbers, per-ticker data horizon,
+> and every gap ranked by what blocks a deploy — lives in
+> **[docs/READINESS.md](docs/READINESS.md)**. Regenerate the numbers with
+> `venv/Scripts/python.exe scripts/smoke_db.py`.
 
 Honest list of what is not built, so nobody discovers it the hard way.
 

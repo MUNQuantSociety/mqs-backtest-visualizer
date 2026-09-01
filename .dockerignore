@@ -37,5 +37,11 @@
 **/secrets.dev.yaml
 **/values.dev.yaml
 **/.artifacts
+# Runtime state that must never ride along in an image: the parquet market-data
+# cache is hundreds of MB and is rebuilt from the database, and the local
+# strategy store holds uploads that belong to a running instance, not a build.
+data/
+.strategy_store/
+**/.pytest_cache
 LICENSE
 README.md
