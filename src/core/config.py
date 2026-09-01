@@ -127,6 +127,19 @@ class Settings:
         "PROGRESS_WRITE_INTERVAL_SECONDS", 1.0
     )
 
+    # Worker liveness, separate from progress. Progress callbacks stop for
+    # minutes while the engine loads bars from the remote database, so they
+    # cannot say whether the worker is alive; a dedicated thread beats on this
+    # cadence instead. A ``running`` row whose last beat is older than the
+    # stale threshold is judged dead by the reconciler at boot. Keep stale >>
+    # interval, with room for a slow database round trip.
+    run_heartbeat_interval_seconds: float = _env_float(
+        "RUN_HEARTBEAT_INTERVAL_SECONDS", 5.0
+    )
+    run_heartbeat_stale_seconds: float = _env_float(
+        "RUN_HEARTBEAT_STALE_SECONDS", 90.0
+    )
+
     # ------------------------------------------------------------------
     # User-strategy validation
     # ------------------------------------------------------------------

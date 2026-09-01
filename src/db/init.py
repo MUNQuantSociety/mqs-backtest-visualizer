@@ -28,6 +28,19 @@ logger = logging.getLogger(__name__)
 
 _CREATE_SCHEMA = text(f'CREATE SCHEMA IF NOT EXISTS "{APP_SCHEMA}"')
 
+# Additive column changes for tables that already exist. ``create_all`` only
+# creates missing *tables*; a column added to a model after the table was first
+# created on the live instance would otherwise be silently absent, and the
+# first INSERT naming it would fail. Every statement here must be idempotent
+# (``IF NOT EXISTS``) because this runs on every boot. This list is the
+# migration story until Alembic arrives — append, never edit.
+_ADDITIVE_MIGRATIONS = (
+    text(
+        f'ALTER TABLE "{APP_SCHEMA}".backtest_runs '
+        "ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ"
+    ),
+)
+
 # Set once the tables have been confirmed to exist in this process. The lock
 # keeps concurrent first requests from racing into create_all together.
 _schema_ready = False
@@ -42,6 +55,8 @@ def init_database(engine: Engine | None = None) -> None:
         with engine.begin() as connection:
             connection.execute(_CREATE_SCHEMA)
             Base.metadata.create_all(connection)
+            for statement in _ADDITIVE_MIGRATIONS:
+                connection.execute(statement)
         logger.info("app schema ready (%d tables)", len(Base.metadata.tables))
     finally:
         if owned:
@@ -70,6 +85,8 @@ async def ensure_schema() -> None:
         async with get_async_engine().begin() as connection:
             await connection.execute(_CREATE_SCHEMA)
             await connection.run_sync(Base.metadata.create_all)
+            for statement in _ADDITIVE_MIGRATIONS:
+                await connection.execute(statement)
         _schema_ready = True
         logger.info("app schema ready (%d tables)", len(Base.metadata.tables))
 

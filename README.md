@@ -96,8 +96,13 @@ Two consequences you will actually see:
 
 - A reload kills any run in flight. That is not silent data loss: on the next
   boot the reconciler (`src/workers/reconciler.py`) marks runs left `running`
-  as `failed` with `"Interrupted by server restart"`, and re-submits runs left
-  `queued`, which were never claimed by anything.
+  **whose worker has stopped heartbeating** as `failed` with
+  `"Interrupted by server restart"`, and re-submits runs left `queued`, which
+  were never claimed by anything. The heartbeat is the point: a worker beats
+  every `RUN_HEARTBEAT_INTERVAL_SECONDS` on a thread that does not depend on
+  engine progress, so a boot only fails rows whose last beat is older than
+  `RUN_HEARTBEAT_STALE_SECONDS`. A second API instance, a rolling deploy, or a
+  test module opening its own app never kills someone else's live run.
 - Nothing at import time touches the database or the pool, so `import server`,
   `pytest`, and `python scripts/*.py` are all cheap and side-effect free.
 
@@ -331,6 +336,9 @@ Pydantic models in `src/schemas/`.
 | `POST` | `/api/strategies` | **Postgres + store + worker pool** | Upload source. Scans it, stores it, and queues its validation backtest. `201` + `status: "draft"`; `422` for a rejected source; `413` over 256 KB. |
 | `GET` | `/api/strategies/template` | *nothing* | Starter source for the editor. Served so the contract it teaches cannot drift from the engine; a test asserts it passes the check below. |
 | `POST` | `/api/strategies/check` | *nothing* | Pre-flight: would this source run here? Reads it with `ast`; stores nothing, executes nothing. Always `200` when the check ran, verdict in `ok`/`issues`; `413` over 256 KB. |
+| `POST` | `/api/strategies/upload` | **Postgres** + store | `POST /strategies` for a real file: multipart `file` (`.py`, UTF-8, ≤ 256 KB) plus `name`/`description` form fields. Same scan, same store, same validation backtest, same `201` — with `validationRunId` to poll. |
+| `POST` | `/api/strategies/upload/check` | *nothing* | `POST /strategies/check` for a file. Same verdict semantics: `200` either way, problems listed by line. |
+| `GET` | `/api/strategies/{key}` | **Postgres** | One strategy **including the ones the catalogue hides**. `validationState` is the real lifecycle (`validating` / `active` / `failed_validation`), `validationRunId` the backtest to open for progress or the failure reason. This is how a client watches an upload. `404` if unknown. |
 | `GET` | `/api/market-data/coverage` | **Postgres** | Which dates have prices, by `tickers` or `strategyKey`. `start`/`end` are the window safe for the whole universe, null when a ticker has none. Read-only against `public.market_data`. |
 | `GET` | `/api/live/portfolios` | *sample data* | Live portfolio list. |
 | `GET` | `/api/live/portfolios/{id}` | *sample data* | Detail — config, positions. |

@@ -8,9 +8,12 @@ gives up.
 
 So startup begins by telling the truth about the previous startup's work:
 
-* a run left ``running`` had its process taken away and is marked ``failed``
-  — and if it was validating an uploaded strategy, that strategy is given the
-  same verdict, because nothing else will ever move it out of ``validating``;
+* a run left ``running`` **whose worker has stopped heartbeating** had its
+  process taken away and is marked ``failed`` — and if it was validating an
+  uploaded strategy, that strategy is given the same verdict, because nothing
+  else will ever move it out of ``validating``. A run that is still beating
+  belongs to a worker that is alive — another API instance, a rolling deploy,
+  a second test module in the same process — and is left alone;
 * a run left ``queued`` was never claimed by anything, and its job is still
   perfectly runnable — it is handed back to the pool.
 
@@ -23,9 +26,11 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Engine, Row, func, select, update
+from sqlalchemy import Engine, Row, func, or_, select, update
 
+from src.core.config import settings
 from src.db.engine import create_sync_engine
 from src.db.init import init_database
 from src.models import BacktestRun
@@ -43,12 +48,26 @@ INTERRUPTED_MESSAGE = "Interrupted by server restart"
 MAX_REQUEUED_RUNS = 100
 
 
+def _stale_cutoff() -> datetime:
+    """Beats older than this mean the worker is gone."""
+    return datetime.now(timezone.utc) - timedelta(
+        seconds=float(settings.run_heartbeat_stale_seconds)
+    )
+
+
 def reconcile_interrupted_runs(engine: Engine | None = None) -> int:
-    """Fail every run still marked ``running``. Returns how many.
+    """Fail every ``running`` run whose worker is no longer beating. Returns how many.
+
+    The predicate is the heartbeat, not the status. ``status='running'`` only
+    says a worker *claimed* the row; whether that worker still exists is what
+    ``heartbeat_at`` answers, and a boot cannot know it any other way — the
+    dead worker was in a previous process, and a live one may be in another
+    instance entirely. A NULL beat is treated as stale: it means the row was
+    claimed before the column existed, by a process this deploy replaced.
 
     Safe on a healthy boot: nothing is ``running`` before the first job is
     claimed, so this matches zero rows. It must run *before* the pool starts
-    accepting work, or it would fail the runs it is about to start.
+    accepting work, or it would race the runs it is about to start.
 
     Runs that were validating an upload also settle the strategy they were
     proving — see :func:`_settle_interrupted_validations`.
@@ -57,13 +76,17 @@ def reconcile_interrupted_runs(engine: Engine | None = None) -> int:
     engine = engine or create_sync_engine()
     try:
         init_database(engine)
+        cutoff = _stale_cutoff()
         with engine.begin() as connection:
             # RETURNING rather than a bare rowcount: a run that was validating
             # an upload has a second row to correct, and this is the only
             # moment its identity is known without a second query.
             interrupted = connection.execute(
                 update(_RUNS)
-                .where(_RUNS.c.status == "running")
+                .where(
+                    _RUNS.c.status == "running",
+                    or_(_RUNS.c.heartbeat_at.is_(None), _RUNS.c.heartbeat_at < cutoff),
+                )
                 .values(
                     status="failed",
                     error_message=INTERRUPTED_MESSAGE,
@@ -75,7 +98,10 @@ def reconcile_interrupted_runs(engine: Engine | None = None) -> int:
         count = len(interrupted)
         if count:
             logger.warning(
-                "Marked %d interrupted run(s) as failed: %s", count, INTERRUPTED_MESSAGE
+                "Marked %d interrupted run(s) as failed (no heartbeat since %s): %s",
+                count,
+                cutoff.isoformat(timespec="seconds"),
+                INTERRUPTED_MESSAGE,
             )
             _settle_interrupted_validations(engine, interrupted)
         return count

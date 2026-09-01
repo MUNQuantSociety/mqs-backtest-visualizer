@@ -84,7 +84,7 @@ flowchart TD
     SERVER --> LIFE["<b>src/workers/job_manager.py:239</b><br/>application_lifespan"]
 
     LIFE --> SCHEMA["<b>src/db/init.py</b> · ensure_schema<br/>CREATE SCHEMA app + create_all<br/><i>models in src/models/</i>"]
-    SCHEMA --> RECON["<b>src/workers/reconciler.py</b><br/>runs stuck 'running' → 'failed'<br/><i>their worker died</i>"]
+    SCHEMA --> RECON["<b>src/workers/reconciler.py</b><br/>'running' + stale heartbeat → 'failed'<br/><i>still beating = another live worker, left alone</i>"]
     RECON --> REQUEUE["<b>job_manager.py:228</b> · _requeue_orphans<br/>runs left 'queued' → resubmitted<br/><i>never claimed, so safe</i>"]
     REQUEUE --> POOL["<b>job_manager.py:173</b> · start_job_manager<br/>ProcessPoolExecutor"]
     POOL --> ROUTER["<b>src/api/router.py</b><br/>routes mounted at /api"]
@@ -106,6 +106,15 @@ pool *spawns* workers by re-importing the module tree. A pool built at import
 time would rebuild itself inside every worker it created; under `--reload` the
 first file save turns that into a fork bomb. A lifespan runs once per real
 server process and never inside a spawned worker.
+
+**The reconciler judges by heartbeat, not by status.** `status='running'` only
+says a worker claimed the row; whether that worker is alive is what
+`heartbeat_at` answers. Each worker beats every few seconds on a thread
+independent of engine progress — progress callbacks stop for minutes during a
+cold `market_data` load, so they cannot serve as liveness. A boot fails only
+rows whose beat is stale, which is what lets two API instances, a rolling
+deploy, or two test modules in one process coexist without killing each
+other's runs.
 
 ---
 
@@ -282,7 +291,7 @@ progress, same error reporting.
 
 ```mermaid
 flowchart TD
-    UP(["POST /api/strategies"]) --> SR["<b>src/api/routes/strategies.py</b>"]
+    UP(["POST /api/strategies  (JSON source)<br/>POST /api/strategies/upload  (multipart .py)"]) --> SR["<b>src/api/routes/strategies.py</b><br/>file → UTF-8 text, then one shared path"]
     SR --> SS["<b>src/services/strategies.py</b>"]
     SS --> SV["<b>src/services/strategy_validation.py</b>"]
 
@@ -302,7 +311,8 @@ flowchart TD
     WIN --> SV2["<b>:389</b> start_validation<br/>run with purpose='validation'"]
     SV2 --> PIPE["<b>the pipeline in §4</b>"]
     SV2 --> TO["<b>:436</b> _schedule_timeout"]
-    SV2 --> RESP(["<b>201</b> status='draft'<br/>'validation started'"])
+    SV2 --> RESP(["<b>201</b> status='draft'<br/><b>validationRunId</b> to poll"])
+    RESP -.->|"GET /strategies/{key}<br/>validationState · validationRunId"| OUT
 
     PIPE --> OUT{"run outcome"}
     OUT -->|completed| ACT["strategy → <b>active</b> + enabled<br/><i>now selectable; reruns via §3</i>"]
@@ -319,6 +329,13 @@ flowchart TD
     class R422,BAD err
     class ACT good
 ```
+
+**Watching an upload.** The catalogue (`GET /strategies`) shows only enabled
+rows, so a validating or failed upload is invisible there by design. The
+client watches it through `GET /strategies/{key}` — `validationState` carries
+the real lifecycle and `validationRunId` is the run to open for a progress bar
+or, on failure, the reason — and `POST /strategies/check` (or `/upload/check`)
+answers "would this run here?" in milliseconds before anything is submitted.
 
 **The layout mirroring is load-bearing, not cosmetic.** `BasePortfolio` finds
 its `config.json` by looking next to its `strategy.py`

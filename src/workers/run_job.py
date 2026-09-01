@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -151,6 +152,7 @@ def run_job(run_id: str) -> str:
 def _execute(engine: Engine, parsed: uuid.UUID) -> str:
     """Claim the run, execute it, and leave it terminal. See :func:`run_job`."""
     context: _RunContext | None = None
+    heartbeat: _RunHeartbeat | None = None
     try:
         _ensure_schema(engine)
 
@@ -166,6 +168,7 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
             return _fail(engine, parsed, _describe(exc))
 
         heartbeat = _RunHeartbeat(engine, parsed)
+        heartbeat.start()
         if heartbeat.should_cancel():
             # Cancelled while it sat in the queue. Answering now saves the
             # minutes of data loading that precede the first cancellation poll.
@@ -195,6 +198,8 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
         _fail(engine, parsed, _describe(exc))
         return "failed"
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         if context is not None:
             _remove_workdir(context.workdir)
 
@@ -229,6 +234,7 @@ def _claim(engine: Engine, run_id: uuid.UUID) -> bool:
             .values(
                 status="running",
                 started_at=func.now(),
+                heartbeat_at=func.now(),
                 progress_pct=0,
                 # A resubmitted run should not display the previous attempt's
                 # error while it is running.
@@ -266,6 +272,54 @@ class _RunHeartbeat:
         # throttled, because a run cancelled while queued should stop before it
         # loads a single bar.
         self._last_poll = float("-inf")
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # -- liveness ---------------------------------------------------------
+    #
+    # Progress is not liveness. The engine makes no callback at all while it
+    # loads bars — minutes, on a cold cache against the remote database — so a
+    # reconciler that judged "alive" by progress writes would kill healthy
+    # runs during exactly the phase that takes longest. This thread beats on
+    # its own clock, and stops the moment the run leaves the engine.
+
+    def start(self) -> None:
+        """Begin beating on a daemon thread. Idempotent."""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._beat_forever,
+            name=f"heartbeat-{self._run_id}",
+            daemon=True,  # never keeps a worker process alive on its own
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop beating and wait briefly for the thread to notice."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def _beat_forever(self) -> None:
+        interval = max(float(settings.run_heartbeat_interval_seconds), 0.5)
+        while not self._stop.wait(interval):
+            try:
+                with self._engine.begin() as connection:
+                    connection.execute(
+                        update(_RUNS)
+                        .where(_RUNS.c.id == self._run_id)
+                        .values(heartbeat_at=func.now())
+                    )
+            except Exception as exc:
+                # Same policy as progress: a missed beat is a cosmetic problem
+                # with a large grace window; a backtest killed by a transient
+                # database error is not.
+                logger.warning(
+                    "Run %s: heartbeat failed (%s); the run continues",
+                    self._run_id,
+                    _describe(exc),
+                )
 
     def on_progress(self, pct: int, stage: str) -> None:
         """Engine callback: record progress, write it at most once a second."""
