@@ -57,9 +57,9 @@ Only its own temporary test objects were deleted; version history remains.
 
 ## Automated proof
 
-- Backend offline suite: **538 passed, 1 expected opt-in skip, 93 deselected**.
+- Backend offline suite at `d686979`: **538 passed, 1 expected opt-in skip, 93 deselected**.
   The database and storage boundaries were isolated from live services.
-- Disposable PostgreSQL pipeline: **16 passed**. Fresh upload, validation,
+- Disposable PostgreSQL pipeline after the container-target guard correction: **23 passed**. Fresh upload, validation,
   activation and two identical browser-shaped reruns use the real spawned worker
   and engine. Tests assert 5 bps fills, positive fees, exact repeatability and
   final equity = capital + realized P&L + open-position P&L − fees (within a cent).
@@ -71,6 +71,14 @@ Only its own temporary test objects were deleted; version history remains.
 
 The local suite emits an existing Starlette/httpx deprecation warning. The
 frontend build reports the existing large demo-data chunk warning.
+
+The first hosted CI run passed unit and image jobs but caught a fixture guard
+assuming PostgreSQL's server address would also be loopback. Docker's forwarded
+port uses a private server address. The corrected guard validates the actual
+client target and the dedicated database/role without allowing remote targets;
+seven additional guard cases accompany it. See
+[backend PR checks](https://github.com/MUNQuantSociety/mqs-backtest-visualizer/pull/3/checks)
+for the exact current commit's hosted results.
 
 ## Release gates and outstanding operations
 

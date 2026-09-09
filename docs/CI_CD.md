@@ -23,9 +23,9 @@ The following activation state is confirmed by the operations handoff:
   The existing ECS task lacks usable database configuration, and CAIR
   PostgreSQL TLS remains off. Application authentication and worker
   sandboxing are separate unfinished release prerequisites.
-- Backend and S3 checks have been verified in the finish-work. Hosted GitHub
-  CI and the image build for the final commit remain unconfirmed until the
-  commit is pushed and the final Actions run is inspected.
+- Backend and S3 behavior is covered by the measured [verification record](VERIFICATION.md).
+  Hosted CI runs on dev and on pull requests; the current PR's Checks tab is
+  authoritative for its exact commit. A local pass alone is not release proof.
 
 Keep the release flag false until all release prerequisites below are met.
 The existing ECS service remains outside the integrations Terraform state.

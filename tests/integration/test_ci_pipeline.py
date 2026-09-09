@@ -4,7 +4,7 @@ Run independently with ``python -m pytest tests/integration/test_ci_pipeline.py 
 The database proof skips BEFORE any connection unless CI_DATABASE_TESTS=1. When
 enabled it fails, never skips, on a wrong target or unavailable database. Required:
 POSTGRES_HOST=127.0.0.1 (or localhost), POSTGRES_DB=mqs_test, explicit POSTGRES_PORT,
-POSTGRES_USER and nonempty POSTGRES_PASSWORD; use POSTGRES_SSLMODE=disable locally.
+POSTGRES_USER=mqs_test and nonempty POSTGRES_PASSWORD; use POSTGRES_SSLMODE=disable locally.
 
 Only a disposable database may be used. This test creates public.market_data and
 seeds synthetic bars when the table is absent; an existing table must match the
@@ -73,6 +73,8 @@ def _database_target(environment: Mapping[str, str]) -> dict[str, str] | None:
             "CI_DATABASE_TESTS=1 requires POSTGRES_DB=mqs_test; "
             "refusing to connect or seed any other database"
         )
+    if environment.get("POSTGRES_USER") != "mqs_test":
+        raise AssertionError("CI_DATABASE_TESTS=1 requires POSTGRES_USER=mqs_test")
     for key in ("POSTGRES_PORT", "POSTGRES_USER", "POSTGRES_PASSWORD"):
         if not environment.get(key, "").strip():
             raise AssertionError(f"Set {key} explicitly for the test DB")
@@ -109,6 +111,7 @@ def test_no_opt_in_needs_no_database_configuration(opt_in):
         ("POSTGRES_DB", "", "POSTGRES_DB"),
         ("POSTGRES_PORT", "0", "POSTGRES_PORT"),
         ("POSTGRES_USER", "", "POSTGRES_USER"),
+        ("POSTGRES_USER", "admin", "POSTGRES_USER"),
         ("POSTGRES_PASSWORD", "", "POSTGRES_PASSWORD"),
     ],
 )
@@ -267,6 +270,55 @@ def test_synthetic_fixture_covers_every_upload_ticker_and_new_york_dst():
             assert volume > 0
 
 
+def _assert_disposable_connection(connection, cursor):
+    # Validate the client's actual target, not inet_server_addr(): a Docker
+    # published loopback port reaches a server on its private bridge address.
+    # No arbitrary private-network destinations are permitted here.
+    target = connection.get_dsn_parameters()
+    if not (
+        target.get("host") == "127.0.0.1"
+        and target.get("hostaddr", "") in {"", "127.0.0.1"}
+        and target.get("dbname") == "mqs_test"
+        and target.get("user") == "mqs_test"
+    ):
+        raise AssertionError("Wrong disposable connection target")
+    cursor.execute("SELECT current_database(), current_user")
+    if cursor.fetchone() != ("mqs_test", "mqs_test"):
+        raise AssertionError("Wrong disposable database or role")
+
+
+@pytest.mark.parametrize("hostaddr", ["", "127.0.0.1"])
+def test_disposable_connection_supports_loopback_port_forwarding(hostaddr):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    connection = SimpleNamespace(get_dsn_parameters=lambda: {
+        "host": "127.0.0.1", "hostaddr": hostaddr,
+        "dbname": "mqs_test", "user": "mqs_test",
+    })
+    cursor = Mock()
+    cursor.fetchone.return_value = ("mqs_test", "mqs_test")
+    _assert_disposable_connection(connection, cursor)
+    cursor.execute.assert_called_once_with("SELECT current_database(), current_user")
+
+
+@pytest.mark.parametrize("key,value", [
+    ("host", "172.18.0.2"), ("hostaddr", "192.0.2.1"),
+    ("dbname", "mqsdb"), ("user", "admin"),
+])
+def test_connected_target_guard_rejects_redirects_before_any_sql(key, value):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    target = {"host": "127.0.0.1", "hostaddr": "127.0.0.1",
+              "dbname": "mqs_test", "user": "mqs_test", key: value}
+    connection = SimpleNamespace(get_dsn_parameters=lambda: target)
+    cursor = Mock()
+    with pytest.raises(AssertionError, match="Wrong disposable connection target"):
+        _assert_disposable_connection(connection, cursor)
+    cursor.execute.assert_not_called()
+
+
 def _seed_disposable_market_data(connection, tickers):
     from psycopg2.extras import execute_values
 
@@ -274,8 +326,7 @@ def _seed_disposable_market_data(connection, tickers):
     assert len(_trading_days()[WARMUP_DAYS:]) >= 80
     with connection, connection.cursor() as cursor:
         # Recheck the actual server identity before the only fixture DDL/DML.
-        cursor.execute("SELECT current_database(), host(inet_server_addr())")
-        assert cursor.fetchone() == ("mqs_test", "127.0.0.1"), "Wrong disposable server"
+        _assert_disposable_connection(connection, cursor)
         cursor.execute("SELECT to_regclass('public.market_data')")
         if cursor.fetchone()[0] is None:
             cursor.execute(
