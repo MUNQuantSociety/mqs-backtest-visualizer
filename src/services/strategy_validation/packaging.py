@@ -11,7 +11,7 @@ import json
 import logging
 from typing import Any
 
-from src.integrations.strategy_store import get_strategy_store, strategy_key
+from src.integrations.strategy_store import StrategyStoreError, get_strategy_store, strategy_key
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +75,43 @@ def store_strategy_source(key: str, source: str, config: dict[str, Any]) -> str:
     ``BasePortfolio`` finds its config by looking beside the file its class was
     defined in, so a key holding only ``strategy.py`` materializes into a
     directory the engine cannot configure.
+
+    Callers must allocate a fresh key or serialize retries for an existing
+    key. Prefix existence is a collision guard, not a cross-process lock.
     """
+    # Serialize before the first write: bad config/encoding must leave no
+    # source-only package. Upload keys are uniquely allocated by the caller.
+    config_source = json.dumps(config, indent=2, allow_nan=False) + "\n"
+    source.encode("utf-8")
     storage = strategy_key(key)
     store = get_strategy_store()
-    store.put(storage, SOURCE_FILENAME, source)
-    store.put(storage, CONFIG_FILENAME, json.dumps(config, indent=2) + "\n")
+    if store.exists(storage):
+        # An identical completed package is a safe retry (including migration
+        # after a DB commit failure). Never overwrite or sweep an existing key.
+        try:
+            if (
+                store.get(storage, SOURCE_FILENAME) == source
+                and store.get(storage, CONFIG_FILENAME) == config_source
+            ):
+                return storage
+        except KeyError:
+            pass
+        raise StrategyStoreError(f"refusing to replace existing strategy package {storage!r}")
+    try:
+        store.put(storage, SOURCE_FILENAME, source)
+        store.put(storage, CONFIG_FILENAME, config_source)
+    except Exception as exc:
+        # Include failures on the first put: a timeout can arrive after S3
+        # accepted the write. Only the fresh, caller-owned prefix is removed.
+        try:
+            store.delete(storage)
+        except Exception as cleanup_exc:
+            exc.add_note(
+                f"Cleanup failed for {storage!r}: {type(cleanup_exc).__name__}; "
+                "stored objects may remain"
+            )
+            logger.exception("Partial strategy package %s could not be removed", storage)
+        raise
     return storage
 
 

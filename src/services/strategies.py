@@ -7,6 +7,7 @@ database and the client disagree about — the status vocabulary.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -239,28 +240,30 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
 
     key = _generate_key(submission.name)
     config = strategy_validation.build_config(key)
-    storage_key = strategy_validation.store_strategy_source(
-        key, submission.source, config
+    storage_key = await asyncio.to_thread(
+        strategy_validation.store_strategy_source, key, submission.source, config
     )
 
-    async with session_scope() as session:
-        await strategies_repo.create_strategy(
-            session,
-            key=key,
-            name=submission.name,
-            description=submission.description or "",
-            kind="user",
-            status="validating",
-            # Never surfaces in the catalogue until a validation run passes.
-            enabled=False,
-            tags=["user"],
-            universe=list(config["TICKERS"]),
-            param_specs=strategy_validation.parameter_specs(),
-            # An upload has no import path: the worker materializes this key
-            # and imports the file it finds there.
-            storage_key=storage_key,
-            class_path=None,
-        )
+    try:
+        async with session_scope() as session:
+            await strategies_repo.create_strategy(
+                session,
+                key=key,
+                name=submission.name,
+                description=submission.description or "",
+                kind="user",
+                status="validating",
+                # Not selectable until its real validation backtest passes.
+                enabled=False,
+                tags=["user"],
+                universe=list(config["TICKERS"]),
+                param_specs=strategy_validation.parameter_specs(),
+                storage_key=storage_key,
+                class_path=None,
+            )
+    except Exception:
+        await _discard_unregistered_source(key)
+        raise
 
     message, run_id = await _begin_validation(
         key, submission.name, config, scan.class_name
@@ -304,18 +307,29 @@ async def _begin_validation(
         ), None
 
     async with session_scope() as session:
-        await strategies_repo.set_validation_state(
-            session,
-            key,
-            status="validating",
-            enabled=False,
-            validation_run_id=uuid.UUID(summary.id),
-        )
+        await strategies_repo.attach_validation_run(session, key, uuid.UUID(summary.id))
 
     return (
         f"Validation backtest started for {class_name} — the strategy "
         f"activates when it passes. Follow run {summary.id} for progress."
     ), summary.id
+
+
+async def _discard_unregistered_source(key: str) -> None:
+    """Clean a fresh failed upload only if its registry transaction did not commit.
+
+    An uncertain commit must not leave a live registry entry pointing at deleted
+    source. If the verification read also fails, retain the package for recovery.
+    """
+    try:
+        async with session_scope() as session:
+            registered = await strategies_repo.get_strategy(session, key)
+        if registered is None:
+            await asyncio.to_thread(strategy_validation.discard_stored_source, key)
+    except Exception:
+        logger.exception(
+            "Retaining source for %s after an uncertain registry write", key
+        )
 
 
 async def delete_strategy(key: str) -> bool:
@@ -330,5 +344,5 @@ async def delete_strategy(key: str) -> bool:
         removed = await strategies_repo.delete_strategy(session, key)
 
     if removed:
-        strategy_validation.discard_stored_source(key)
+        await asyncio.to_thread(strategy_validation.discard_stored_source, key)
     return removed

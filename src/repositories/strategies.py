@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import bindparam, func, select, text
+from sqlalchemy import bindparam, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models import BacktestRun, Strategy
@@ -204,6 +204,16 @@ async def strategies_with_staged_source(session: AsyncSession) -> list[Strategy]
         Strategy.source_staging.is_not(None), Strategy.kind == "user"
     )
     return list((await session.execute(statement)).scalars().all())
+
+
+async def attach_validation_run(session: AsyncSession, key: str, run_id: uuid.UUID) -> None:
+    """Attach a run without resetting a verdict a fast worker already wrote."""
+    await session.execute(
+        update(Strategy)
+        .where(Strategy.key == key, Strategy.kind == "user",
+               (Strategy.validation_run_id.is_(None)) | (Strategy.validation_run_id == run_id))
+        .values(validation_run_id=run_id)
+    )
 
 
 async def adopt_staged_source(

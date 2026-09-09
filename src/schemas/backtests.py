@@ -52,6 +52,9 @@ class PerformanceMetrics(CamelModel):
     win_rate: float
     profit_factor: float
     total_trades: int
+    # Existing clients require numbers. Keys here identify undefined values
+    # whose numeric compatibility placeholder must not be displayed as zero.
+    unavailable: dict[str, str] = Field(default_factory=dict)
 
 
 class BacktestSummary(CamelModel):
@@ -89,6 +92,8 @@ class BacktestDetail(BacktestSummary):
     # frontend session: a cancelled run is `status="failed"` with
     # `errorMessage="Cancelled by user"`, which is unreadable without this.
     error_message: str | None = None
+    report_metadata: dict[str, Any] = Field(default_factory=dict)
+    open_positions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class BacktestListResponse(Page):

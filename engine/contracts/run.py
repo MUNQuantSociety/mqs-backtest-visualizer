@@ -77,6 +77,9 @@ class RunRequest:
     # a script with no database in sight.
     on_progress: Callable[[int, str], None] = _noop_progress
     should_cancel: Callable[[], bool] = _never_cancel
+    # Cash charged per filled share, on both buys and sells. Kept separate
+    # from fractional slippage and from the strategy's parameter dictionary.
+    commission_per_share: float = 0.0
 
 
 @dataclass
@@ -94,3 +97,13 @@ class RunResult:
     fills: list[dict[str, Any]] = field(default_factory=list)
     final_equity: float | None = None
     artifact_dir: str | None = None
+    # The close of the last bar the equity curve saw, per ticker — the marks
+    # ``final_equity`` was valued at. Supplemental unrealized P&L can use these
+    # marks without inventing closing fills. Last quotes can be stale for a
+    # ticker that did not trade at the final timestamp.
+    # Empty when there is nothing to mark (fast mode has no fills). A plain
+    # dict of floats so it crosses the process boundary like everything else.
+    final_prices: dict[str, float] = field(default_factory=dict)
+    # Plain serializable provenance for RunMetrics.extra / API reportMetadata.
+    # Includes benchmark definition/coverage and the explicit chart baseline.
+    report_metadata: dict[str, Any] = field(default_factory=dict)

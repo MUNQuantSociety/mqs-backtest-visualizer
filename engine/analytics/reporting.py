@@ -1,7 +1,8 @@
 import logging
 import os
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Dict
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
@@ -262,6 +263,8 @@ def _generate_minute_by_minute_performance(
         -trades_df["shares"] * trades_df["fill_price"],
         trades_df["shares"] * trades_df["fill_price"],
     )
+    if "fees" in trades_df:
+        trades_df["cash_change"] -= pd.to_numeric(trades_df["fees"], errors="coerce").fillna(0.0)
     trades_df["position_change"] = np.where(
         trades_df["signal_type"] == "BUY", trades_df["shares"], -trades_df["shares"]
     )
@@ -302,64 +305,149 @@ def _generate_buy_and_hold_benchmark(
     full_historical_data: pd.DataFrame,
     initial_capital: float,
     portfolio_weights: dict[str, float],
+    start: Any = None,
+    end: Any = None,
 ) -> pd.DataFrame:
+    """Hold fixed shares bought at each ticker's first valid in-window close.
+
+    Allocations remain cash until their first quote. Later marks carry forward;
+    no prices are backfilled and no calendar/minute grid is allocated. Summing
+    changes in each holding's P&L needs only the observed rows, even for a large
+    sparse universe. Residual cash (or financing when weights exceed one) is
+    constant, with no costs, interest, or rebalancing.
     """
-    CORRECTED: Generates a robust minute-by-minute benchmark report that accounts
-    for uninvested capital, ensuring the starting value is always correct.
-    """
-    if full_historical_data.empty or not portfolio_weights:
+    if full_historical_data is None or full_historical_data.empty:
         return pd.DataFrame()
-
-    price_pivot = full_historical_data.pivot(
-        index="timestamp", columns="ticker", values="close_price"
-    )
-    price_pivot.index = pd.to_datetime(price_pivot.index, errors="coerce")
-    price_pivot = price_pivot[price_pivot.index.notna()].sort_index()
-    if _minute_resample_too_large(price_pivot):
-        logging.warning(
-            "Skipping buy-and-hold benchmark: %d tickers x %d-min span exceeds %d-cell limit",
-            len(price_pivot.columns),
-            int((price_pivot.index.max() - price_pivot.index.min()).total_seconds() // 60),
-            MINUTE_RESAMPLE_CELL_LIMIT,
-        )
-        return pd.DataFrame()
-    minute_prices = price_pivot.resample("min").ffill().bfill()
-
-    first_day_prices = minute_prices.iloc[0]
-    initial_shares = pd.Series(index=portfolio_weights.keys(), dtype=float)
-
-    # Calculate the initial capital that is actually invested into assets.
-    total_investment = 0.0
-    for ticker, weight in portfolio_weights.items():
-        if ticker in first_day_prices and first_day_prices[ticker] > 0:
-            investment_amount = initial_capital * weight
-            initial_shares[ticker] = investment_amount / first_day_prices[ticker]
-            total_investment += investment_amount
-
-    initial_shares = initial_shares.fillna(0)
-
-    # Calculate the portion of capital that remains as cash.
-    initial_cash_held = initial_capital - total_investment
-
-    # Calculate the value of the asset holdings over time.
-    aligned_tickers = [
-        ticker for ticker in initial_shares.index if ticker in minute_prices.columns
+    if not np.isfinite(initial_capital) or initial_capital <= 0:
+        raise ValueError("Benchmark initial capital must be finite and positive.")
+    weights = benchmark_weights(portfolio_weights, list(portfolio_weights))
+    needed = {"timestamp", "ticker", "close_price"}
+    if not needed.issubset(full_historical_data.columns):
+        raise ValueError("Benchmark prices need timestamp, ticker and close_price.")
+    frame = full_historical_data[["timestamp", "ticker", "close_price"]].copy()
+    frame["timestamp"] = market_timestamps(frame["timestamp"])
+    frame["ticker"] = frame["ticker"].astype(str)
+    frame["close_price"] = pd.to_numeric(frame["close_price"], errors="coerce")
+    frame = frame.loc[
+        frame["ticker"].isin(weights)
+        & frame["timestamp"].notna()
+        & np.isfinite(frame["close_price"])
+        & (frame["close_price"] > 0)
     ]
-    benchmark_asset_values = minute_prices[aligned_tickers].dot(
-        initial_shares[aligned_tickers]
+    if start is not None:
+        frame = frame.loc[frame["timestamp"] >= market_timestamp(start)]
+    if end is not None:
+        frame = frame.loc[frame["timestamp"] <= market_timestamp(end)]
+    frame = frame.sort_values("timestamp", kind="stable").drop_duplicates(
+        ["timestamp", "ticker"], keep="last"
     )
-
-    # The total benchmark value is the fluctuating asset value plus the fixed cash held.
-    benchmark_total_values = benchmark_asset_values + initial_cash_held
-
-    benchmark_df = pd.DataFrame(
-        {"timestamp": minute_prices.index, "buy_and_hold_value": benchmark_total_values}
+    if frame.empty:
+        return pd.DataFrame()
+    first_prices = frame.groupby("ticker")["close_price"].transform("first")
+    frame["pnl"] = (
+        initial_capital * frame["ticker"].map(weights)
+        * (frame["close_price"] / first_prices - 1.0)
     )
+    frame["change"] = frame.groupby("ticker")["pnl"].diff().fillna(0.0)
+    values = initial_capital + frame.groupby("timestamp")["change"].sum().cumsum()
+    if not np.isfinite(values).all():
+        raise ValueError("Benchmark valuation produced non-finite values.")
+    benchmark_df = values.rename("buy_and_hold_value").reset_index()
     benchmark_df["buy_and_hold_return"] = (
         benchmark_df["buy_and_hold_value"] / initial_capital
     ) - 1.0
 
+    entries = frame.groupby("ticker")["timestamp"].first()
+    missing = [ticker for ticker, weight in weights.items() if weight and ticker not in entries]
+    delayed = [
+        ticker for ticker, moment in entries.items()
+        if weights[ticker] and moment > frame["timestamp"].iloc[0]
+    ]
+    benchmark_df.attrs["report_metadata"] = {
+        "kind": "configured_universe_buy_and_hold",
+        "weights": weights,
+        "universe": list(weights),
+        "initial_value": float(initial_capital),
+        "cash_weight": 1.0 - sum(weights.values()),
+        "entry_rule": "first_valid_in_window_close_per_ticker",
+        "missing_price_policy": "cash_until_entry_then_last_observed_close",
+        "rebalanced": False,
+        "costs_included": False,
+        "timezone": "America/New_York",
+        "first_observation": frame["timestamp"].iloc[0].isoformat(),
+        "last_observation": frame["timestamp"].iloc[-1].isoformat(),
+        "entry_timestamps": {ticker: moment.isoformat() for ticker, moment in entries.items() if weights[ticker]},
+        "last_price_timestamps": {
+            ticker: moment.isoformat()
+            for ticker, moment in frame.groupby("ticker")["timestamp"].last().items()
+        },
+        "missing_tickers": missing,
+        "delayed_tickers": delayed,
+        "coverage": "partial" if missing or delayed else "complete",
+        "coverage_scope": "in_window_entry_availability",
+        "observed_price_rows": len(frame),
+        "observations_per_ticker": {
+            ticker: int(count) for ticker, count in frame.groupby("ticker").size().items()
+        },
+    }
     return benchmark_df
+
+
+def benchmark_weights(
+    portfolio_weights: Any, tickers: list[str] | None
+) -> dict[str, float]:
+    """Preserve explicit universe allocations; only absent weights imply equal weight.
+
+    Zero/omitted allocations remain cash. Extra mapping keys outside TICKERS
+    are ignored (a request may narrow the universe). Never renormalize weights
+    or silently turn malformed/negative weights into a different benchmark.
+    """
+    universe = list(dict.fromkeys(str(ticker) for ticker in (tickers or [])))
+    if tickers is None and isinstance(portfolio_weights, Mapping):
+        universe = [str(ticker) for ticker in portfolio_weights]
+    if not universe:
+        return {}
+    if portfolio_weights is None:
+        return {ticker: 1.0 / len(universe) for ticker in universe}
+    if isinstance(portfolio_weights, Mapping):
+        raw = {ticker: portfolio_weights.get(ticker, 0.0) for ticker in universe}
+    elif isinstance(portfolio_weights, (list, tuple)) and len(portfolio_weights) == len(universe):
+        raw = dict(zip(universe, portfolio_weights))
+    else:
+        raise ValueError("Benchmark WEIGHTS must be a mapping or one weight per ticker.")
+    try:
+        weights = {ticker: float(weight) for ticker, weight in raw.items()}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Benchmark WEIGHTS must contain finite nonnegative numbers.") from exc
+    if any(not np.isfinite(weight) or weight < 0 for weight in weights.values()):
+        raise ValueError("Benchmark WEIGHTS must contain finite nonnegative numbers.")
+    return weights
+
+
+def market_timestamp(value: Any) -> pd.Timestamp:
+    """Interpret naive dates in New York, convert aware instants, reject bad cutoffs."""
+    moment = pd.Timestamp(value)
+    if pd.isna(moment):
+        raise ValueError("Benchmark window requires a valid timestamp.")
+    return moment.tz_localize("America/New_York") if moment.tzinfo is None else moment.tz_convert("America/New_York")
+
+
+def market_timestamps(values: pd.Series) -> pd.Series:
+    """Normalize bar timestamps, including mixed offsets across DST changes."""
+    if pd.api.types.is_datetime64_any_dtype(values.dtype):
+        parsed = values
+    else:
+        # Parsing each object separately avoids treating naive daily labels as
+        # UTC when a column also contains aware timestamps or mixed DST offsets.
+        def parse(value):
+            try:
+                return market_timestamp(value)
+            except (TypeError, ValueError):
+                return pd.NaT
+        return pd.to_datetime(values.map(parse), utc=True).dt.tz_convert("America/New_York")
+    if parsed.dt.tz is None:
+        return parsed.dt.tz_localize("America/New_York", ambiguous="NaT", nonexistent="NaT")
+    return parsed.dt.tz_convert("America/New_York")
 
 
 # --- Advanced Analytics Calculations (Unchanged) ---
@@ -547,16 +635,24 @@ def generate_backtest_report(
     initial_capital: float,
     full_historical_data: pd.DataFrame,
     out_dir: str | None = None,
-) -> None:
+    benchmark_start: Any = None,
+    benchmark_end: Any = None,
+) -> dict[str, pd.DataFrame]:
     """
     Generates and saves a full backtest report with enhanced risk analysis.
+
+    VISUALIZER: returns the report frames keyed by CSV stem (``{}`` when
+    nothing was generated). The buy-and-hold benchmark is built in memory
+    here anyway; returning it lets ``run_single`` attach it to the equity
+    curve without re-reading CSVs. Benchmark cutoffs exclude the lookback
+    prefix and any prices after the final performance sample.
     """
     logger = portfolio.logger
-    reports = {}
+    reports: dict[str, pd.DataFrame] = {}
     logger.info("Generating backtest report...")
     if perf_df.empty:
         logger.warning("Performance DataFrame is empty. Skipping report generation")
-        return None
+        return reports
     # VISUALIZER: upstream always wrote to a cwd-relative
     # "src/backtest/data/<ts>_backtest_<id>" directory, which only makes
     # sense when the engine is run from a checkout of the trading repo.
@@ -593,6 +689,7 @@ def generate_backtest_report(
                     "signal_type",
                     "shares",
                     "fill_price",
+                    "fees",
                     "confidence",
                     "cash_after",
                 ]
@@ -639,10 +736,16 @@ def generate_backtest_report(
 
     # Section 6: Buy-and-hold benchmark report
     try:
+        # VISUALIZER: bought on the run's first bar, not the lookback's, and
+        # with weights that survive a list-shaped or absent WEIGHTS config.
         benchmark_df = _generate_buy_and_hold_benchmark(
             full_historical_data=full_historical_data,
             initial_capital=initial_capital,
-            portfolio_weights=portfolio.portfolio_weights,
+            portfolio_weights=benchmark_weights(
+                portfolio.portfolio_weights, getattr(portfolio, "tickers", None)
+            ),
+            start=benchmark_start if benchmark_start is not None else perf_df["timestamp"].min(),
+            end=benchmark_end if benchmark_end is not None else perf_df["timestamp"].max(),
         )
         if not benchmark_df.empty:
             reports["benchmark_buy_and_hold"] = benchmark_df.copy()
@@ -710,3 +813,5 @@ def generate_backtest_report(
     except Exception as e:
         logger.error(f"Error saving reports to CSV: {e}", exc_info=True)
     logger.info("Backtest report generation complete.")
+    # VISUALIZER: see the docstring — the caller wants the benchmark frame.
+    return reports

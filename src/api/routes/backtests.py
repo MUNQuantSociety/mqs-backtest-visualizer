@@ -22,6 +22,7 @@ from src.schemas.backtests import (
 )
 from src.services import backtests as backtests_service
 from src.services.backtests import DeleteOutcome, RunSubmissionError
+from src.services.report_exports import EXPORT_NAMES, export_report
 
 router = APIRouter(prefix="/backtests", tags=["backtests"])
 
@@ -117,3 +118,21 @@ async def delete_backtest(backtest_id: str) -> Response:
             detail=f"No backtest with id {backtest_id!r}.",
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{backtest_id}/exports/{filename}")
+async def download_report(backtest_id: str, filename: str) -> Response:
+    """Download one completed run as CSV or the exact detail JSON contract."""
+    if filename not in EXPORT_NAMES:
+        raise HTTPException(status_code=404, detail="Unknown report export.")
+    detail = await backtests_service.get_backtest(backtest_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Backtest not found.")
+    if detail.status is not BacktestStatus.COMPLETED:
+        raise HTTPException(status_code=409, detail="Exports are available only after a successful backtest.")
+    result = export_report(detail, filename)
+    return Response(content=result.content, media_type=result.media_type, headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    })

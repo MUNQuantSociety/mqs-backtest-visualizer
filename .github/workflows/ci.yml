@@ -1,0 +1,193 @@
+name: ci
+
+# dev is CI-only. main runs the same jobs through deploy.yml at its exact SHA.
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [dev]
+  workflow_call:
+
+permissions:
+  contents: read
+
+# Keep this distinct from the caller's deployment concurrency group.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/dev' }}
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  AWS_EC2_METADATA_DISABLED: "true"
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CI_DATABASE_TESTS: "0"
+      STRATEGY_STORE_BACKEND: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Set transient test storage
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"], "unit")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              for key, name in (("STRATEGY_STORE_ROOT", "strategies"),
+                                ("MARKET_CACHE_DIR", "cache"), ("ARTIFACT_DIR", "artifacts")):
+                  path = root / name
+                  path.mkdir(parents=True, exist_ok=True)
+                  print(f"{key}={path}", file=output)
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Import smoke
+        run: python -c "import server; print('import ok:', server.app.title)"
+      - name: Layering invariants (docs/ARCHITECTURE_FLOW.md section 7)
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            if [ -n "$2" ]; then
+              echo "::error::$1"
+              echo "$2"
+              fail=1
+            fi
+          }
+          check "engine/ must not import src.*" \
+            "$(grep -rn '^\s*\(from\|import\)\s\+src\.' engine/ --include='*.py' || true)"
+          check "engine/ must not use fastapi or sqlalchemy" \
+            "$(grep -rln 'fastapi\|sqlalchemy' engine/ --include='*.py' || true)"
+          check "src/api/ must not import sqlalchemy" \
+            "$(grep -rln 'sqlalchemy' src/api/ --include='*.py' || true)"
+          check "src/api/ must not import engine" \
+            "$(grep -rn '^\s*from engine' src/api/ --include='*.py' || true)"
+          exit "$fail"
+      - name: Tests without a database
+        run: >-
+          python -m pytest -q -m 'not db' -p no:cacheprovider --durations=10
+          --basetemp="$RUNNER_TEMP/unit-pytest"
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: mqs_test
+          POSTGRES_USER: mqs_test
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mqs_test -d mqs_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CI_DATABASE_TESTS: "1"
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: mqs_test
+      POSTGRES_USER: mqs_test
+      POSTGRES_PASSWORD: ci-only-password
+      POSTGRES_SSLMODE: disable
+      STRATEGY_STORE_BACKEND: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Deterministic PostgreSQL integration tests
+        env:
+          STRATEGY_STORE_ROOT: ${{ runner.temp }}/postgres/strategies
+          MARKET_CACHE_DIR: ${{ runner.temp }}/postgres/cache
+          ARTIFACT_DIR: ${{ runner.temp }}/postgres/artifacts
+        # Fixture-owned data; never run the live-data integration suite here.
+        run: >-
+          python -m pytest tests/integration/test_ci_pipeline.py -q
+          -p no:cacheprovider --durations=10
+          --basetemp="$RUNNER_TEMP/postgres-pytest"
+          --junitxml="$RUNNER_TEMP/postgres-tests.xml"
+      - name: Reject empty or skipped PostgreSQL coverage
+        run: python scripts/check_ci_test_report.py "$RUNNER_TEMP/postgres-tests.xml"
+
+  image:
+    # On main, deploy builds and pushes once after tests. PR/dev builds use no AWS.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: btv-ci:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+      - name: Image imports and writable runtime directories
+        env:
+          IMAGE: btv-ci:${{ github.sha }}
+        run: |
+          docker run --rm --network none --entrypoint python "$IMAGE" -c '
+          import os
+          from pathlib import Path
+          import server
+          assert os.getuid() != 0
+          for directory in (".artifacts", ".strategy_store", "data/backfill_cache"):
+              probe = Path(directory) / "ci-write-probe"
+              probe.write_text("ok")
+              probe.unlink()
+          print("image smoke passed")'
+
+  test:
+    # Preserve the required PR check name, including failures of dependencies.
+    name: test
+    if: always()
+    needs: [unit, postgres, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      UNIT_RESULT: ${{ needs.unit.result }}
+      POSTGRES_RESULT: ${{ needs.postgres.result }}
+      IMAGE_RESULT: ${{ needs.image.result }}
+    steps:
+      - name: Require all checks
+        shell: python {0}
+        run: |
+          import os
+          expected_image = "success" if (
+              os.environ["GITHUB_EVENT_NAME"] == "pull_request"
+              or os.environ["GITHUB_REF"] == "refs/heads/dev"
+          ) else "skipped"
+          if not (
+              os.environ["UNIT_RESULT"] == "success"
+              and os.environ["POSTGRES_RESULT"] == "success"
+              and os.environ["IMAGE_RESULT"] == expected_image
+          ):
+              raise SystemExit("Required CI checks failed, were cancelled, or were skipped")

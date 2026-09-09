@@ -245,6 +245,7 @@ async def application_lifespan(app: object = None) -> AsyncIterator[None]:
     """
     from src.db.init import database_lifespan
 
+    logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     async with database_lifespan(app):
         async with job_manager_lifespan(app):
             yield

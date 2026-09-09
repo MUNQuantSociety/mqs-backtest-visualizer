@@ -36,6 +36,7 @@ from src.repositories import runs as runs_repo
 from src.repositories import strategies as strategies_repo
 from src.repositories.runs import TERMINAL_STATUSES, RunFilters, RunListRow
 from src.services import market_data as market_data_service
+from src.services.run_controls import split_controls
 from src.schemas.backtests import (
     BacktestDetail,
     BacktestListResponse,
@@ -151,6 +152,7 @@ def _to_metrics(metrics: RunMetrics | None) -> PerformanceMetrics:
             win_rate=0.0,
             profit_factor=0.0,
             total_trades=0,
+            unavailable=_metric_availability(None),
         )
     return PerformanceMetrics(
         total_return=_float(metrics.total_return),
@@ -162,7 +164,25 @@ def _to_metrics(metrics: RunMetrics | None) -> PerformanceMetrics:
         win_rate=_float(metrics.win_rate),
         profit_factor=_float(metrics.profit_factor),
         total_trades=int(metrics.total_trades or 0),
+        unavailable=_metric_availability(metrics),
     )
+
+
+def _metric_availability(metrics: RunMetrics | None) -> dict[str, str]:
+    unavailable = {}
+    for column, field in PerformanceMetrics.model_fields.items():
+        if column in {"total_trades", "unavailable"}:
+            continue
+        if metrics is None or getattr(metrics, column) is None:
+            reason = "Undefined for this run's observations or closed trades."
+            if metrics is None:
+                reason = "Run has no completed metrics yet."
+            elif column == "profit_factor":
+                reason = "No losing closed trades; profit factor is undefined."
+            elif column == "win_rate":
+                reason = "No closed trades."
+            unavailable[field.alias or column] = reason
+    return unavailable
 
 
 def _to_equity_point(point: RunEquityPoint) -> EquityPoint:
@@ -195,6 +215,8 @@ def to_detail(row: RunListRow) -> BacktestDetail:
     """Full run payload: summary fields plus metrics, curve, and trades."""
     run = row.run
     summary = _to_summary(row)
+    extra = dict(run.metrics.extra or {}) if run.metrics else {}
+    positions = extra.pop("openPositions", [])
     return BacktestDetail(
         **summary.model_dump(),
         metrics=_to_metrics(run.metrics),
@@ -203,6 +225,8 @@ def to_detail(row: RunListRow) -> BacktestDetail:
         parameters=dict(run.params or {}),
         progress_pct=run.progress_pct,
         error_message=run.error_message,
+        report_metadata=extra,
+        open_positions=list(positions),
     )
 
 
@@ -465,7 +489,9 @@ def _validated_capital(raw: float) -> float:
     """Capital has to be positive and finite — it divides every return."""
     capital = float(raw)
     if not math.isfinite(capital):
-        raise RunSubmissionError(f"initialCapital must be a finite number; got {raw!r}.")
+        raise RunSubmissionError(
+            f"initialCapital must be a finite number; got {raw!r}."
+        )
     if capital <= 0:
         raise RunSubmissionError(
             f"initialCapital must be greater than zero; got {capital:g}."
@@ -615,12 +641,17 @@ async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
     name = _validated_name(request.name)
     strategy = await _load_runnable_strategy(request.strategy_key)
     start_date, end_date = _validated_window(request)
-    # After the cheap checks and after the strategy is known, because it needs
-    # both the universe and a database round trip per ticker.
-    await _validated_coverage(list(strategy.universe or []), start_date, end_date)
     initial_capital = _validated_capital(request.initial_capital)
     mode = _validated_mode(request.mode)
-    params = _validated_params(strategy, request.params)
+    try:
+        strategy_params, controls, universe = split_controls(
+            request.params, strategy.universe, mode
+        )
+    except ValueError as exc:
+        raise RunSubmissionError(str(exc)) from None
+    params = _validated_params(strategy, strategy_params)
+    # Check the selected universe, not the registry's defaults.
+    await _validated_coverage(universe, start_date, end_date)
 
     summary = await create_backtest_run(
         name=name,
@@ -628,11 +659,11 @@ async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
         start_date=start_date,
         end_date=end_date,
         initial_capital=initial_capital,
-        symbol=_symbol_for(strategy.universe),
+        symbol=_symbol_for(universe),
         engine_version=ENGINE_VERSION,
         # The overlay the worker hands the engine, plus the reserved mode key
         # it pops back off first — there is no mode column to put it in.
-        params={**params, MODE_KEY: mode},
+        params={**params, **controls, MODE_KEY: mode},
     )
     return await _dispatch(summary)
 
@@ -649,6 +680,13 @@ async def _dispatch(summary: BacktestSummary) -> BacktestSummary:
 
     try:
         get_job_manager().submit(summary.id)
+        logger.info(
+            "Backtest request accepted: run=%s strategy=%s window=%s..%s",
+            summary.id,
+            summary.strategy_id,
+            summary.start_date,
+            summary.end_date,
+        )
     except Exception as exc:
         logger.error("Run %s could not be queued: %s", summary.id, exc)
         await _fail_undispatched(summary.id, f"Could not be queued to run: {exc}")

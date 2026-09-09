@@ -68,6 +68,7 @@ class BacktestEngine:
         self.initial_capital: float = 0.0
         self.slippage: float = 0.0
         self.cost_model: CostModel | None = None
+        self.commission_per_share: float = 0.0
         self.backtest_mode: str = "event"
         # VISUALIZER: task-4 seams. Callables default to no-ops so the
         # engine stays usable from a plain script.
@@ -145,6 +146,7 @@ class BacktestEngine:
         fast_config: dict[str, Any] | None = None,
         fast_years_back: int | None = None,
         fast_benchmark_label: str | None = None,
+        commission_per_share: float = 0.0,
     ):
         """
         Configures the backtest with the necessary parameters.
@@ -156,6 +158,14 @@ class BacktestEngine:
         self.slippage = slippage
         self.cost_model = cost_model
         self.backtest_mode = str(backtest_mode).lower().strip()
+        self.commission_per_share = float(commission_per_share)
+        if not np.isfinite(self.commission_per_share) or self.commission_per_share < 0:
+            raise ValueError("commission_per_share must be finite and nonnegative.")
+        if self.backtest_mode == "fast" and self.commission_per_share:
+            raise ValueError(
+                "Fast mode does not support per-share commission; use event mode "
+                "or explicitly set commission_per_share to zero."
+            )
         self.fast_config = self._normalize_fast_config(
             fast_config,
             fast_years_back=fast_years_back,
@@ -744,6 +754,7 @@ class BacktestEngine:
                         initial_capital=self.initial_capital,
                         slippage=self.slippage,
                         cost_model=self.cost_model,
+                        commission_per_share=self.commission_per_share,
                         order_manager=order_manager,
                         # VISUALIZER: per-run seams (task 4).
                         on_progress=self.on_progress,

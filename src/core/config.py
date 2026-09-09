@@ -185,9 +185,29 @@ class Settings:
 
     strategy_store_backend: str = os.getenv("STRATEGY_STORE_BACKEND", "local").lower()
     strategy_store_root: Path = _env_path("STRATEGY_STORE_ROOT", ".strategy_store")
-    # Unused until the infrastructure repo provisions a bucket; the S3 backend
-    # is a stub that raises without it.
-    strategy_store_s3_bucket: str = os.getenv("STRATEGY_STORE_S3_BUCKET", "")
+    # Required when the backend is ``s3``; ``build_strategy_store`` refuses to
+    # construct an S3 store without it. The bucket is provisioned by the
+    # infrastructure repo, never created by this code.
+    strategy_store_s3_bucket: str = os.getenv("STRATEGY_STORE_S3_BUCKET", "").strip()
+    # Optional namespace inside the strategy bucket. Local verification uses
+    # development; the production task role is restricted to production.
+    strategy_store_s3_prefix: str = os.getenv("STRATEGY_STORE_S3_PREFIX", "").strip()
+    # A LocalStack/MinIO endpoint for an end-to-end check without AWS. Setting
+    # it also switches the client to path-style addressing, which those
+    # emulators need. ``AWS_ENDPOINT_URL`` is the SDK's own spelling and is
+    # honoured as a fallback so a developer's existing shell setup works.
+    strategy_store_s3_endpoint_url: str = _env_first(
+        "STRATEGY_STORE_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"
+    )
+    # Read here rather than letting boto3 read the environment, because this
+    # module is the only environment reader. ECS Fargate injects AWS_REGION;
+    # the infra's default is us-east-2. Blank means "let the SDK decide", so a
+    # developer's ``~/.aws/config`` region still applies locally.
+    #
+    # Deliberately no AWS credential settings: the SDK's default chain (task
+    # role on Fargate, CLI profile on a laptop) supplies them, and settings
+    # must never hold access keys.
+    aws_region: str = _env_first("AWS_REGION", "AWS_DEFAULT_REGION")
 
     # ------------------------------------------------------------------
     # Derived connection URLs

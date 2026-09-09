@@ -139,7 +139,7 @@ def test_backtest_detail_carries_curve_trades_and_metrics() -> None:
     )
     assert _aliases(PerformanceMetrics) == {
         "totalReturn", "cagr", "sharpe", "sortino", "maxDrawdown",
-        "volatility", "winRate", "profitFactor", "totalTrades",
+        "volatility", "winRate", "profitFactor", "totalTrades", "unavailable",
     }
     assert _aliases(EquityPoint) == {"date", "equity", "benchmark"}
     assert {"entryDate", "exitDate", "returnPct"} <= _aliases(Trade)

@@ -60,6 +60,7 @@ from src.db.engine import create_sync_engine
 from src.db.init import init_database
 from src.models import BacktestRun, RunEquityPoint, RunMetrics, RunTrade, Strategy
 from src.services.trade_pairing import TradeRow, pair_fills
+from src.services.reporting import calculation_metadata, daily_metrics, open_positions
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,10 @@ def run_job(run_id: str) -> str:
     a redelivered job finds the row already ``running`` and returns quietly
     instead of running the backtest a second time.
     """
+    logging.basicConfig(
+        level=settings.log_level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     parsed = _parse_run_id(run_id)
     if parsed is None:
         logger.error("run_job called with %r, which is not a run id", run_id)
@@ -184,7 +189,9 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
                 # with no metrics, curve, or trades would be a lie the client
                 # cannot detect, so this is a failure with an honest message.
                 logger.exception("Run %s produced results that would not store", parsed)
-                return _fail(engine, parsed, f"result could not be stored: {_describe(exc)}")
+                return _fail(
+                    engine, parsed, f"result could not be stored: {_describe(exc)}"
+                )
             logger.info("Run %s completed", parsed)
             return "completed"
 
@@ -507,6 +514,13 @@ def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest
     artifact_dir = Path(settings.artifact_dir) / str(context.run_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    params = dict(context.params)
+    slippage = float(params.pop("slippageBps", 0.0)) / 10_000.0
+    commission = float(params.pop("commissionPerShare", 0.0))
+    # The selected universe is retained for reporting; validated TICKERS and
+    # WEIGHTS overlays are present only when it differs from the strategy.
+    params.pop("universe", None)
+
     return RunRequest(
         run_id=str(context.run_id),
         strategy_key=context.strategy_key,
@@ -515,7 +529,9 @@ def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest
         end_date=context.end_date,
         initial_capital=context.initial_capital,
         mode=context.mode,
-        params=dict(context.params),
+        params=params,
+        slippage=slippage,
+        commission_per_share=commission,
         artifact_dir=str(artifact_dir),
         on_progress=heartbeat.on_progress,
         should_cancel=heartbeat.should_cancel,
@@ -534,14 +550,20 @@ def _persist_success(engine: Engine, context: _RunContext, result: RunResult) ->
     equity curve is half-written renders as a chart with a cliff in it, and
     nothing downstream would ever notice.
     """
-    trades = pair_fills(result.fills)
+    trades = pair_fills(result.fills, market_timezone=settings.market_timezone)
     trade_rows = [_trade_row(context.run_id, trade) for trade in trades]
     equity_rows = _equity_rows(context.run_id, result.equity_curve)
     metrics_row = _metrics_row(context, result, trades, len(equity_rows))
 
-    final_equity = result.final_equity
-    if final_equity is None and result.equity_curve:
-        final_equity = result.equity_curve[-1].equity
+    if not equity_rows:
+        raise ValueError("A completed backtest did not produce an equity curve.")
+    final_equity = equity_rows[-1]["equity"]
+    if result.final_equity is not None:
+        reported_final = _money_required(result.final_equity, "final_equity")
+        if abs(reported_final - final_equity) > Decimal("0.0001"):
+            raise ValueError(
+                "Engine final equity does not match its final daily observation."
+            )
 
     with engine.begin() as connection:
         # Results are keyed by run id with no version, so a re-run of the same
@@ -564,9 +586,9 @@ def _persist_success(engine: Engine, context: _RunContext, result: RunResult) ->
                 # Denormalised onto the run row because the list endpoint sorts
                 # and renders these four and must not join to do it.
                 final_equity=_money(final_equity),
-                total_return=_ratio(result.metrics.get("total_return")),
-                sharpe=_ratio(result.metrics.get("sharpe")),
-                max_drawdown=_ratio(result.metrics.get("max_drawdown")),
+                total_return=metrics_row["total_return"],
+                sharpe=metrics_row["sharpe"],
+                max_drawdown=metrics_row["max_drawdown"],
                 progress_pct=100,
                 error_message=None,
                 finished_at=func.now(),
@@ -600,7 +622,9 @@ def _equity_rows(
                 "run_id": run_id,
                 "seq": seq,
                 "date": day,
-                "equity": _money_required(point.equity, "equity"),
+                "equity": _money_required(point.equity, "equity").quantize(
+                    Decimal("0.000001")
+                ),
                 "benchmark": _money(point.benchmark),
             }
         )
@@ -634,15 +658,38 @@ def _metrics_row(
     """The ``run_metrics`` row: engine numbers plus the round-trip ones."""
     engine_metrics = dict(result.metrics or {})
     round_trip = _round_trip_metrics(trades)
+    # Compute from exactly the daily marks/precision that reach CSV and JSON.
+    daily = _equity_rows(context.run_id, result.equity_curve)
+    application_metrics = daily_metrics(
+        [float(point["equity"]) for point in daily], context.initial_capital
+    )
+    metadata = dict(getattr(result, "report_metadata", {}))
+    if "equity" in metadata:
+        equity_metadata = dict(metadata["equity"])
+        baseline = dict(equity_metadata.get("baseline", {}))
+        # The engine curve includes a same-date pre-trading baseline. Daily
+        # persistence keeps that day's LAST mark, so no curve index survives.
+        baseline.pop("curve_index", None)
+        baseline["includedInDailyCurve"] = False
+        equity_metadata["baseline"] = baseline
+        metadata["equity"] = equity_metadata
 
     row: dict[str, Any] = {"run_id": context.run_id}
     for key in METRIC_KEYS:
         # The engine leaves the three trade-shaped metrics as None: it only
         # ever sees one-leg fills, so pairing them is this side's job.
-        value = round_trip[key] if key in round_trip else engine_metrics.get(key)
+        value = round_trip[key] if key in round_trip else application_metrics.get(key)
         row[key] = int(value or 0) if key == "total_trades" else _ratio(value)
 
     row["extra"] = {
+        **metadata,
+        **calculation_metadata(),
+        "marketTimezone": settings.market_timezone,
+        "engineMetrics": {
+            key: float(value) if _ratio(value) is not None else None
+            for key, value in engine_metrics.items()
+        },
+        "openPositions": open_positions(trades, result.final_prices),
         "fill_count": len(result.fills),
         "closed_trades": row["total_trades"],
         "open_lots": len(trades) - row["total_trades"],
@@ -730,9 +777,7 @@ def apply_validation_outcome(engine: Engine, run_id: uuid.UUID, outcome: str) ->
                     # disabled by one, whatever a hand-edited row says.
                     _STRATEGIES.c.kind == "user",
                 )
-                .values(
-                    status=status, enabled=enabled, validation_run_id=run_id
-                )
+                .values(status=status, enabled=enabled, validation_run_id=run_id)
             )
     except Exception:
         # The run itself is already recorded correctly. Losing the strategy

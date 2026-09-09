@@ -37,6 +37,17 @@ pyarrow>=15.0
 #   matplotlib>=3.8
 #   scipy>=1.11
 
+# Object storage. The strategy store's S3 backend (src/integrations/
+# strategy_store.py) is the only importer, and it imports lazily; the package
+# is still required so a deploy with STRATEGY_STORE_BACKEND=s3 never discovers
+# a missing SDK on the first upload. Floor pinned to the current major.
+boto3>=1.35,<2
+
 # Testing
 pytest>=8.3.0
 httpx>=0.27.0
+# TEST-ONLY: in-process S3 mock for tests/unit/test_strategy_store.py. It sits
+# in this single requirements file, as pytest and httpx do, because the
+# Dockerfile installs the file wholesale and the project keeps one list; it
+# is never imported by application code. moto 5 exposes ``mock_aws``.
+moto[s3]>=5.0,<6

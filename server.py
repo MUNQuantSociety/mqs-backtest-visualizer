@@ -8,11 +8,15 @@ URL and CORS is never exercised. CORS is configured anyway for the case where th
 app is served from a different origin than the API.
 """
 
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.api.router import api_router
 from src.core.config import settings
+from src.integrations.strategy_store import StrategyStoreError
 from src.workers.job_manager import application_lifespan
 
 app = FastAPI(
@@ -38,6 +42,21 @@ app.add_middleware(
 )
 
 app.include_router(api_router, prefix=settings.api_prefix)
+
+
+@app.exception_handler(StrategyStoreError)
+async def strategy_storage_unavailable(
+    request: Request, exc: StrategyStoreError
+) -> JSONResponse:
+    """Give upload clients a retryable error without exposing bucket details."""
+    logging.getLogger(__name__).error(
+        "Strategy storage unavailable on %s: %s", request.url.path, exc
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Strategy storage is unavailable. Please try again later."},
+        headers={"Retry-After": "30"},
+    )
 
 
 # Kept from the first scaffold commit so anything already pointing at the
