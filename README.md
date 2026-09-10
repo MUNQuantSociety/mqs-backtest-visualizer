@@ -23,6 +23,8 @@ assert that a release is deployed.
 
 For the request/worker/database design, read [Architecture Flow](docs/ARCHITECTURE_FLOW.md).
 For current result semantics, read [Report Contract](docs/REPORT_CONTRACT.md).
+For completed work, verification evidence and remaining release blockers, read
+[Project Status and Handoff](PROJECT_STATUS.md).
 [CI and deployment](#ci-and-deployment) below summarizes the current workflow files;
 dated architecture/readiness notes remain useful historical context.
 
