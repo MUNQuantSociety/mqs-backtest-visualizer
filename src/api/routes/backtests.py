@@ -11,8 +11,11 @@ exists for — see :func:`create_backtest`.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Response, status
+import uuid
 
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+
+from src.api.dependencies.current_user import require_current_user
 from src.schemas.backtests import (
     BacktestDetail,
     BacktestListResponse,
@@ -34,9 +37,11 @@ async def list_backtests(
     strategy_id: str | None = Query(default=None, alias="strategyId"),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100, alias="pageSize"),
+    owner_id: uuid.UUID = Depends(require_current_user),
 ) -> BacktestListResponse:
-    """Runs, newest first. An empty list is a valid answer, not an error."""
+    """This user's public runs, newest first. Empty is a valid answer, not an error."""
     return await backtests_service.list_backtests(
+        owner_id=owner_id,
         search=search,
         status=status_filter,
         strategy_id=strategy_id,

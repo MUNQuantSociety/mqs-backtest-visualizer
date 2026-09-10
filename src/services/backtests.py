@@ -32,9 +32,11 @@ from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
 from src.models import BacktestRun, RunEquityPoint, RunMetrics, RunTrade
+from src.repositories import public_runs as public_runs_repo
 from src.repositories import runs as runs_repo
 from src.repositories import strategies as strategies_repo
-from src.repositories.runs import TERMINAL_STATUSES, RunFilters, RunListRow
+from src.repositories.public_runs import PublicRunFilters, PublicRunRow
+from src.repositories.runs import TERMINAL_STATUSES, RunListRow
 from src.services import market_data as market_data_service
 from src.services.run_controls import split_controls
 from src.schemas.backtests import (
@@ -139,6 +141,57 @@ def _to_summary(row: RunListRow) -> BacktestSummary:
     )
 
 
+def _json_str(results: dict, *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = results.get(key)
+        if value is not None and str(value):
+            return str(value)
+    return default
+
+
+def _json_float(results: dict, *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        value = results.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _json_status(results: dict) -> BacktestStatus:
+    raw = _json_str(results, "status", default="completed")
+    try:
+        return BacktestStatus(raw)
+    except ValueError:
+        return BacktestStatus.COMPLETED
+
+
+def _public_to_summary(row: PublicRunRow) -> BacktestSummary:
+    """Unpack ``results`` JSON. Extra strategy-specific keys are ignored here."""
+    results = row.results
+    strategy_key = _json_str(results, "strategy_key", "strategyId")
+    return BacktestSummary(
+        id=str(row.id),
+        name=_json_str(results, "name", default="Untitled run"),
+        strategy_id=strategy_key,
+        strategy_name=row.strategy_name or strategy_key,
+        symbol=_json_str(results, "symbol", default="MULTI"),
+        timeframe=_json_str(results, "timeframe", default="1d"),
+        status=_json_status(results),
+        start_date=_json_str(results, "start_date", "startDate"),
+        end_date=_json_str(results, "end_date", "endDate"),
+        created_at=_iso_datetime(row.created_at),
+        initial_capital=_json_float(results, "initial_capital", "initialCapital"),
+        final_equity=_json_float(results, "final_equity", "finalEquity"),
+        total_return=_json_float(results, "total_return", "totalReturn"),
+        sharpe=_json_float(results, "sharpe"),
+        max_drawdown=_json_float(results, "max_drawdown", "maxDrawdown"),
+    )
+
+
 def _to_metrics(metrics: RunMetrics | None) -> PerformanceMetrics:
     """Zeros for a run with no metrics row yet — see the module docstring."""
     if metrics is None:
@@ -232,22 +285,24 @@ def to_detail(row: RunListRow) -> BacktestDetail:
 
 async def list_backtests(
     *,
+    owner_id: uuid.UUID,
     search: str | None = None,
     status: BacktestStatus | None = None,
     strategy_id: str | None = None,
     page: int = 1,
     page_size: int = 25,
 ) -> BacktestListResponse:
-    """One page of runs. Empty until the run pipeline writes its first row."""
-    await ensure_schema()
-    filters = RunFilters(
+    """One page of this user's ``public.backtest_runs``. Empty is a valid answer."""
+    filters = PublicRunFilters(
         search=search,
         status=status.value if status is not None else None,
         strategy_key=strategy_id,
     )
     async with session_scope() as session:
-        rows, total = await runs_repo.list_runs(session, filters, page, page_size)
-        items = [_to_summary(row) for row in rows]
+        rows, total = await public_runs_repo.list_runs_for_owner(
+            session, owner_id, filters, page, page_size
+        )
+        items = [_public_to_summary(row) for row in rows]
     return BacktestListResponse(
         items=items, total=total, page=page, page_size=page_size
     )

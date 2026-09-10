@@ -1,8 +1,7 @@
 """Stand-in for sign-in: the client sends who they are pretending to be.
 
 Until real auth lands, ``X-User-Id`` must be a row in ``public.user_creds``.
-Missing or unknown is 401. Nothing uses this yet — the next change will
-pass the UUID into the list endpoint as ``owner_id``.
+Missing or unknown is 401. The list endpoint uses that UUID as ``owner_id``.
 """
 
 from __future__ import annotations
