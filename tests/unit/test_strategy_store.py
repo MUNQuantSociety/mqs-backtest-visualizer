@@ -288,9 +288,9 @@ def test_s3_constructor_creates_no_client(monkeypatch: pytest.MonkeyPatch) -> No
     import boto3
 
     def _boom(*args: object, **kwargs: object) -> None:
-        raise AssertionError("boto3.client called during construction")
+        raise AssertionError("boto3 Session created during construction")
 
-    monkeypatch.setattr(boto3, "client", _boom)
+    monkeypatch.setattr(boto3.session, "Session", _boom)
 
     store = S3StrategyStore("any-bucket", prefix="/team-a/", region="eu-west-1")
 
@@ -300,7 +300,7 @@ def test_s3_constructor_creates_no_client(monkeypatch: pytest.MonkeyPatch) -> No
     assert store.region == "eu-west-1"
     assert store.endpoint_url is None
     # Only a method that talks to S3 reaches for the client.
-    with pytest.raises(AssertionError, match="boto3.client called"):
+    with pytest.raises(AssertionError, match="boto3 Session created"):
         store.exists(strategy_key("x"))
 
 
@@ -509,7 +509,7 @@ def test_s3_client_creation_failure_is_translated(monkeypatch, tmp_path, method)
     from botocore.exceptions import NoCredentialsError
 
     store = S3StrategyStore(BUCKET, region=REGION)
-    monkeypatch.setattr(boto3, "client", Mock(side_effect=NoCredentialsError()))
+    monkeypatch.setattr(boto3.session, "Session", Mock(side_effect=NoCredentialsError()))
     key = strategy_key("no-client")
     args = {"put": (key, "strategy.py", SOURCE), "get": (key, "strategy.py"),
             "exists": (key,), "delete": (key,), "materialize": (key, tmp_path / "pkg")}[method]

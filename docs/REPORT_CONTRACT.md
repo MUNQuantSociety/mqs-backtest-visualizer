@@ -207,6 +207,17 @@ The detail API exposes that object as `reportMetadata` except `openPositions`,
 which is returned separately. Engine dictionaries retain their snake_case keys;
 the API does not recursively rename dictionary keys to camelCase.
 
+`reportMetadata.execution` contains `fillCount` and a nullable `message`.
+Completed event runs with no fills explain whether the strategy had insufficient
+warmup, generated no orders, or requested orders without fills. Fast runs explain
+that their vectorized positions do not produce an individual fill table. Clients
+should show the message on completed runs, without inferring a failure from an
+empty trade list. VolMomentum also records bounded `strategyDiagnostics`: signal
+evaluation/skip/request counts and each ticker's strongest momentum-to-threshold
+snapshot. Its threshold remains 1.5 times annualized daily volatility; momentum
+and volatility are both expressed in percent. These fields are absent on older
+reports, whose stored results are unchanged.
+
 Calculation keys include `reportVersion`, `frequency`, `periodsPerYear`,
 `annualRiskFreeRate`, `standardDeviation`, `riskReturnBasis`, `totalReturnBasis`,
 `cagrBasis`, `tradePnlBasis` and `openPositionPnlBasis`. Diagnostics include
@@ -215,6 +226,14 @@ Calculation keys include `reportVersion`, `frequency`, `periodsPerYear`,
 `equity_samples` includes the engine baseline; `equity_points_stored` does not
 count it as a separate observation. Metadata is additive; consumers should
 tolerate absent keys on older records and new keys in future reports.
+
+New worker runs also include `strategySource`: `backend`, `storageKey`,
+`sourceSha256` and `configSha256` for a downloaded strategy package. Hashes
+describe the exact downloaded bytes before execution; run-specific controls
+are separate and do not alter stored source/config. Legacy local built-ins
+instead report `backend: builtin` and `classPath`. This field is optional on
+older reports and is not a security signature or S3 version lock. See
+[S3 strategy flow](S3_STRATEGY_FLOW.md).
 
 ## Downloads
 

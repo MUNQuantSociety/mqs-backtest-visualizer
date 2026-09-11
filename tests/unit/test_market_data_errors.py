@@ -58,6 +58,7 @@ class _EmptyDB:
 def isolated_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Point the parquet cache at an empty directory so the DB is consulted."""
     monkeypatch.setenv("MARKET_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("MARKET_DATA_SOURCE", "database")
 
 
 @pytest.mark.parametrize("db", [_FailingDB(), _RaisingDB()])

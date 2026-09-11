@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from datetime import datetime
 from decimal import Decimal
 
+from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
 from src.repositories import strategies as strategies_repo
@@ -32,6 +34,7 @@ from src.schemas.strategies import (
     StrategyTemplate,
 )
 from src.services import strategy_validation
+from src.services.strategy_availability import package_available
 from src.services.strategy_validation import template
 
 # The registry tracks four states; the client's Zod enum knows three. Both
@@ -113,13 +116,30 @@ def _generate_key(name: str) -> str:
 
 
 async def list_strategies(include_disabled: bool = False) -> StrategyListResponse:
-    """The catalogue, with per-strategy run aggregates computed in SQL."""
+    """Registered strategies and aggregates, backed by complete S3 packages.
+
+    The registry remains the validation/ownership catalogue: arbitrary S3
+    objects and incomplete uploads must never become executable strategies.
+    Local mode retains the vendored built-ins for offline development.
+    """
+    started = time.perf_counter()
+    logger.info("CATALOGUE | GET strategies received; storage=%s", settings.strategy_store_backend)
     await ensure_schema()
     async with session_scope() as session:
         rows = await strategies_repo.list_strategies(
             session, include_disabled=include_disabled
         )
-        items = [to_schema(row) for row in rows]
+    if settings.strategy_store_backend == "s3":
+        limit = asyncio.Semaphore(4)
+
+        async def available(row: StrategyRow) -> bool:
+            async with limit:
+                return await package_available(row.strategy.storage_key)
+
+        present = await asyncio.gather(*(available(row) for row in rows))
+        rows = [row for row, exists in zip(rows, present) if exists]
+    items = [to_schema(row) for row in rows]
+    logger.info("CATALOGUE | Returning %d strategies: %s; elapsed_ms=%.0f", len(items), [item.id for item in items], (time.perf_counter() - started) * 1000)
     return StrategyListResponse(items=items, total=len(items))
 
 
@@ -230,7 +250,9 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
     Raises :class:`~src.services.strategy_validation.StrategyValidationError`
     for source the student has to fix; the route turns that into a 422.
     """
+    logger.info("UPLOAD | Checking strategy source; name=%r bytes=%d", submission.name, len(submission.source.encode("utf-8")))
     scan = strategy_validation.scan_source(submission.source)
+    logger.info("UPLOAD | Compatibility passed; class=%s", scan.class_name)
 
     await ensure_schema()
     # One-shot catch-up for rows written before the store existed. It finds
@@ -243,6 +265,7 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
     storage_key = await asyncio.to_thread(
         strategy_validation.store_strategy_source, key, submission.source, config
     )
+    logger.info("UPLOAD | Source/config stored; strategy=%s storage=%s key=%s", key, settings.strategy_store_backend, storage_key)
 
     try:
         async with session_scope() as session:
@@ -265,6 +288,7 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
         await _discard_unregistered_source(key)
         raise
 
+    logger.info("UPLOAD | Draft registered; strategy=%s; queueing validation", key)
     message, run_id = await _begin_validation(
         key, submission.name, config, scan.class_name
     )

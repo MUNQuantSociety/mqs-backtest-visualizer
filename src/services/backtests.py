@@ -292,7 +292,7 @@ async def list_backtests(
     page: int = 1,
     page_size: int = 25,
 ) -> BacktestListResponse:
-    """One page of this user's ``public.backtest_runs``. Empty is a valid answer."""
+    """One page of this user's current and historical runs."""
     filters = PublicRunFilters(
         search=search,
         status=status.value if status is not None else None,
@@ -438,11 +438,21 @@ async def _load_runnable_strategy(strategy_key: str) -> _RunnableStrategy:
             )
         if not strategy.enabled:
             raise RunSubmissionError(_unavailable_reason(strategy.status, key))
-        return _RunnableStrategy(
+        snapshot = _RunnableStrategy(
             key=strategy.key,
             universe=list(strategy.universe or []),
             param_specs=list(strategy.param_specs or []),
         )
+        storage_key = strategy.storage_key
+    if settings.strategy_store_backend == "s3":
+        from src.services.strategy_availability import package_available
+
+        if not await package_available(storage_key):
+            raise RunSubmissionError(
+                f"Strategy {key!r} has no complete package in the configured "
+                "S3 store. Publish or restore it before running a backtest."
+            )
+    return snapshot
 
 
 def _unavailable_reason(status: str, key: str) -> str:
@@ -531,7 +541,10 @@ async def _validated_coverage(universe: list[str], start: date, end: date) -> No
             "strategy cannot be backtested over any window."
         )
     if coverage.start is None or coverage.end is None:
-        return
+        raise RunSubmissionError(
+            f"There is no shared market-data window for {', '.join(universe)}. "
+            "Choose tickers with overlapping history."
+        )
 
     if start.isoformat() < coverage.start or end.isoformat() > coverage.end:
         raise RunSubmissionError(
@@ -681,7 +694,9 @@ def _symbol_for(universe: list[str]) -> str:
     return tickers[0] if len(tickers) == 1 else "MULTI"
 
 
-async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
+async def submit_backtest_run(
+    request: BacktestRunRequest, *, owner_id: uuid.UUID | None = None
+) -> BacktestSummary:
     """Validate a submission, queue the run, and return the row to show for it.
 
     Persisting and dispatching are two different failures and are handled
@@ -693,6 +708,10 @@ async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
 
     Raises :class:`RunSubmissionError` for anything the student can fix.
     """
+    logger.info(
+        "SUBMIT | Backtest request received; strategy=%r window=%s..%s capital=%s mode=%s",
+        request.strategy_key, request.start_date, request.end_date, request.initial_capital, request.mode,
+    )
     name = _validated_name(request.name)
     strategy = await _load_runnable_strategy(request.strategy_key)
     start_date, end_date = _validated_window(request)
@@ -705,6 +724,7 @@ async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
     except ValueError as exc:
         raise RunSubmissionError(str(exc)) from None
     params = _validated_params(strategy, strategy_params)
+    logger.info("SUBMIT | Settings validated; strategy=%s tickers=%s slippage_bps=%s commission_per_share=%s", strategy.key, universe, controls.get("slippageBps", 0), controls.get("commissionPerShare", 0))
     # Check the selected universe, not the registry's defaults.
     await _validated_coverage(universe, start_date, end_date)
 
@@ -719,7 +739,9 @@ async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
         # The overlay the worker hands the engine, plus the reserved mode key
         # it pops back off first — there is no mode column to put it in.
         params={**params, **controls, MODE_KEY: mode},
+        owner_id=owner_id,
     )
+    logger.info("QUEUED | Run persisted; run=%s strategy=%s; dispatching to worker", summary.id, strategy.key)
     return await _dispatch(summary)
 
 

@@ -44,6 +44,7 @@ def stub_repo(monkeypatch: pytest.MonkeyPatch):
     """Replace the per-ticker lookup, and the session it would have opened."""
 
     def install(spans: dict[str, tuple[date, date] | None]) -> None:
+        monkeypatch.setenv("MARKET_DATA_SOURCE", "database")
         async def fake_coverage(_session, tickers):
             return {ticker: spans.get(ticker) for ticker in tickers}
 

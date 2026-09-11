@@ -44,6 +44,7 @@ from engine.contracts import (
 )
 from engine.core.backtest_engine import BacktestEngine
 from engine.data.db_adapter import EngineDBAdapter
+from engine.data.fmp import FMPDataAdapter, market_data_source
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 logger = logging.getLogger(__name__)
@@ -222,6 +223,37 @@ def _fast_mode_perf(engine: BacktestEngine) -> pd.DataFrame | None:
     return frame
 
 
+def _execution_summary(mode: str, fills: list, diagnostics: dict | None) -> dict:
+    """Explain recorded fills without treating vector positions as no trades."""
+    if mode == "fast":
+        message = (
+            "Fast mode models positions without individual order fills; an empty "
+            "trade table does not mean the strategy made no trades."
+        )
+    elif fills:
+        message = None
+    else:
+        message = "No trades were filled during the selected period."
+        if diagnostics:
+            requests = diagnostics.get("buyRequestCount", 0) + diagnostics.get("sellRequestCount", 0)
+            if not diagnostics.get("evaluationCount", 0) and diagnostics.get("warmupSkipCount", 0):
+                message = (
+                    "No trades were placed: the strategy never had enough ready "
+                    "market and indicator history to evaluate a signal."
+                )
+            elif requests:
+                message = "The strategy requested trades, but none produced a fill during the selected period."
+            elif diagnostics.get("evaluationCount", 0):
+                message = (
+                    "No trades were placed: no buy or sell requests were generated "
+                    "during the selected period."
+                )
+                if not diagnostics.get("bullishSignalCount", 0):
+                    message += " No ticker exceeded the strategy's bullish entry threshold."
+        message += " Trade metrics that require executed or closed trades are unavailable."
+    return {"fillCount": len(fills), "message": message}
+
+
 def run_single(request: RunRequest) -> RunResult:
     """Execute one backtest and return its results as a :class:`RunResult`.
 
@@ -254,7 +286,7 @@ def run_single(request: RunRequest) -> RunResult:
             # the run has occupied a worker slot for the length of a data load.
             _reject_unsupported_fast_mode(strategy_class)
 
-        adapter = EngineDBAdapter()
+        adapter = FMPDataAdapter() if market_data_source() == "fmp" else EngineDBAdapter()
         engine = _ReportBacktestEngine(
             db_connector=adapter,
             backtest_output_root=artifact_dir,
@@ -280,6 +312,7 @@ def run_single(request: RunRequest) -> RunResult:
         engine.run()
 
         benchmark_df = None
+        strategy_diagnostics = None
         final_prices: dict[str, float] = {}
         if mode == "fast":
             perf_df = _fast_mode_perf(engine)
@@ -307,6 +340,7 @@ def run_single(request: RunRequest) -> RunResult:
             perf_df = runner.perf_df if runner is not None else None
             fills = list(runner.executor.trade_log) if runner and runner.executor else []
             if runner is not None:
+                strategy_diagnostics = getattr(runner.portfolio, "strategy_diagnostics", None)
                 final_prices = dict(runner.final_prices)
                 benchmark_df = runner.benchmark_df
                 prices = runner.main_data_df
@@ -361,6 +395,9 @@ def run_single(request: RunRequest) -> RunResult:
             artifact_dir=artifact_dir,
             final_prices=final_prices,
             report_metadata={
+                "marketData": {"source": market_data_source(), "resolution": "daily"},
+                "execution": _execution_summary(mode, fills, strategy_diagnostics),
+                **({"strategyDiagnostics": strategy_diagnostics} if strategy_diagnostics is not None else {}),
                 "executionCosts": {
                     "slippageFraction": slippage,
                     "commissionPerShare": commission_per_share,

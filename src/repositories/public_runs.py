@@ -1,9 +1,9 @@
-"""Dashboard list reads — ``public.backtest_runs`` scoped by owner.
+"""Owner-scoped dashboard reads across current runs and public history.
 
-Identity is columns (``id``, ``owner_id``, ``created_at``). Everything a
-strategy produced sits in ``results`` JSONB.
-
-Create, detail, and the worker still use ``app.backtest_runs``.
+The worker updates ``app.backtest_runs``, so those rows are read directly to
+keep every lifecycle state visible. Public history can use summary columns
+or a ``results`` JSONB object; normalizing whole rows supports both layouts
+without changing either table. A current run wins when its id is also public.
 """
 
 from __future__ import annotations
@@ -33,32 +33,53 @@ class PublicRunRow:
     strategy_name: str
 
 
-_FILTERS = """
-    FROM public.backtest_runs r
-    LEFT JOIN app.strategies s ON s.key = r.results->>'strategy_key'
-    WHERE r.owner_id = :owner_id
-      AND (CAST(:status AS text) IS NULL OR r.results->>'status' = CAST(:status AS text))
-      AND (
-            CAST(:strategy_key AS text) IS NULL
-            OR r.results->>'strategy_key' = CAST(:strategy_key AS text)
+_OWNED_RUNS = """
+    WITH owned_runs AS (
+        SELECT a.id, a.owner_id, a.created_at, to_jsonb(a) AS results
+        FROM app.backtest_runs a
+        WHERE a.owner_id = :owner_id AND a.purpose = 'user'
+
+        UNION ALL
+
+        SELECT p.id, p.owner_id, p.created_at,
+               CASE WHEN jsonb_typeof(to_jsonb(p)->'results') = 'object'
+                    THEN to_jsonb(p)->'results'
+                    ELSE to_jsonb(p)
+               END AS results
+        FROM public.backtest_runs p
+        WHERE p.owner_id = :owner_id
+          AND NOT EXISTS (
+              SELECT 1 FROM app.backtest_runs a
+              WHERE a.id = p.id AND a.owner_id = :owner_id AND a.purpose = 'user'
           )
+    )
+"""
+
+_STRATEGY_KEY = "COALESCE(r.results->>'strategy_key', r.results->>'strategyId')"
+
+_FILTERS = f"""
+    FROM owned_runs r
+    LEFT JOIN app.strategies s ON s.key = {_STRATEGY_KEY}
+    WHERE (CAST(:status AS text) IS NULL OR COALESCE(r.results->>'status', 'completed') = CAST(:status AS text))
+      AND (CAST(:strategy_key AS text) IS NULL OR {_STRATEGY_KEY} = CAST(:strategy_key AS text))
       AND (
             CAST(:search AS text) IS NULL
             OR lower(COALESCE(r.results->>'name', '')) LIKE CAST(:search AS text)
             OR lower(COALESCE(r.results->>'symbol', '')) LIKE CAST(:search AS text)
-            OR lower(COALESCE(r.results->>'strategy_key', '')) LIKE CAST(:search AS text)
+            OR lower(COALESCE({_STRATEGY_KEY}, '')) LIKE CAST(:search AS text)
             OR lower(COALESCE(s.name, '')) LIKE CAST(:search AS text)
           )
 """
 
 _LIST = text(
     f"""
+    {_OWNED_RUNS}
     SELECT
         r.id,
         r.owner_id,
         r.created_at,
         r.results,
-        COALESCE(s.name, r.results->>'strategy_key', '') AS strategy_name
+        COALESCE(s.name, {_STRATEGY_KEY}, '') AS strategy_name
     {_FILTERS}
     ORDER BY r.created_at DESC, r.id
     OFFSET :offset
@@ -66,7 +87,7 @@ _LIST = text(
     """
 )
 
-_COUNT = text(f"SELECT count(*) {_FILTERS}")
+_COUNT = text(f"{_OWNED_RUNS} SELECT count(*) {_FILTERS}")
 
 
 def _params(
@@ -107,7 +128,7 @@ async def list_runs_for_owner(
     page: int = 1,
     page_size: int = 25,
 ) -> tuple[list[PublicRunRow], int]:
-    """One page of this user's public runs, newest first."""
+    """One page of this user's current and historical runs, newest first."""
     offset = max(page - 1, 0) * page_size
     bind = _params(owner_id, filters, offset=offset, limit=page_size)
     total = int((await session.execute(_COUNT, bind)).scalar_one())

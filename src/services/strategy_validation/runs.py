@@ -14,6 +14,7 @@ import logging
 from datetime import date, timedelta
 
 from engine import ENGINE_VERSION
+from engine.data.fmp import FMPUnavailable, market_data_source
 from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
@@ -29,6 +30,7 @@ from src.services.backtests import (
     create_backtest_run,
 )
 from src.services.strategy_validation.packaging import build_config, store_strategy_source
+from src.services.market_data import coverage_for
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,18 @@ async def validation_window(tickers: list[str]) -> tuple[date, date]:
     returns zero rows and would fail every upload for a reason that has nothing
     to do with the uploaded code.
     """
+    if market_data_source() == "fmp":
+        try:
+            coverage = await coverage_for(tickers)
+        except FMPUnavailable as exc:
+            raise ValidationStartError(str(exc)) from None
+        if coverage.start is None or coverage.end is None:
+            raise ValidationStartError(f"there is no shared FMP history for {', '.join(tickers)}")
+        latest = date.fromisoformat(coverage.end)
+        earliest = date.fromisoformat(coverage.start)
+        span = max(int(settings.validation_window_days), 1)
+        return max(earliest, latest - timedelta(days=span)), latest
+
     async with session_scope() as session:
         latest = await market_data_repo.latest_market_data_date(session, tickers)
 

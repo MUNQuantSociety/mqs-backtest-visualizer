@@ -7,6 +7,53 @@ a claim that every frontend panel is real or that production is deployed.
 
 ## Bottom line
 
+### Follow-up: S3 built-ins and visible logging (2026-09-10)
+
+`portfolio_1` and `portfolio_2` source/config were published and byte-verified
+under the existing development S3 prefix. Their registry IDs and run history
+were retained. In S3 mode the catalogue checks registered package availability;
+workers download the selected package instead of importing the local built-in.
+Missing packages/outages no longer silently substitute demo strategies/coverage.
+Run-specific controls do not rewrite the shared package.
+
+INFO terminal output now covers HTTP arrival/response, catalogue/package checks,
+coverage and controls, queue/worker startup, S3 downloads, engine stages and
+percentage progress, report persistence and failures. Requests carry a response
+`X-Request-ID`; worker logs include run IDs. See the
+[S3/logging runbook](docs/S3_STRATEGY_FLOW.md) for commands and stage meanings.
+
+Live checks used a temporary no-reload backend on 8123, database-backed prices,
+and the actual frontend Vite proxy on 5174 (fixtures disabled). This isolated
+verification from concurrent edits/reloads in the main development server; it
+is not a production deployment or a new authenticated browser-click verification.
+
+| Strategy / run | Inputs | Verified result |
+| --- | --- | --- |
+| `portfolio_1` / `1a5ec2ee-1492-4d90-9777-cf62ca82f7c7` | CRWV/NBIS; 2025-10-15 through 2025-11-07; capital 200,000 | Completed; 15 daily points; no fills; final equity 200,000. No synthetic trades were added. |
+| `portfolio_2` / `2cb659d7-093c-4dfd-93f3-c0331b047619` | Same tickers/dates; capital 175,000; submitted through Vite proxy | Completed; 15 daily points; 4 FIFO trade lots; final equity 186,108.420325. |
+
+Both reports identify `backend=s3`, their storage keys and source hashes matching
+the published local source. Both retain the chosen benchmark universe and
+capital. Report reads and CSV export through the frontend proxy returned 200.
+The earlier run `a328bd69-a449-4740-bc2e-1315504c140f` failed on a worker
+KeyboardInterrupt during development reload and is retained as a failed run.
+
+Verification during this follow-up: the collected offline backend suite passed
+561 tests (94 deselected); after adding HTTP logging, the focused S3/logging
+suite passed 18 tests. These are snapshots, not certification of concurrent
+market-data work added by another session. Frontend type checking passed.
+The final logging-only check passed all 6 tests, including visible nonzero
+slippage/commission precision and HTTP request correlation/redaction.
+The real-mode strategy/coverage API tests passed in the initial focused run;
+the frontend form suite still has timing failures during this shared-checkout
+session (loading/default-date updates). The final rerun also timed out starting
+a Vitest worker, so a fully green frontend regression suite is not claimed here.
+Temporary verification servers on 8123/5174 were stopped after the successful
+runs; existing user development servers were left in place.
+Existing release blockers below remain unchanged.
+
+### Prior implementation baseline
+
 The core student backtesting workflow is implemented and was verified with
 the real frontend, PostgreSQL market data and private S3 strategy storage:
 

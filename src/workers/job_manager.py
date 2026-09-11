@@ -245,7 +245,12 @@ async def application_lifespan(app: object = None) -> AsyncIterator[None]:
     """
     from src.db.init import database_lifespan
 
-    logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    from src.core.logging_config import configure_logging
+
+    configure_logging(settings.log_level, non_blocking=True)
+    logger.info("STARTUP | API starting; log_level=%s strategy_store=%s", settings.log_level, settings.strategy_store_backend)
     async with database_lifespan(app):
         async with job_manager_lifespan(app):
+            logger.info("READY | Database initialized; workers ready; API accepting requests")
             yield
+    logger.info("SHUTDOWN | API and worker pool stopped")

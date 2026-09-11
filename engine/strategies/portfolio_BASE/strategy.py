@@ -10,6 +10,7 @@ from typing import Any, Literal, Optional
 import pandas as pd
 
 from engine.indicators.base import Indicator
+from engine.data.fmp import FMPDataAdapter, fetch_daily_history, market_data_source
 from engine.strategies.order_interface import StrategyContext
 
 
@@ -182,9 +183,20 @@ class BasePortfolio(ABC):
         end_time = self.backtest_start_date or datetime.now()
         start_time = end_time - timedelta(days=warmup_days)
 
-        sql = self.MARKET_DATA_QUERY.format(placeholders="%s")
-        params = [ticker, start_time.date(), end_time.date()]
-        result = self.db.execute_query(sql, params, fetch="all")
+        if market_data_source() == "fmp":
+            # Warm indicators only with completed days before the simulation.
+            # A newly listed ticker may have no warmup yet; it becomes ready
+            # naturally as the event loop receives bars.
+            fetch = self.db.get_daily_history if isinstance(self.db, FMPDataAdapter) else fetch_daily_history
+            frame = fetch(
+                [ticker], start_time.date(), end_time.date() - timedelta(days=1),
+                require_all=False,
+            )
+            result = {"status": "success", "data": frame.to_dict("records")}
+        else:
+            sql = self.MARKET_DATA_QUERY.format(placeholders="%s")
+            params = [ticker, start_time.date(), end_time.date()]
+            result = self.db.execute_query(sql, params, fetch="all")
 
         price_col: str = kwargs.get("price_col") or kwargs.get("close_col", "close_price")
         if result["status"] == "success" and result.get("data"):

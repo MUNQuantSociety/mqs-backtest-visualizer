@@ -637,6 +637,7 @@ def generate_backtest_report(
     out_dir: str | None = None,
     benchmark_start: Any = None,
     benchmark_end: Any = None,
+    include_minute_report: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """
     Generates and saves a full backtest report with enhanced risk analysis.
@@ -646,6 +647,8 @@ def generate_backtest_report(
     here anyway; returning it lets ``run_single`` attach it to the equity
     curve without re-reading CSVs. Benchmark cutoffs exclude the lookback
     prefix and any prices after the final performance sample.
+    Daily data callers disable the synthetic minute report; observed equity,
+    benchmark, and risk reports keep their existing sampling.
     """
     logger = portfolio.logger
     reports: dict[str, pd.DataFrame] = {}
@@ -720,19 +723,22 @@ def generate_backtest_report(
         reports["performance_timeseries_percentage"] = pct_df.copy()
 
     # Section 5: High-frequency performance report
-    try:
-        minute_perf_df = _generate_minute_by_minute_performance(
-            trade_log=portfolio.executor.trade_log,
-            full_historical_data=full_historical_data,
-            initial_capital=initial_capital,
-            tickers=portfolio.tickers,
-        )
-        if not minute_perf_df.empty:
-            reports["performance_timeseries_minute_by_minute"] = minute_perf_df.copy()
-    except Exception as e:
-        logger.error(
-            f"Error generating minute-by-minute performance report: {e}", exc_info=True
-        )
+    if include_minute_report:
+        try:
+            minute_perf_df = _generate_minute_by_minute_performance(
+                trade_log=portfolio.executor.trade_log,
+                full_historical_data=full_historical_data,
+                initial_capital=initial_capital,
+                tickers=portfolio.tickers,
+            )
+            if not minute_perf_df.empty:
+                reports["performance_timeseries_minute_by_minute"] = minute_perf_df.copy()
+        except Exception as e:
+            logger.error(
+                f"Error generating minute-by-minute performance report: {e}", exc_info=True
+            )
+    else:
+        logger.info("Skipping synthetic minute-by-minute report for daily market data.")
 
     # Section 6: Buy-and-hold benchmark report
     try:

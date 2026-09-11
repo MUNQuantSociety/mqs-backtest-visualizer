@@ -23,6 +23,18 @@ assert that a release is deployed.
 
 For the request/worker/database design, read [Architecture Flow](docs/ARCHITECTURE_FLOW.md).
 For current result semantics, read [Report Contract](docs/REPORT_CONTRACT.md).
+For portfolio publication, S3 execution and visible terminal logs, read
+[S3 strategy flow and logging](docs/S3_STRATEGY_FLOW.md).
+
+For a stable local Windows API, run `./scripts/start-dev-api.ps1`. It launches
+the application in your terminal on port 8000; press Ctrl+C to stop it. Only
+the explicit `-Background` option writes timestamped output/error files under
+`logs/` and waits for `/api/health` before reporting Ready. Stop the existing
+process before starting another; restart it after backend code changes. This
+avoids an auto-reloader retaining the port when its application child exits.
+API console logging runs on bounded background queues, so a stalled terminal
+does not block requests. S3 sessions and clients are confined to one thread
+and process, then reused there for concurrent catalogue checks.
 For completed work, verification evidence and remaining release blockers, read
 [Project Status and Handoff](PROJECT_STATUS.md).
 [CI and deployment](#ci-and-deployment) below summarizes the current workflow files;
@@ -55,10 +67,27 @@ dated architecture/readiness notes remain useful historical context.
 ## Quick start
 
 Use **Python 3.12** and run commands from the repository root. A reachable
-PostgreSQL database with readable `public.market_data` and permission to
-create/write `app.*` is needed to seed strategies and run the API. The
-[isolated tests](#tests) do not need a database. There is no Redis, Celery or
+PostgreSQL database with permission to create/write `app.*` is needed to seed
+strategies and run the API. For prices, set `FMP_API_KEY` in the backend `.env`:
+coverage, indicator warmup, event runs and fast runs then use FMP daily history.
+The [isolated tests](#tests) do not need a database. There is no Redis, Celery or
 separate worker service to start.
+
+FMP uses the [stable daily OHLCV endpoint](https://site.financialmodelingprep.com/developer/docs/stable/historical-price-eod-full).
+Each run fetches its selected tickers and dates, including lookback history;
+the old database parquet cache is not used. Coverage answers are cached for up
+to five minutes and end on the latest available prior exchange date. A window
+before an IPO or past available history is rejected with the actual bounds.
+Provider failures appear as retryable errors, not missing tickers or demo data.
+`MARKET_DATA_SOURCE=database` restores database prices and requires readable
+`public.market_data`; `MARKET_DATA_SOURCE=fmp` explicitly requires the FMP key.
+With no source override, FMP is required. A missing key fails explicitly; it never
+switches to database prices. Each run downloads its tickers concurrently (up to
+four at a time) and shares that history between indicator warmup, simulation and
+benchmark construction.
+Daily FMP runs export observed daily results and skip the synthetic minute-by-minute
+CSV, which would expand daily closes across nights and weekends.
+Restart the API and workers after changing `.env`.
 
 ### Windows PowerShell
 
@@ -72,13 +101,18 @@ if (-not (Test-Path -LiteralPath .env)) {
 
 Edit the existing `.env` to configure your database before continuing; the
 copy step above leaves an existing file untouched. Then seed the catalogue
-and start the API with console output also appended to a local log:
+and start the API in your terminal:
 
 ```powershell
 .\venv\Scripts\python.exe scripts/seed_strategies.py
-New-Item -ItemType Directory -Force -Path logs | Out-Null
-.\venv\Scripts\python.exe -u -m uvicorn server:app --reload --port 8000 --log-level info 2>&1 | Tee-Object -FilePath logs/backend.log -Append
+.\venv\Scripts\python.exe -X faulthandler -u -m uvicorn server:app --host 127.0.0.1 --port 8000 --log-level info
 ```
+
+Keep that terminal open; press **Ctrl+C** to stop the API. The helper
+`.\scripts\start-dev-api.ps1` runs the same foreground command after checking
+that the port is free. Use `-Port 8001` to choose another port. Only an explicit
+`-Background` starts a hidden process and redirects output and crash traces to
+timestamped files under `logs/`.
 
 ### Linux/macOS
 
@@ -92,8 +126,7 @@ Configure `.env` before running these commands:
 
 ```bash
 venv/bin/python scripts/seed_strategies.py
-mkdir -p logs
-venv/bin/python -u -m uvicorn server:app --reload --port 8000 --log-level info 2>&1 | tee -a logs/backend.log
+venv/bin/python -X faulthandler -u -m uvicorn server:app --host 127.0.0.1 --port 8000 --log-level info
 ```
 
 Open [API docs](http://localhost:8000/docs) or
@@ -102,6 +135,14 @@ objects and starts the process pool; seeding upserts built-in catalogue entries.
 Neither operation is a general schema migration system. `LOG_LEVEL` controls
 application logging; Uvicorn's flag controls its own logger. `logs/` and
 `*.log` are gitignored.
+
+The default launch omits `--reload`: its supervisor can retain the port after
+the application child exits, leaving HTTP requests unanswered. `faulthandler`
+prints Python thread stacks for native crashes. Logs show request arrival/response, S3 package checks
+and downloads, selected controls, coverage, queue/worker stages, progress and
+report persistence. See the [logging command and stage reference](docs/S3_STRATEGY_FLOW.md#start-the-backend-with-visible-logs).
+In S3 mode, seeding alone does not publish strategy files; follow the
+[portfolio publication steps](docs/S3_STRATEGY_FLOW.md#publish-the-two-built-in-portfolios).
 
 Keep the pandas/NumPy constraints in [requirements.txt](requirements.txt):
 the vendored engine depends on that compatible runtime. Optional cache warming
@@ -725,6 +766,15 @@ class MyStrategy(BasePortfolio):
 Exactly one `BasePortfolio` subclass per file — zero means the file is not a
 strategy, and two means the answer depends on which one the loader happens to
 find first. Both are a 422.
+
+`context.buy(ticker)` moves toward the configured long `WEIGHTS` allocation,
+covering a short first; absent weights use equal allocation. `context.sell(ticker)`
+reduces an existing long to flat and does nothing when flat or short.
+`context.close_position(ticker)` closes either side. For deliberate signed
+exposure, use `context.target_weight(ticker, weight)`: `0.25` targets a 25% long,
+`-0.25` targets a 25% short, and `0` targets flat. Each helper accepts `confidence`
+to trade that fraction of the remaining adjustment, subject to whole-share
+rounding, cash, margin, and execution costs.
 
 ---
 

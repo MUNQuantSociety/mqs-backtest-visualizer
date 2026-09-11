@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import threading
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
@@ -287,7 +288,7 @@ class S3StrategyStore:
     is an idempotent prefix sweep, and ``materialize`` streams every object
     under the key into a directory in the layout the engine imports from.
 
-    The boto3 client is created on first use, not in ``__init__``, for three
+    A boto3 client is created per thread on first use, not in ``__init__``, for three
     reasons that all bite in practice. The worker pool spawns its processes
     (``src/workers/job_manager.py``), so the child rebuilds the store from
     scratch and must not inherit a socket-holding client through pickling;
@@ -322,47 +323,71 @@ class S3StrategyStore:
         self.prefix = f"{cleaned}{KEY_SEPARATOR}" if cleaned else ""
         self.region = (region or "").strip() or None
         self.endpoint_url = (endpoint_url or "").strip() or None
-        self._client: Any = None
-        self._client_pid: int | None = None
+        self._thread_state = threading.local()
 
     # ------------------------------------------------------------------
     # Client lifecycle
     # ------------------------------------------------------------------
     @property
+    def _client(self) -> Any:
+        """The calling thread's client; retain the existing inspection seam."""
+        return getattr(self._thread_state, "client", None)
+
+    @_client.setter
+    def _client(self, value: Any) -> None:
+        self._thread_state.client = value
+
+    @property
+    def _client_pid(self) -> int | None:
+        return getattr(self._thread_state, "pid", None)
+
+    @_client_pid.setter
+    def _client_pid(self, value: int | None) -> None:
+        self._thread_state.pid = value
+
+    @property
     def _s3(self) -> S3Client:
         """The boto3 client, built on first access (see the class docstring).
 
-        Not locked: boto3 clients are thread-safe, and if two request threads
-        race here they build two equivalent clients and the last one wins —
-        a wasted socket, not a bug.
+        Catalogue checks fan out across threads. Each thread owns its session,
+        client and HTTPS connection pool, avoiding concurrent TLS handshakes
+        against one client's certificate store. Repeated calls in that thread
+        reuse connections. A fork must also rebuild the inherited client.
         """
-        if self._client is None or self._client_pid != os.getpid():
-            import boto3
-            from botocore.config import Config
+        pid = os.getpid()
+        if self._client is not None and self._client_pid == pid:
+            return self._client
+        import boto3
+        from botocore.config import Config
 
-            # Path-style addressing only when an endpoint is set: LocalStack
-            # and MinIO resolve ``http://host:port/bucket``, while real S3
-            # should keep the SDK's default virtual-hosted style.
-            config = Config(
-                connect_timeout=5,
-                read_timeout=10,
-                retries={"mode": "standard", "total_max_attempts": 3},
-                s3={"addressing_style": "path"} if self.endpoint_url else {},
-            )
-            self._client = boto3.client(
-                "s3",
-                region_name=self.region,
-                endpoint_url=self.endpoint_url,
-                config=config,
-            )
-            self._client_pid = os.getpid()
+        # Path-style addressing only when an endpoint is set: LocalStack
+        # and MinIO resolve ``http://host:port/bucket``, while real S3
+        # should keep the SDK's default virtual-hosted style.
+        config = Config(
+            connect_timeout=5,
+            read_timeout=10,
+            retries={"mode": "standard", "total_max_attempts": 3},
+            s3={"addressing_style": "path"} if self.endpoint_url else {},
+        )
+        # boto3.client() uses a shared default Session. Keep that mutable SDK
+        # state thread-local too; certificate verification remains enabled.
+        self._client = boto3.session.Session().client(
+            "s3",
+            region_name=self.region,
+            endpoint_url=self.endpoint_url,
+            config=config,
+        )
+        self._client_pid = pid
         return self._client
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
-        state["_client"] = None
-        state["_client_pid"] = None
+        state.pop("_thread_state", None)
         return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._thread_state = threading.local()
 
     # ------------------------------------------------------------------
     # Key translation

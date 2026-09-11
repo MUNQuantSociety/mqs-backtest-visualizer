@@ -25,6 +25,7 @@ single = importlib.import_module("engine.run_single")
 
 @pytest.fixture(autouse=True)
 def no_database(monkeypatch):
+    monkeypatch.setenv("MARKET_DATA_SOURCE", "database")
     def forbidden(*args, **kwargs):
         pytest.fail("Report unit tests must never connect to PostgreSQL")
     monkeypatch.setattr("psycopg2.connect", forbidden)
@@ -228,6 +229,7 @@ def test_final_sample_includes_oms_fill_after_last_poll():
     "engine.strategies.portfolio_3.strategy:RegimeAdaptiveStrategy",
 ])
 def test_real_supported_fast_paths_use_configured_hold(monkeypatch, tmp_path, class_path):
+    monkeypatch.setenv("MARKET_DATA_SOURCE", "database")
     days = pd.bdate_range("2025-09-01", "2026-01-05")
     rows = [
         {"timestamp": day.tz_localize("America/New_York") + pd.Timedelta(hours=16),

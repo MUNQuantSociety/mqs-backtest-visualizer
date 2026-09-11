@@ -28,6 +28,7 @@ from engine.analytics.vector_strategy_adapters import (
 from engine.analytics.vectorized_backtest import VectorBacktester
 from engine.core.cost_model import CostModel
 from engine.core.runner import BacktestRunner
+from engine.data.fmp import FMPDataAdapter
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 
@@ -228,6 +229,19 @@ class BacktestEngine:
         if not tickers:
             self.logger.warning("Fast mode skipped: portfolio has no tickers.")
             return pd.DataFrame()
+
+        from engine.data.fmp import fetch_daily_history, market_data_source
+
+        if market_data_source() == "fmp":
+            fetch = (
+                portfolio_instance.db.get_daily_history
+                if isinstance(portfolio_instance.db, FMPDataAdapter)
+                else fetch_daily_history
+            )
+            df = fetch(tickers, start_date, end_date)
+            if not df.empty:
+                df["trade_date"] = df["timestamp"].dt.normalize().dt.tz_localize(None)
+            return df
 
         placeholders = ", ".join(["%s"] * len(tickers))
         sql = f"""
@@ -727,6 +741,18 @@ class BacktestEngine:
                     self._run_fast_vectorized(portfolio_instance)
                 else:
                     # --- Instantiate with the loaded config_dict ---
+                    if isinstance(self.db_connector, FMPDataAdapter):
+                        if self.on_progress is not None:
+                            self.on_progress(0, "loading FMP data")
+                        # Fetch before constructing indicators. The standard
+                        # indicators fit in 90 days; custom longer warmups can
+                        # extend the same in-memory history on demand.
+                        lookback = max(int(config_data.get("LOOKBACK_DAYS", 365)), 90)
+                        self.db_connector.get_daily_history(
+                            config_data.get("TICKERS", []),
+                            pd.Timestamp(self.start_date) - pd.Timedelta(days=lookback),
+                            self.end_date,
+                        )
                     portfolio_instance = portfolio_class(
                         db_connector=self.db_connector,
                         executor=None,  # The runner will set the executor later

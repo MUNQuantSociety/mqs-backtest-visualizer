@@ -196,6 +196,9 @@ def seed() -> list[dict[str, Any]]:
             session.execute(
                 statement.on_conflict_do_update(
                     index_elements=[Strategy.key],
+                    # Published metadata belongs to its verified package. A
+                    # normal seed must not silently drift from its S3 config.
+                    where=Strategy.storage_key.is_(None),
                     set_={
                         column: statement.excluded[column]
                         for column in (

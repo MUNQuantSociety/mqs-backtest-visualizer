@@ -11,20 +11,26 @@ exists for — see :func:`create_backtest`.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
+from engine.data.fmp import FMPUnavailable
 from src.api.dependencies.current_user import require_current_user
 from src.schemas.backtests import (
     BacktestDetail,
+    BacktestEquity,
     BacktestListResponse,
     BacktestRunRequest,
     BacktestStatus,
     BacktestSummary,
+    LookbackPeriod,
 )
 from src.services import backtests as backtests_service
 from src.services.backtests import DeleteOutcome, RunSubmissionError
+from src.services.backtest_equity import window_equity
 from src.services.report_exports import EXPORT_NAMES, export_report
 
 router = APIRouter(prefix="/backtests", tags=["backtests"])
@@ -39,7 +45,7 @@ async def list_backtests(
     page_size: int = Query(default=25, ge=1, le=100, alias="pageSize"),
     owner_id: uuid.UUID = Depends(require_current_user),
 ) -> BacktestListResponse:
-    """This user's public runs, newest first. Empty is a valid answer, not an error."""
+    """This user's current and historical runs, newest first."""
     return await backtests_service.list_backtests(
         owner_id=owner_id,
         search=search,
@@ -55,7 +61,10 @@ async def list_backtests(
     response_model=BacktestSummary,
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def create_backtest(submission: BacktestRunRequest) -> BacktestSummary:
+async def create_backtest(
+    submission: BacktestRunRequest,
+    owner_id: uuid.UUID = Depends(require_current_user),
+) -> BacktestSummary:
     """Run a backtest. Answers **202** with the row, not the result.
 
     The engine takes minutes, so the response is the queued run itself: the
@@ -75,8 +84,11 @@ async def create_backtest(submission: BacktestRunRequest) -> BacktestSummary:
     strategy does not accept.
     """
     try:
-        return await backtests_service.submit_backtest_run(submission)
+        return await backtests_service.submit_backtest_run(submission, owner_id=owner_id)
+    except FMPUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     except RunSubmissionError as exc:
+        logging.getLogger(__name__).warning("REJECTED | Backtest request rejected; strategy=%r reason=%s", submission.strategy_key, str(exc))
         # A string ``detail``, not FastAPI's list of error objects: the
         # client's error reader takes `detail` only when it is a string, and
         # shows "Request failed with status code 422" otherwise.
@@ -94,6 +106,24 @@ async def get_backtest(backtest_id: str) -> BacktestDetail:
             detail=f"No backtest with id {backtest_id!r}.",
         )
     return detail
+
+
+@router.get("/{backtest_id}/equity", response_model=BacktestEquity)
+async def get_backtest_equity(
+    backtest_id: str,
+    period: LookbackPeriod = Query(),
+    end_date: date = Query(alias="endDate", ge=date(6, 1, 1)),
+) -> BacktestEquity:
+    """Slice saved equity and benchmark observations; never run the engine.
+
+    The dashboard passes the latest selected run's endDate to every strategy,
+    so 1Y/2Y/5Y use the same calendar window. Max returns all saved observations
+    through endDate. Available bounds explain short or missing history.
+    """
+    detail = await backtests_service.get_backtest(backtest_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"No backtest with id {backtest_id!r}.")
+    return window_equity(detail, period, end_date)
 
 
 @router.delete("/{backtest_id}", status_code=status.HTTP_204_NO_CONTENT)

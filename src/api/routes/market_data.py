@@ -1,17 +1,14 @@
 """Market-data coverage endpoint.
 
-Exists so the run form can offer a window that has prices in it. Coverage ends
-weeks behind the calendar, so a date picker defaulting to "last 30 days"
-produces an empty window, and the run fails for a reason that has nothing to do
-with the student's strategy.
-
-Read-only against ``public.market_data``, which the live trading system owns.
+Bounds the run form to actual FMP or database history for the selected tickers.
+Provider errors are reported separately from tickers with no history.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, status
 
+from engine.data.fmp import FMPUnavailable
 from src.schemas.market_data import CoverageResponse
 from src.services import market_data as market_data_service
 
@@ -64,4 +61,7 @@ async def get_coverage(
             detail="No tickers to report coverage for.",
         )
 
-    return await market_data_service.coverage_for(wanted)
+    try:
+        return await market_data_service.coverage_for(wanted)
+    except FMPUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None

@@ -22,9 +22,10 @@ Three consequences follow from that, and they explain most of the shape below:
   table means by "workers: sync DB only".
 
 Uploaded strategies travel this same path. The only branch is where the class
-comes from — a built-in is imported from ``engine.strategies``, an upload is
-copied out of the strategy store into a temporary directory and imported from
-there — and the only extra step is at the end, where a run marked
+comes from — published built-ins and uploads are copied out of the strategy
+store into a temporary directory and imported from there. Only legacy built-ins
+in local-storage mode import from ``engine.strategies``. The only extra step
+for an upload is at the end, where a run marked
 ``purpose='validation'`` writes its verdict onto the strategy it validated. A
 validation run is otherwise an ordinary run in every respect. Note that
 importing an upload *executes* it, in this process, with the credentials this
@@ -39,6 +40,7 @@ throttled read of ``cancel_requested``, and a cancelled run lands as
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import tempfile
@@ -113,9 +115,9 @@ class _RunContext:
     initial_capital: float
     mode: str
     params: dict[str, Any]
-    # Where an uploaded strategy was materialised, so it can be deleted when
-    # the run is over. ``None`` for a built-in, which is already on disk.
+    # Temporary copy of a stored package; None for legacy local built-ins.
     workdir: Path | None = None
+    storage_key: str | None = None
 
 
 def run_job(run_id: str) -> str:
@@ -130,10 +132,9 @@ def run_job(run_id: str) -> str:
     a redelivered job finds the row already ``running`` and returns quietly
     instead of running the backtest a second time.
     """
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    from src.core.logging_config import configure_logging
+
+    configure_logging(settings.log_level)
     parsed = _parse_run_id(run_id)
     if parsed is None:
         logger.error("run_job called with %r, which is not a run id", run_id)
@@ -165,6 +166,8 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
             logger.info("Run %s was already claimed; nothing to do.", parsed)
             return "skipped"
 
+        logger.info("WORKER | Run claimed; run=%s; loading strategy and settings", parsed)
+
         try:
             context = _load_context(engine, parsed)
         except Exception as exc:
@@ -179,10 +182,16 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
             # minutes of data loading that precede the first cancellation poll.
             return _fail(engine, parsed, CANCELLED_MESSAGE)
 
+        source = _strategy_source(context)
+        started = time.perf_counter()
+        logger.info("ENGINE | Starting; run=%s strategy=%s source=%s capital=%s window=%s..%s mode=%s tickers_override=%s", parsed, context.strategy_key, source["backend"], context.initial_capital, context.start_date, context.end_date, context.mode, context.params.get("TICKERS", "stored config"))
         result = run_single(_build_request(context, heartbeat))
+        result.report_metadata["strategySource"] = source
+        logger.info("ENGINE | Finished; run=%s status=%s elapsed_s=%.2f", parsed, result.status, time.perf_counter() - started)
 
         if result.status == "completed":
             try:
+                logger.info("PERSIST | Writing report; run=%s equity_samples=%d fills=%d", parsed, len(result.equity_curve), len(result.fills))
                 _persist_success(engine, context, result)
             except Exception as exc:
                 # The backtest was fine; storing it was not. Saying "completed"
@@ -192,7 +201,7 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
                 return _fail(
                     engine, parsed, f"result could not be stored: {_describe(exc)}"
                 )
-            logger.info("Run %s completed", parsed)
+            logger.info("COMPLETED | run=%s final_equity=%s; results and exports ready", parsed, result.final_equity)
             return "completed"
 
         if result.status == "cancelled":
@@ -274,6 +283,7 @@ class _RunHeartbeat:
         self._interval = max(float(settings.progress_write_interval_seconds), 0.0)
         self._pending_pct = 0
         self._written_pct = -1
+        self._last_logged_progress: tuple[int, str] | None = None
         self._cancelled = False
         # Negative infinity rather than "now": the first poll must not be
         # throttled, because a run cancelled while queued should stop before it
@@ -331,7 +341,10 @@ class _RunHeartbeat:
     def on_progress(self, pct: int, stage: str) -> None:
         """Engine callback: record progress, write it at most once a second."""
         self._pending_pct = max(0, min(100, int(pct)))
-        logger.debug("Run %s: %d%% (%s)", self._run_id, self._pending_pct, stage)
+        progress = (self._pending_pct, stage)
+        if progress != self._last_logged_progress:
+            logger.info("PROGRESS | run=%s progress=%d%% stage=%s", self._run_id, self._pending_pct, stage)
+            self._last_logged_progress = progress
         self._poll()
 
     def should_cancel(self) -> bool:
@@ -431,6 +444,7 @@ def _load_context(engine: Engine, run_id: uuid.UUID) -> _RunContext:
         mode=mode or DEFAULT_MODE,
         params=params,
         workdir=workdir,
+        storage_key=row.storage_key,
     )
 
 
@@ -443,19 +457,38 @@ def _resolve_class_path(
 ) -> tuple[str, Path | None]:
     """Where to import this strategy's class from, and what to clean up after.
 
-    Built-ins carry a dotted path to a vendored class and need nothing else.
-    An upload is a pair of objects in the strategy store, so it is copied into
+    Published built-ins and uploads are pairs of objects in the store, copied into
     a temporary directory and imported from there; the loader registers the
     module under a per-run name, which is why what comes back is still an
     ordinary ``"module:ClassName"`` path that ``run_single`` resolves without
-    knowing an upload was involved. This is the *only* place the pipeline
-    branches on ``kind``.
+    knowing storage was involved. Stored source always wins over a local import.
+    Local built-ins remain available only in local-storage mode.
     """
-    if kind == "user":
+    if storage_key or kind == "user":
         return _materialize_user_strategy(run_id, strategy_key, storage_key)
+    if settings.strategy_store_backend == "s3":
+        raise RuntimeError(
+            f"strategy {strategy_key!r} has not been published to the configured S3 store"
+        )
     if class_path:
         return class_path, None
     raise RuntimeError(f"strategy {strategy_key!r} has no class_path to run")
+
+
+def _strategy_source(context: _RunContext) -> dict[str, Any]:
+    """Record the exact downloaded bytes before the strategy starts trading."""
+    if context.workdir is None:
+        return {"backend": "builtin", "classPath": context.class_path}
+    return {
+        "backend": settings.strategy_store_backend,
+        "storageKey": context.storage_key,
+        "sourceSha256": hashlib.sha256(
+            (context.workdir / "strategy.py").read_bytes()
+        ).hexdigest(),
+        "configSha256": hashlib.sha256(
+            (context.workdir / "config.json").read_bytes()
+        ).hexdigest(),
+    }
 
 
 def _materialize_user_strategy(
@@ -484,6 +517,8 @@ def _materialize_user_strategy(
     from src.integrations.strategy_store import get_strategy_store
 
     workdir = Path(tempfile.mkdtemp(prefix=f"mqs-user-{run_id.hex[:8]}-"))
+    started = time.perf_counter()
+    logger.info("STORAGE FETCH | run=%s strategy=%s backend=%s key=%s; downloading source/config", run_id, strategy_key, settings.strategy_store_backend, storage_key)
     try:
         loaded = load_user_strategy(
             storage_key=storage_key,
@@ -492,8 +527,10 @@ def _materialize_user_strategy(
             token=run_id.hex,
         )
     except BaseException:
+        logger.error("STORAGE FETCH | Failed; run=%s strategy=%s", run_id, strategy_key)
         _remove_workdir(workdir)
         raise
+    logger.info("STORAGE FETCH | Loaded; run=%s strategy=%s class=%s elapsed_ms=%.0f", run_id, strategy_key, loaded.strategy_class.__name__, (time.perf_counter() - started) * 1000)
     return loaded.class_path, workdir
 
 

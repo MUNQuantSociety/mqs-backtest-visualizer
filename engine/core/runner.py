@@ -12,6 +12,7 @@ from engine.analytics.reporting import generate_backtest_report
 from engine.contracts.errors import NoMarketData, RunCancelled
 from engine.core.executor import BacktestExecutor
 from engine.core.utils import fetch_historical_data
+from engine.data.fmp import FMPDataAdapter
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 # Define the exchange timezone
@@ -436,6 +437,12 @@ class BacktestRunner:
                     # bar, not the first bar of the lookback prefix.
                     benchmark_start=self.backtest_loop_start_date,
                     benchmark_end=perf_df["timestamp"].max(),
+                    # Daily FMP closes cannot supply intraday observations.
+                    # Avoid expanding them into hundreds of thousands of
+                    # synthetic minute rows and serializing a redundant CSV.
+                    include_minute_report=not isinstance(
+                        getattr(self.portfolio, "db", None), FMPDataAdapter
+                    ),
                 )
                 # VISUALIZER: keep the in-memory benchmark for run_single.
                 self.benchmark_df = (reports or {}).get("benchmark_buy_and_hold")

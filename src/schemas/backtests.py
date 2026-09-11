@@ -28,6 +28,27 @@ class EquityPoint(CamelModel):
     benchmark: float | None = None
 
 
+LookbackPeriod = Literal["1y", "2y", "5y", "max"]
+
+
+class EquityWindow(CamelModel):
+    period: LookbackPeriod
+    requested_start: str | None
+    requested_end: str
+    available_start: str | None
+    available_end: str | None
+
+
+class BacktestEquity(CamelModel):
+    """Saved observations only; selecting a period never executes a new run."""
+
+    id: str
+    strategy_id: str
+    symbol: str
+    equity_curve: list[EquityPoint]
+    window: EquityWindow
+
+
 class Trade(CamelModel):
     id: str
     symbol: str

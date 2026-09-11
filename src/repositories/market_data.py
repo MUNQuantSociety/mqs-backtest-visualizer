@@ -3,10 +3,10 @@
 The live trading system owns this table. This application reads it and must
 never write to it.
 
-Both queries here are per ticker rather than aggregates over a ticker set. That
-is measured, not stylistic: the planner answers the per-ticker form from the
-descending date index in under a millisecond, while the aggregate form walks
-the index and takes minutes on a table this size.
+Use the existing (ticker, timestamp) index for both ends of each ticker's
+history. Ordering by date instead scans the global date index and filters out
+other tickers, which can take minutes for recently listed symbols. Return the
+stored exchange date, not a timestamp converted in the client's timezone.
 """
 
 from __future__ import annotations
@@ -16,17 +16,16 @@ from datetime import date
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# One ticker's most recent bar. See the module docstring for why this is not
-# ``max(date)`` over a ticker set.
+# Earliest/latest observations use the same ticker-specific index.
 _LATEST_BAR_SQL = text(
     "SELECT date FROM public.market_data "
-    "WHERE ticker = :ticker ORDER BY date DESC LIMIT 1"
+    'WHERE ticker = :ticker ORDER BY "timestamp" DESC LIMIT 1'
 ).bindparams(bindparam("ticker"))
 
 # The other end of the same index, read the same way and for the same reason.
 _EARLIEST_BAR_SQL = text(
     "SELECT date FROM public.market_data "
-    "WHERE ticker = :ticker ORDER BY date ASC LIMIT 1"
+    'WHERE ticker = :ticker ORDER BY "timestamp" ASC LIMIT 1'
 ).bindparams(bindparam("ticker"))
 
 

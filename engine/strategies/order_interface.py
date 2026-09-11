@@ -1,5 +1,7 @@
 # engine/strategies/order_interface.py  (vendored from MQSMaster)
 import logging
+import math
+from collections.abc import Mapping
 from datetime import datetime
 
 import pandas as pd
@@ -67,12 +69,48 @@ class StrategyContext:
         )
 
     def buy(self, ticker: str, confidence: float = 1.0):
-        self._trade(ticker, "BUY", confidence)
+        """Move toward the configured long allocation, covering a short first."""
+        self.target_weight(ticker, self._allocation_weight(ticker), confidence)
 
     def sell(self, ticker: str, confidence: float = 1.0):
-        self._trade(ticker, "SELL", confidence)
+        """Reduce an existing long toward flat; never open or enlarge a short."""
+        positions = getattr(self._executor, "positions", self.Portfolio.positions)
+        if positions.get(ticker, 0.0) > 0:
+            self._trade(ticker, "SELL", confidence, target_weight=0.0)
 
-    def _trade(self, ticker: str, signal_type: str, confidence: float):
+    def close_position(self, ticker: str, confidence: float = 1.0):
+        """Reduce either a long or short position toward flat."""
+        self.target_weight(ticker, 0.0, confidence)
+
+    def target_weight(self, ticker: str, weight: float, confidence: float = 1.0):
+        """Move toward signed portfolio exposure; negative weights intentionally short."""
+        weight = float(weight)
+        if not math.isfinite(weight):
+            raise ValueError("Target weight must be finite")
+        self._trade(ticker, "BUY", confidence, target_weight=weight)
+
+    def _allocation_weight(self, ticker: str) -> float:
+        # BasePortfolio passes the existing WEIGHTS/TICKERS config under these
+        # lowercase keys. Absent weights mean equal allocation; explicit zero
+        # or omitted mapping entries remain unallocated, as in reporting.
+        tickers = list(dict.fromkeys(self._portfolio_config.get("tickers", [])))
+        if ticker not in tickers:
+            return 0.0
+        weights = self._portfolio_config.get("weights")
+        if weights is None:
+            return 1.0 / len(tickers)
+        if isinstance(weights, Mapping):
+            weight = weights.get(ticker, 0.0)
+        elif isinstance(weights, (list, tuple)) and len(weights) == len(tickers):
+            weight = weights[tickers.index(ticker)]
+        else:
+            raise ValueError("WEIGHTS must be a mapping or one weight per ticker")
+        weight = float(weight)
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("WEIGHTS must contain finite nonnegative numbers")
+        return weight
+
+    def _trade(self, ticker: str, signal_type: str, confidence: float, *, target_weight: float):
         asset_data = self.Market[ticker]
         if not asset_data.Exists or asset_data.Close is None or asset_data.Close <= 0:
             logging.warning(
@@ -96,7 +134,8 @@ class StrategyContext:
                 cash=self.Portfolio.cash,
                 positions=self._positions_df,
                 port_notional=self.Portfolio.total_value,
-                ticker_weight=self.Portfolio.get_asset_weight(ticker, asset_data.Close),
+                ticker_weight=0.0,
+                target_weight=target_weight,
             )
             if sizing.quantity > 0:
                 # Direction comes from the SIGN of the sized notional, not
@@ -130,6 +169,7 @@ class StrategyContext:
                 cash=self.Portfolio.cash,
                 positions=self._positions_df,
                 port_notional=self.Portfolio.total_value,
-                ticker_weight=self.Portfolio.get_asset_weight(ticker, asset_data.Close),
+                ticker_weight=0.0,
+                target_weight=target_weight,
                 timestamp=self.time,
             )
