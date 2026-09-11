@@ -37,14 +37,17 @@ _FILTERS = """
     FROM public.backtest_runs r
     LEFT JOIN app.strategies s ON s.key = r.results->>'strategy_key'
     WHERE r.owner_id = :owner_id
-      AND (:status IS NULL OR r.results->>'status' = :status)
-      AND (:strategy_key IS NULL OR r.results->>'strategy_key' = :strategy_key)
+      AND (CAST(:status AS text) IS NULL OR r.results->>'status' = CAST(:status AS text))
       AND (
-            :search IS NULL
-            OR lower(COALESCE(r.results->>'name', '')) LIKE :search
-            OR lower(COALESCE(r.results->>'symbol', '')) LIKE :search
-            OR lower(COALESCE(r.results->>'strategy_key', '')) LIKE :search
-            OR lower(COALESCE(s.name, '')) LIKE :search
+            CAST(:strategy_key AS text) IS NULL
+            OR r.results->>'strategy_key' = CAST(:strategy_key AS text)
+          )
+      AND (
+            CAST(:search AS text) IS NULL
+            OR lower(COALESCE(r.results->>'name', '')) LIKE CAST(:search AS text)
+            OR lower(COALESCE(r.results->>'symbol', '')) LIKE CAST(:search AS text)
+            OR lower(COALESCE(r.results->>'strategy_key', '')) LIKE CAST(:search AS text)
+            OR lower(COALESCE(s.name, '')) LIKE CAST(:search AS text)
           )
 """
 
