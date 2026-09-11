@@ -89,6 +89,12 @@ Daily FMP runs export observed daily results and skip the synthetic minute-by-mi
 CSV, which would expand daily closes across nights and weekends.
 Restart the API and workers after changing `.env`.
 
+No database to point at, or no VPN? `docker compose up -d db` starts a local
+PostgreSQL with the right schema and a seeder that fills it with synthetic
+bars — see **[README.Docker.md](README.Docker.md)** for the walkthrough. It is
+the fastest way to a working stack, and nothing you do to it can affect the
+live trading system.
+
 ### Windows PowerShell
 
 ```powershell
@@ -862,6 +868,10 @@ current connection is determined by configuration.
 The bars the engine simulates over. Order of a billion rows on a remote host,
 so every query this repo writes against it is index-shaped by necessity.
 
+The local Docker database ([README.Docker.md](README.Docker.md)) recreates this
+table from the same DDL MQSMaster uses and fills it with a few tens of thousands
+of synthetic bars — the same shape, four orders of magnitude smaller.
+
 Coverage, measured 2026-08-21 (`scripts/check_market_data.py`):
 
 | | |
@@ -941,6 +951,7 @@ round trip. These are operator commands, not part of isolated tests.
 | Script | What it does |
 | --- | --- |
 | `scripts/seed_strategies.py` | Creates the `app` schema and upserts the four built-in strategies. Idempotent; leaves uploads, run history and `created_at` alone. Run after any schema change and on any fresh database. |
+| `scripts/seed_dev_db.py` | Fills a **local** `public.market_data` with synthetic hourly bars for every seeded universe. Idempotent, and refuses to run against a non-local `POSTGRES_HOST`. See [README.Docker.md](README.Docker.md). |
 | `scripts/check_market_data.py` | Measures `market_data` coverage for the seeded universes — first and last bar per ticker, and the window that is safe for all of them. `--all-tickers` walks the whole tape and is opt-in for good reason. |
 | `scripts/smoke_engine.py` | Proves the vendored engine can reach the real database: builds `portfolio_dummy` through `EngineDBAdapter` and pulls a short window of daily bars. Run it after touching `engine/data/` or `engine/core/utils.py`. |
 | `scripts/seed_market_cache.py` | Copies already-backfilled parquet files out of a local MQSMaster checkout into `data/backfill_cache/`. Optional; turns a first run into a cache hit. |
