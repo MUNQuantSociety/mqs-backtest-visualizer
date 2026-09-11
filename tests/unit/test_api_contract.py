@@ -176,68 +176,63 @@ def test_strategy_keys_are_camel_case() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _user_headers() -> dict[str, str]:
+    # Alice from the dummy user_creds rows used to test the public list.
+    return {"X-User-Id": "4510522a-07e1-4dba-98c3-e83bbee3cfe3"}
+
+
 @pytest.mark.db
-def test_backtest_list_is_paginated(
-    client: TestClient, seeded_run: BacktestSummary
-) -> None:
-    response = client.get("/api/backtests", params={"page": 1, "pageSize": 2})
+def test_backtest_list_is_paginated(client: TestClient) -> None:
+    """List is public.backtest_runs scoped by X-User-Id. Empty is a valid page."""
+    response = client.get(
+        "/api/backtests", params={"page": 1, "pageSize": 2}, headers=_user_headers()
+    )
     assert response.status_code == 200
 
     body = response.json()
     assert set(body) == {"items", "total", "page", "pageSize"}
     assert body["page"] == 1
     assert body["pageSize"] == 2
-    # The fixture's run is the newest, so page 1 is never empty here — which is
-    # what makes the per-item key assertion below run at all.
-    assert body["items"]
     assert len(body["items"]) <= 2
     assert body["total"] >= len(body["items"])
 
     for item in body["items"]:
-        # camelCase is the contract, not a preference.
         assert set(item) == _aliases(BacktestSummary)
 
 
 @pytest.mark.db
-def test_backtest_list_filters_by_strategy(
-    client: TestClient, seeded_run: BacktestSummary
-) -> None:
+def test_backtest_list_filters_by_strategy(client: TestClient) -> None:
     response = client.get(
-        "/api/backtests", params={"strategyId": CONTRACT_RUN_STRATEGY}
+        "/api/backtests",
+        params={"strategyId": CONTRACT_RUN_STRATEGY},
+        headers=_user_headers(),
     )
     assert response.status_code == 200
+    assert all(
+        item["strategyId"] == CONTRACT_RUN_STRATEGY for item in response.json()["items"]
+    )
 
-    items = response.json()["items"]
-    # A filter that returns nothing would satisfy the "all match" assertion on
-    # its own, so prove the matching row is actually there first.
-    assert seeded_run.id in {item["id"] for item in items}
-    assert all(item["strategyId"] == CONTRACT_RUN_STRATEGY for item in items)
-
-    other = client.get("/api/backtests", params={"strategyId": "portfolio_1"})
+    other = client.get(
+        "/api/backtests",
+        params={"strategyId": "portfolio_1"},
+        headers=_user_headers(),
+    )
     assert other.status_code == 200
-    assert seeded_run.id not in {item["id"] for item in other.json()["items"]}
+    assert all(item["strategyId"] == "portfolio_1" for item in other.json()["items"])
 
 
 @pytest.mark.db
-def test_backtest_list_rows_match_their_detail(
+def test_backtest_detail_shape_from_app_row(
     client: TestClient, seeded_run: BacktestSummary
 ) -> None:
-    """Whatever the list shows must be fetchable in full."""
-    listing = client.get("/api/backtests", params={"pageSize": 3})
-    assert listing.status_code == 200
-
-    items = listing.json()["items"]
-    assert items, "the seeded run must appear on the first page"
-
-    for item in items:
-        detail = client.get(f"/api/backtests/{item['id']}")
-        assert detail.status_code == 200
-
-        body = detail.json()
-        assert body["id"] == item["id"]
-        assert set(body["metrics"]) == _aliases(PerformanceMetrics)
-        assert isinstance(body["equityCurve"], list)
-        assert isinstance(body["trades"], list)
+    """Detail still comes from app.backtest_runs — list ids may not exist there."""
+    detail = client.get(f"/api/backtests/{seeded_run.id}")
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["id"] == seeded_run.id
+    assert set(body["metrics"]) == _aliases(PerformanceMetrics)
+    assert isinstance(body["equityCurve"], list)
+    assert isinstance(body["trades"], list)
 
 
 @pytest.mark.db

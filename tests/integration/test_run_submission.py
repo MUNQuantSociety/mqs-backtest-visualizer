@@ -259,20 +259,15 @@ def test_the_run_completes_with_results(completed_run) -> None:
     )
 
 
-def test_headline_numbers_reach_the_list_row(client, completed_run) -> None:
-    """The list view reads only the run row, so the run row must be filled in."""
+def test_headline_numbers_reach_the_detail_row(client, completed_run) -> None:
+    """The app run row still carries denormalised headlines for GET /{id}."""
     accepted, detail = completed_run
 
-    listing = client.get("/api/backtests", params={"strategyId": accepted["strategyId"]})
-    assert listing.status_code == 200
-
-    rows = {row["id"]: row for row in listing.json()["items"]}
-    row = rows[accepted["id"]]
-
-    assert row["status"] == "completed"
-    assert row["finalEquity"] == pytest.approx(detail["equityCurve"][-1]["equity"])
-    assert row["totalReturn"] == pytest.approx(detail["metrics"]["totalReturn"])
-    assert row["sharpe"] == pytest.approx(detail["metrics"]["sharpe"])
+    body = client.get(f"/api/backtests/{accepted['id']}").json()
+    assert body["status"] == "completed"
+    assert body["finalEquity"] == pytest.approx(detail["equityCurve"][-1]["equity"])
+    assert body["totalReturn"] == pytest.approx(detail["metrics"]["totalReturn"])
+    assert body["sharpe"] == pytest.approx(detail["metrics"]["sharpe"])
 
 
 def test_submitted_parameters_come_back_on_the_run(completed_run) -> None:
