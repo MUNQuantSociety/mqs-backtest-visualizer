@@ -3,16 +3,18 @@ from datetime import datetime
 
 from engine.indicators.base import Indicator
 
+
 class VWAP(Indicator):
     """
     A stateful, rolling Volume Weighted Average Price (VWAP) indicator.
     Calculates the VWAP over a rolling window of 'period' bars.
     VWAP = sum(Price * Volume) / sum(Volume)
     """
+
     def __init__(self, ticker: str, **kwargs):
         """
         Initializes the VWAP indicator.
-        
+
         Args:
             ticker (str): The ticker symbol this indicator is for.
             **kwargs:
@@ -21,11 +23,11 @@ class VWAP(Indicator):
                 vol_col (str): The name of the volume column (default: 'volume').
         """
         super().__init__(ticker=ticker, **kwargs)
-        
-        self.period = int(kwargs.get('period', 20))
-        self.price_col = kwargs.get('price_col', 'close_price')
-        self.vol_col = kwargs.get('vol_col', 'volume')
-        
+
+        self.period = int(kwargs.get("period", 20))
+        self.price_col = kwargs.get("price_col", "close_price")
+        self.vol_col = kwargs.get("vol_col", "volume")
+
         if self.period <= 0:
             raise ValueError("VWAP indicator requires a 'period' > 0.")
 
@@ -38,17 +40,17 @@ class VWAP(Indicator):
     def Update(self, timestamp: datetime, data_point: float, **kwargs):
         """
         Updates the indicator with a new price and optional volume.
-        
+
         Args:
             timestamp (datetime): The timestamp of the new data.
             data_point (float): The price value.
             **kwargs: Optional 'volume' parameter (defaults to 1.0).
         """
         # Get volume from kwargs, default to 1.0 if not provided
-        volume = float(kwargs.get('volume', 1.0))
-        
+        volume = float(kwargs.get("volume", 1.0))
+
         pv = data_point * volume
-        
+
         # If buffer is full, subtract the oldest values
         if len(self._pv_buffer) == self.period:
             old_pv = self._pv_buffer[0]

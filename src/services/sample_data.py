@@ -67,10 +67,22 @@ _STRATEGY_BLUEPRINTS: list[dict] = [
         "tags": ["momentum", "volume"],
         "universe": ["AAPL", "MSFT", "NVDA", "AMZN"],
         "parameters": [
-            {"key": "lookback_days", "label": "Lookback (days)", "type": "integer",
-             "default": 90, "min": 20, "max": 365},
-            {"key": "top_n", "label": "Positions held", "type": "integer",
-             "default": 4, "min": 1, "max": 20},
+            {
+                "key": "lookback_days",
+                "label": "Lookback (days)",
+                "type": "integer",
+                "default": 90,
+                "min": 20,
+                "max": 365,
+            },
+            {
+                "key": "top_n",
+                "label": "Positions held",
+                "type": "integer",
+                "default": 4,
+                "min": 1,
+                "max": 20,
+            },
         ],
     },
     {
@@ -81,10 +93,22 @@ _STRATEGY_BLUEPRINTS: list[dict] = [
         "tags": ["momentum"],
         "universe": ["SPY", "TLT", "GLD", "XOM"],
         "parameters": [
-            {"key": "lookback_days", "label": "Lookback (days)", "type": "integer",
-             "default": 120, "min": 20, "max": 365},
-            {"key": "vol_target", "label": "Volatility target", "type": "percent",
-             "default": 0.15, "min": 0.05, "max": 0.4},
+            {
+                "key": "lookback_days",
+                "label": "Lookback (days)",
+                "type": "integer",
+                "default": 120,
+                "min": 20,
+                "max": 365,
+            },
+            {
+                "key": "vol_target",
+                "label": "Volatility target",
+                "type": "percent",
+                "default": 0.15,
+                "min": 0.05,
+                "max": 0.4,
+            },
         ],
     },
     {
@@ -95,10 +119,22 @@ _STRATEGY_BLUEPRINTS: list[dict] = [
         "tags": ["regime", "vix", "adaptive"],
         "universe": ["SPY", "TLT", "GLD", "_VIX"],
         "parameters": [
-            {"key": "vix_threshold", "label": "VIX threshold", "type": "number",
-             "default": 22.0, "min": 10.0, "max": 50.0},
-            {"key": "risk_off_weight", "label": "Risk-off weight", "type": "percent",
-             "default": 0.6, "min": 0.0, "max": 1.0},
+            {
+                "key": "vix_threshold",
+                "label": "VIX threshold",
+                "type": "number",
+                "default": 22.0,
+                "min": 10.0,
+                "max": 50.0,
+            },
+            {
+                "key": "risk_off_weight",
+                "label": "Risk-off weight",
+                "type": "percent",
+                "default": 0.6,
+                "min": 0.0,
+                "max": 1.0,
+            },
         ],
     },
 ]
@@ -142,12 +178,42 @@ def list_strategies() -> list[Strategy]:
 # ---------------------------------------------------------------------------
 
 _BACKTEST_SPECS: list[tuple[str, str, str, str, BacktestStatus]] = [
-    ("bt-001", "Volume Momentum — 2025 H1", "portfolio_1", "AAPL", BacktestStatus.COMPLETED),
-    ("bt-002", "Volume Momentum — tuned lookback", "portfolio_1", "NVDA", BacktestStatus.COMPLETED),
+    (
+        "bt-001",
+        "Volume Momentum — 2025 H1",
+        "portfolio_1",
+        "AAPL",
+        BacktestStatus.COMPLETED,
+    ),
+    (
+        "bt-002",
+        "Volume Momentum — tuned lookback",
+        "portfolio_1",
+        "NVDA",
+        BacktestStatus.COMPLETED,
+    ),
     ("bt-003", "Momentum baseline", "portfolio_2", "SPY", BacktestStatus.COMPLETED),
-    ("bt-004", "Momentum — vol target 20%", "portfolio_2", "SPY", BacktestStatus.FAILED),
-    ("bt-005", "Regime adaptive — full window", "portfolio_3", "SPY", BacktestStatus.COMPLETED),
-    ("bt-006", "Regime adaptive — high VIX only", "portfolio_3", "TLT", BacktestStatus.RUNNING),
+    (
+        "bt-004",
+        "Momentum — vol target 20%",
+        "portfolio_2",
+        "SPY",
+        BacktestStatus.FAILED,
+    ),
+    (
+        "bt-005",
+        "Regime adaptive — full window",
+        "portfolio_3",
+        "SPY",
+        BacktestStatus.COMPLETED,
+    ),
+    (
+        "bt-006",
+        "Regime adaptive — high VIX only",
+        "portfolio_3",
+        "TLT",
+        BacktestStatus.RUNNING,
+    ),
 ]
 
 _STRATEGY_NAMES = {item["id"]: item["name"] for item in _STRATEGY_BLUEPRINTS}
@@ -206,7 +272,9 @@ def _trades(salt: str, symbol: str, count: int) -> list[Trade]:
 def _backtest_summaries() -> list[BacktestSummary]:
     summaries: list[BacktestSummary] = []
 
-    for index, (run_id, name, strategy_id, symbol, status) in enumerate(_BACKTEST_SPECS):
+    for index, (run_id, name, strategy_id, symbol, status) in enumerate(
+        _BACKTEST_SPECS
+    ):
         initial = 1_000_000.0
         curve = _equity_curve(run_id, 180, initial)
         final = curve[-1].equity
@@ -282,12 +350,30 @@ def get_backtest(run_id: str) -> BacktestDetail | None:
 # ---------------------------------------------------------------------------
 
 _PORTFOLIO_SPECS: list[tuple[str, str, str, EngineState, list[str], float]] = [
-    ("portfolio_1", "Volume Momentum", "VolumeMomentumStrategy", EngineState.RUNNING,
-     ["AAPL", "MSFT", "NVDA", "AMZN"], 0.4),
-    ("portfolio_2", "Cross-Sectional Momentum", "MomentumStrategy", EngineState.RUNNING,
-     ["SPY", "TLT", "GLD", "XOM"], 0.35),
-    ("portfolio_3", "Regime Adaptive", "RegimeAdaptiveStrategy", EngineState.STOPPED,
-     ["SPY", "TLT", "GLD"], 0.25),
+    (
+        "portfolio_1",
+        "Volume Momentum",
+        "VolumeMomentumStrategy",
+        EngineState.RUNNING,
+        ["AAPL", "MSFT", "NVDA", "AMZN"],
+        0.4,
+    ),
+    (
+        "portfolio_2",
+        "Cross-Sectional Momentum",
+        "MomentumStrategy",
+        EngineState.RUNNING,
+        ["SPY", "TLT", "GLD", "XOM"],
+        0.35,
+    ),
+    (
+        "portfolio_3",
+        "Regime Adaptive",
+        "RegimeAdaptiveStrategy",
+        EngineState.STOPPED,
+        ["SPY", "TLT", "GLD"],
+        0.25,
+    ),
 ]
 
 
@@ -402,7 +488,9 @@ def portfolio_composition(portfolio_id: str, days: int) -> CompositionSeries | N
 
     rng = _rng(f"composition:{portfolio_id}")
     start = datetime.now(timezone.utc) - timedelta(days=days)
-    timestamps = [(start + timedelta(days=offset)).date().isoformat() for offset in range(days)]
+    timestamps = [
+        (start + timedelta(days=offset)).date().isoformat() for offset in range(days)
+    ]
 
     holdings: dict[str, list[float]] = {}
     for position in detail.positions:
@@ -447,7 +535,9 @@ def portfolio_executions(portfolio_id: str) -> list[Execution] | None:
                 notional=round(price * quantity, 2),
                 executed_at=_iso(now - timedelta(minutes=index * 17)),
                 algo="TWAP" if uses_oms else None,
-                parent_order_id=f"{portfolio_id}-p{index // 3 + 1:04d}" if uses_oms else None,
+                parent_order_id=f"{portfolio_id}-p{index // 3 + 1:04d}"
+                if uses_oms
+                else None,
             )
         )
     return executions
@@ -522,12 +612,27 @@ def system_status() -> SystemStatus:
 
 _LOG_MESSAGES = [
     (LogLevel.INFO, "RunEngine", "Portfolio thread started", None),
-    (LogLevel.INFO, "VolumeMomentum_1", "OnData complete, 4 signals evaluated", "portfolio_1"),
+    (
+        LogLevel.INFO,
+        "VolumeMomentum_1",
+        "OnData complete, 4 signals evaluated",
+        "portfolio_1",
+    ),
     (LogLevel.DEBUG, "MQSDBConnector", "Atomic state query returned in 12ms", None),
     (LogLevel.INFO, "OrderManager", "Child order filled: 40 @ 187.22", "portfolio_1"),
     (LogLevel.WARNING, "fmpMarketData", "Rate limit at 80%, backing off", None),
-    (LogLevel.INFO, "Momentum_2", "Rebalance skipped, weights within tolerance", "portfolio_2"),
-    (LogLevel.ERROR, "RegimeAdaptive_3", "VIX feed stale, holding last regime", "portfolio_3"),
+    (
+        LogLevel.INFO,
+        "Momentum_2",
+        "Rebalance skipped, weights within tolerance",
+        "portfolio_2",
+    ),
+    (
+        LogLevel.ERROR,
+        "RegimeAdaptive_3",
+        "VIX feed stale, holding last regime",
+        "portfolio_3",
+    ),
     (LogLevel.INFO, "risk_manager", "Daily allocation unchanged", None),
 ]
 

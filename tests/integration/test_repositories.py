@@ -130,7 +130,7 @@ def test_run_round_trips_and_feeds_strategy_aggregates() -> None:
             # Stand in for what the worker writes when the engine finishes.
             run.status = "completed"
             run.progress_pct = 100
-            run.final_equity = Decimal("110000")
+            run.final_equity = Decimal(110000)
             run.total_return = Decimal("0.1")
             run.sharpe = Decimal("1.25")
             run.max_drawdown = Decimal("-0.05")
@@ -151,22 +151,33 @@ def test_run_round_trips_and_feeds_strategy_aggregates() -> None:
             session.add_all(
                 [
                     RunEquityPoint(
-                        run_id=run_id, seq=0, date=date(2025, 1, 2),
-                        equity=Decimal("100000"),
+                        run_id=run_id,
+                        seq=0,
+                        date=date(2025, 1, 2),
+                        equity=Decimal(100000),
                     ),
                     RunEquityPoint(
-                        run_id=run_id, seq=1, date=date(2025, 1, 31),
-                        equity=Decimal("110000"),
+                        run_id=run_id,
+                        seq=1,
+                        date=date(2025, 1, 31),
+                        equity=Decimal(110000),
                     ),
                 ]
             )
             session.add(
                 RunTrade(
-                    run_id=run_id, seq=0, symbol="AAPL", side="long",
-                    entry_date=date(2025, 1, 3), exit_date=date(2025, 1, 20),
-                    entry_price=Decimal("100"), exit_price=Decimal("110"),
-                    quantity=Decimal("100"), pnl=Decimal("1000"),
-                    return_pct=Decimal("0.1"), fees=Decimal("1"),
+                    run_id=run_id,
+                    seq=0,
+                    symbol="AAPL",
+                    side="long",
+                    entry_date=date(2025, 1, 3),
+                    exit_date=date(2025, 1, 20),
+                    entry_price=Decimal(100),
+                    exit_price=Decimal(110),
+                    quantity=Decimal(100),
+                    pnl=Decimal(1000),
+                    return_pct=Decimal("0.1"),
+                    fees=Decimal(1),
                 )
             )
 
@@ -179,15 +190,26 @@ def test_run_round_trips_and_feeds_strategy_aggregates() -> None:
                 session, RunFilters(search="REPOSITORY TEST"), 1, 25
             )
             filtered_out, _ = await runs_repo.list_runs(
-                session, RunFilters(status="queued", strategy_key="portfolio_dummy"),
-                1, 25,
+                session,
+                RunFilters(status="queued", strategy_key="portfolio_dummy"),
+                1,
+                25,
             )
             aggregates = await strategies_repo.list_strategies(
                 session, include_disabled=True
             )
 
         summary = await backtests_service.get_backtest(str(run_id))
-        return run_id, detail, listed, total, searched, filtered_out, aggregates, summary
+        return (
+            run_id,
+            detail,
+            listed,
+            total,
+            searched,
+            filtered_out,
+            aggregates,
+            summary,
+        )
 
     async def cleanup(run_id):
         async with session_scope() as session:
@@ -345,9 +367,7 @@ def test_user_strategy_submission_refuses_source_it_could_not_run() -> None:
             await strategies_service.submit_strategy(submission)
 
         async with session_scope() as session:
-            rows = await strategies_repo.list_strategies(
-                session, include_disabled=True
-            )
+            rows = await strategies_repo.list_strategies(session, include_disabled=True)
         return str(excinfo.value), {row.strategy.key for row in rows}
 
     message, keys = _run(scenario())

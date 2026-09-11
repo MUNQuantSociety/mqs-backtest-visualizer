@@ -1,6 +1,6 @@
 """Smoke test for the basic API server.
 
-    pytest tests/unit/test_health.py -v
+pytest tests/unit/test_health.py -v
 """
 
 from fastapi.testclient import TestClient
@@ -25,4 +25,6 @@ def test_cors_allows_frontend_origin() -> None:
         },
     )
     assert response.status_code == 200
-    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    assert (
+        response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    )

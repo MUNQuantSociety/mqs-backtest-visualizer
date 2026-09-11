@@ -9,7 +9,8 @@ that could not be reached is neither — it is worth retrying unchanged.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 
 class EngineError(Exception):

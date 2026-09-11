@@ -1,8 +1,8 @@
 # engine/strategies/toolkit.py  (vendored from MQSMaster)
 
-from typing import List
 
 import pandas as pd
+
 
 @pd.api.extensions.register_dataframe_accessor("toolkit")
 @pd.api.extensions.register_series_accessor("toolkit")
@@ -18,6 +18,7 @@ class QuantToolkitAccessor:
         # On a DataFrame
         winsorized_df = history.toolkit.winsorize(limits=[0.05, 0.05])
     """
+
     def __init__(self, pandas_obj):
         self._obj = pandas_obj
 
@@ -42,17 +43,16 @@ class QuantToolkitAccessor:
         from scipy.ndimage import gaussian_filter1d
 
         return pd.Series(
-            gaussian_filter1d(self._obj.values, sigma=sigma),
-            index=self._obj.index
+            gaussian_filter1d(self._obj.values, sigma=sigma), index=self._obj.index
         )
 
-    def winsorize(self, limits: List[float] = [0.05, 0.05]):
+    def winsorize(self, limits: list[float] = [0.05, 0.05]):
         """
         Applies winsorization to a Series or each column of a DataFrame, capping
         extreme values to reduce the effect of outliers.
 
         Args:
-            limits (List[float]): The lower and upper quantile limits. 
+            limits (List[float]): The lower and upper quantile limits.
                                   E.g., [0.05, 0.05] caps the bottom 5% and top 5%.
 
         Returns:
@@ -64,7 +64,7 @@ class QuantToolkitAccessor:
             return self._winsorize_series(self._obj, limits=limits)
 
     @staticmethod
-    def _winsorize_series(series: pd.Series, limits: List[float]) -> pd.Series:
+    def _winsorize_series(series: pd.Series, limits: list[float]) -> pd.Series:
         """Helper to winsorize a single Series."""
         series = series.copy()
         quantiles = series.quantile(limits)

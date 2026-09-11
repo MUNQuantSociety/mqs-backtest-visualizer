@@ -1,6 +1,7 @@
-import os
-import json
 import inspect
+import json
+import os
+
 
 def read_config_param(param: str):
     """
@@ -12,14 +13,14 @@ def read_config_param(param: str):
     caller_dir = os.path.dirname(caller_file)
     print(caller_dir)
     # Construct path to config.json
-    config_path = os.path.join(caller_dir, 'config.json')
+    config_path = os.path.join(caller_dir, "config.json")
 
     # Check if config.json exists
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"No config.json found in {caller_dir}")
 
     # Load JSON and return requested parameter
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         config_data = json.load(f)
 
     if param not in config_data:

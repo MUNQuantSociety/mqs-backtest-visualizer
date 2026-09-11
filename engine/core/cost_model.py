@@ -23,8 +23,8 @@ Total per-trade cost in bps:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,7 @@ class CostModelParams:
     enable_spread: bool = True
     enable_fixed: bool = True
 
-    def with_overrides(self, **overrides) -> "CostModelParams":
+    def with_overrides(self, **overrides) -> CostModelParams:
         kwargs = {**self.__dict__, **overrides}
         return CostModelParams(**kwargs)
 
@@ -130,25 +130,31 @@ class CostModel:
         return mid_price
 
     @classmethod
-    def for_large_cap(cls) -> "CostModel":
-        return cls(CostModelParams(
-            fixed_bps=0.5,
-            spread_bps_default=4.0,
-            alpha_impact=1.0,
-        ))
+    def for_large_cap(cls) -> CostModel:
+        return cls(
+            CostModelParams(
+                fixed_bps=0.5,
+                spread_bps_default=4.0,
+                alpha_impact=1.0,
+            )
+        )
 
     @classmethod
-    def for_small_cap(cls) -> "CostModel":
-        return cls(CostModelParams(
-            fixed_bps=1.0,
-            spread_bps_default=40.0,
-            alpha_impact=1.5,
-        ))
+    def for_small_cap(cls) -> CostModel:
+        return cls(
+            CostModelParams(
+                fixed_bps=1.0,
+                spread_bps_default=40.0,
+                alpha_impact=1.5,
+            )
+        )
 
     @classmethod
-    def disabled(cls) -> "CostModel":
-        return cls(CostModelParams(
-            enable_fixed=False,
-            enable_spread=False,
-            enable_impact=False,
-        ))
+    def disabled(cls) -> CostModel:
+        return cls(
+            CostModelParams(
+                enable_fixed=False,
+                enable_spread=False,
+                enable_impact=False,
+            )
+        )

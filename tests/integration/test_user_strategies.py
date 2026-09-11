@@ -100,7 +100,7 @@ class UploadedTestStrategy(BasePortfolio):
 '''
 
 # Rejected before anything is stored: ``os`` is outside the import allowlist.
-SOURCE_IMPORTING_OS = '''
+SOURCE_IMPORTING_OS = """
 import os
 
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
@@ -109,10 +109,10 @@ from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 class NosyStrategy(BasePortfolio):
     def OnData(self, context):
         os.listdir(".")
-'''
+"""
 
 # Rejected because there is no answer to "which one runs?".
-SOURCE_WITH_TWO_STRATEGIES = '''
+SOURCE_WITH_TWO_STRATEGIES = """
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 
@@ -124,7 +124,7 @@ class FirstStrategy(BasePortfolio):
 class SecondStrategy(BasePortfolio):
     def OnData(self, context):
         pass
-'''
+"""
 
 # Passes the scan, imports cleanly, and then throws on the first bar. This is
 # the breakage validation exists for: nothing before the event loop can see it,
@@ -132,18 +132,18 @@ class SecondStrategy(BasePortfolio):
 # per-timestamp strategy errors for the batch CLI — one broken portfolio should
 # not stop the other eight — and a run of this source used to finish
 # ``completed`` with no fills, which activated it.
-SOURCE_THAT_RAISES_IN_ONDATA = '''
+SOURCE_THAT_RAISES_IN_ONDATA = """
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 
 class RaisingStrategy(BasePortfolio):
     def OnData(self, context):
         raise ValueError("this strategy raises on every bar")
-'''
+"""
 
 # Passes the scan and fails the run: the module raises while being imported, in
 # the worker, which is exactly the class of breakage validation exists to catch.
-SOURCE_THAT_FAILS_TO_IMPORT = '''
+SOURCE_THAT_FAILS_TO_IMPORT = """
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 raise ValueError("this strategy is broken on purpose")
@@ -152,7 +152,7 @@ raise ValueError("this strategy is broken on purpose")
 class BrokenStrategy(BasePortfolio):
     def OnData(self, context):
         pass
-'''
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +391,9 @@ def test_validation_activates_the_strategy(db_engine, validated_upload) -> None:
     assert row.validation_run_id == _validation_run_id(db_engine, key)
 
 
-def test_an_activated_strategy_appears_in_the_catalogue(client, validated_upload) -> None:
+def test_an_activated_strategy_appears_in_the_catalogue(
+    client, validated_upload
+) -> None:
     key, _ = validated_upload
     listing = client.get("/api/strategies")
     assert listing.status_code == 200

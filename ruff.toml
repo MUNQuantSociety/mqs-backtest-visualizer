@@ -1,0 +1,29 @@
+# Set the target Python version
+target-version = "py311"
+
+# Line length limit (default is 88, matching Black)
+line-length = 88
+
+[lint]
+# Enable rules:
+# E / W: Pycodestyle errors & warnings
+# F: Pyflakes (detects undefined variables, unused imports, logic errors)
+# I: Isort (import sorting)
+# B: Bugbear (catches likely bugs and design flaws)
+select = ["E", "W", "F", "I", "B"]
+
+# Ignore specific rules if needed (e.g., line too long)
+ignore = ["E501"]
+
+# Allow autofix for all enabled rules
+fixable = ["ALL"]
+unfixable = []
+
+# Exclude common directory patterns
+[lint.per-file-ignores]
+# Ignore unused imports in __init__.py files
+"__init__.py" = ["F401"]
+
+[format]
+# Enable automatic formatting of code blocks inside docstrings
+docstring-code-format = true

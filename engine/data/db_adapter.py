@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -72,9 +73,7 @@ class EngineDBAdapter:
             # connects. Verified against the live instance — see BACKEND_PLAN
             # section 2 before "hardening" it.
             "sslmode": os.environ.get("POSTGRES_SSLMODE", "prefer"),
-            "connect_timeout": int(
-                os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")
-            ),
+            "connect_timeout": int(os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")),
         }
         self._conn_kwargs.update(overrides)
         self._connection: Any = None
@@ -130,8 +129,8 @@ class EngineDBAdapter:
                 pass
             self._connection = None
 
-    def __enter__(self) -> "EngineDBAdapter":
+    def __enter__(self) -> EngineDBAdapter:
         return self
 
-    def __exit__(self, *_exc_info: Any) -> None:
+    def __exit__(self, *_exc_info: object) -> None:
         self.close()

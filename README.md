@@ -548,10 +548,23 @@ from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 
 class MyStrategy(BasePortfolio):
-    def __init__(self, db_connector, executor, debug=False, config_dict=None,
-                 backtest_start_date=None, order_manager=None):
-        super().__init__(db_connector, executor, debug, config_dict,
-                         backtest_start_date, order_manager)
+    def __init__(
+        self,
+        db_connector,
+        executor,
+        debug=False,
+        config_dict=None,
+        backtest_start_date=None,
+        order_manager=None,
+    ):
+        super().__init__(
+            db_connector,
+            executor,
+            debug,
+            config_dict,
+            backtest_start_date,
+            order_manager,
+        )
         self.logger = logging.getLogger(self.__class__.__name__)
         self._steps = 0
 

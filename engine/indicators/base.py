@@ -3,10 +3,12 @@
 from abc import ABC, abstractmethod
 from datetime import datetime
 
+
 class Indicator(ABC):
     """
     Abstract base class for all stateful technical indicators.
     """
+
     def __init__(self, ticker: str, **kwargs):
         self.ticker = ticker
         self.kwargs = kwargs  # Store all parameters

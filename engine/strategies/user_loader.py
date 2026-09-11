@@ -136,9 +136,7 @@ def load_user_strategy(
     )
 
 
-def _materialize(
-    storage_key: str, store: StrategyMaterializer, dest_dir: Path
-) -> Path:
+def _materialize(storage_key: str, store: StrategyMaterializer, dest_dir: Path) -> Path:
     try:
         return Path(store.materialize(storage_key, dest_dir))
     except KeyError as exc:

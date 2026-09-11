@@ -4,20 +4,22 @@ from datetime import datetime
 
 from engine.indicators.base import Indicator
 
+
 class AverageTrueRange(Indicator):
     """
     A stateful, rolling Average True Range (ATR) indicator.
     ATR = Simple Moving Average of TR
     """
+
     def __init__(self, ticker: str, **kwargs):
         super().__init__(ticker=ticker, **kwargs)
-        
-        self.period = int(kwargs.get('period', 14))
-        self.high_col = kwargs.get('high_col', 'high_price')
-        self.low_col = kwargs.get('low_col', 'low_price')
-        self.close_col = kwargs.get('close_col', 'close_price')
+
+        self.period = int(kwargs.get("period", 14))
+        self.high_col = kwargs.get("high_col", "high_price")
+        self.low_col = kwargs.get("low_col", "low_price")
+        self.close_col = kwargs.get("close_col", "close_price")
         self._logger = logging.getLogger(f"{self.__class__.__name__}_{self.ticker}")
-        
+
         if self.period <= 0:
             raise ValueError("ATR indicator requires a 'period' > 0.")
 

@@ -229,7 +229,9 @@ def _violation(node: ast.AST) -> str | None:
 
     if isinstance(node, ast.Attribute):
         if node.attr in BANNED_ATTRIBUTES:
-            return f"the attribute {node.attr!r} is not allowed in an uploaded strategy."
+            return (
+                f"the attribute {node.attr!r} is not allowed in an uploaded strategy."
+            )
         value = node.value
         if isinstance(value, ast.Name) and value.id in BANNED_MODULE_ROOTS:
             return (
@@ -280,6 +282,7 @@ def _extends_base_portfolio(node: ast.ClassDef) -> bool:
         if isinstance(base, ast.Attribute) and base.attr == BASE_CLASS_NAME:
             return True
     return False
+
 
 # ---------------------------------------------------------------------------
 # The compatibility check: the same reading, reported instead of raised
@@ -361,9 +364,7 @@ def check_compatibility(source: str) -> CompatibilityReport:
     for node in ast.walk(tree):
         violation = _violation(node)
         if violation is not None:
-            issues.append(
-                CompatibilityIssue(getattr(node, "lineno", 0), violation)
-            )
+            issues.append(CompatibilityIssue(getattr(node, "lineno", 0), violation))
 
     class_name = None
     classes = _strategy_class_nodes(tree)
@@ -538,9 +539,7 @@ def _contract_issues(strategy: ast.ClassDef) -> list[CompatibilityIssue]:
     return issues
 
 
-def _has_decorator(
-    method: ast.FunctionDef | ast.AsyncFunctionDef, name: str
-) -> bool:
+def _has_decorator(method: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> bool:
     """True if ``method`` carries the bare decorator ``name``."""
     return any(
         isinstance(decorator, ast.Name) and decorator.id == name
@@ -586,7 +585,10 @@ def _method_named(
 ) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
     """A method defined directly on this class, not on anything nested in it."""
     for node in strategy.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == name
+        ):
             return node
     return None
 
@@ -824,7 +826,9 @@ async def mark_validation_unstarted(key: str, reason: str) -> None:
                 session, key, status="failed_validation", enabled=False
             )
     except Exception:
-        logger.exception("Strategy %s could not be marked unvalidated (%s)", key, reason)
+        logger.exception(
+            "Strategy %s could not be marked unvalidated (%s)", key, reason
+        )
 
 
 # ---------------------------------------------------------------------------

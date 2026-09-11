@@ -17,8 +17,8 @@ class ExponentialMovingAverage(Indicator):
     def __init__(self, ticker: str, **kwargs):
         super().__init__(ticker=ticker, **kwargs)
 
-        self.period = int(kwargs.get('period'))
-        self.price_col = kwargs.get('price_col', 'close_price')
+        self.period = int(kwargs.get("period"))
+        self.price_col = kwargs.get("price_col", "close_price")
 
         if not self.period or self.period <= 0:
             raise ValueError("ExponentialMovingAverage requires a 'period' > 0.")
@@ -38,7 +38,7 @@ class ExponentialMovingAverage(Indicator):
         For the first 'period' data points, we calculate SMA as the seed.
         After that, we use the EMA formula.
         """
-        self._count += 1 #increment time
+        self._count += 1  # increment time
 
         # EMA is initially none. Period size (declared in strategy, see config.json) is used for avg
         # Wait until period length reached, then calculate EMA
@@ -50,8 +50,10 @@ class ExponentialMovingAverage(Indicator):
                 # Use SMA as the initial EMA value
                 self._ema = self._sum / self.period
                 self._current_value = self._ema
-                self._is_ready = True # moving average initialized, is ready.
+                self._is_ready = True  # moving average initialized, is ready.
         else:
             # Apply EMA formula: EMA = (Price * k) + (Previous EMA * (1 - k))
-            self._ema = (data_point * self.multiplier) + (self._ema * (1 - self.multiplier))
+            self._ema = (data_point * self.multiplier) + (
+                self._ema * (1 - self.multiplier)
+            )
             self._current_value = self._ema

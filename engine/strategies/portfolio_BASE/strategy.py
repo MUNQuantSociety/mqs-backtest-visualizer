@@ -5,7 +5,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import pandas as pd
 
@@ -31,7 +31,7 @@ class BasePortfolio(ABC):
         executor,
         debug=False,
         config_dict=None,
-        backtest_start_date: Optional[datetime] = None,
+        backtest_start_date: datetime | None = None,
         order_manager=None,
     ):
         """
@@ -51,8 +51,7 @@ class BasePortfolio(ABC):
         self.lookback_days: int = config_dict.get("LOOKBACK_DAYS", 30)
         self.portfolio_weights: list[Any] | None = config_dict.get("WEIGHTS")
         self.data_feeds: list[str] = config_dict.get(
-            "DATA_FEEDS",
-            ["MARKET_DATA", "POSITIONS", "CASH_EQUITY", "PORT_NOTIONAL"]
+            "DATA_FEEDS", ["MARKET_DATA", "POSITIONS", "CASH_EQUITY", "PORT_NOTIONAL"]
         )
 
         self.logger: logging.Logger = logging.getLogger(
@@ -61,7 +60,7 @@ class BasePortfolio(ABC):
         self.logger.info(
             "Initialized portfolio %s with %s tickers.",
             self.portfolio_id,
-            len(self.tickers)
+            len(self.tickers),
         )
 
         self.portfolio_config_dict: dict[str, Any] = {
@@ -75,10 +74,9 @@ class BasePortfolio(ABC):
         # --- Indicator Management ---
         self._indicators: list[Indicator] = []
 
-    def _build_indicator_update_payload(self,
-        indicator: Indicator,
-        row
-    ) -> tuple[Any | Literal['close_price'], float, dict[Any, Any]] | None:
+    def _build_indicator_update_payload(
+        self, indicator: Indicator, row
+    ) -> tuple[Any | Literal["close_price"], float, dict[Any, Any]] | None:
         """
         Build a consistent Update() payload for an indicator from a market-data row.
         """
@@ -133,10 +131,7 @@ class BasePortfolio(ABC):
 
     # --- DYNAMIC INDICATOR FACTORY ---
     def AddIndicator(
-        self,
-        indicator_class_name: str,
-        ticker: str,
-        **kwargs
+        self, indicator_class_name: str, ticker: str, **kwargs
     ) -> Indicator:
         """
         Dynamically loads, instantiates, warms up, and registers an indicator.
@@ -186,7 +181,9 @@ class BasePortfolio(ABC):
         params = [ticker, start_time.date(), end_time.date()]
         result = self.db.execute_query(sql, params, fetch="all")
 
-        price_col: str = kwargs.get("price_col") or kwargs.get("close_col", "close_price")
+        price_col: str = kwargs.get("price_col") or kwargs.get(
+            "close_col", "close_price"
+        )
         if result["status"] == "success" and result.get("data"):
             df = pd.DataFrame(result["data"])
 
@@ -230,8 +227,8 @@ class BasePortfolio(ABC):
         self._indicators.append(indicator)
         return indicator
 
-    def RegisterIndicatorSet(self,
-        indicator_definitions: dict[str, tuple[str, dict[str, Any]]]
+    def RegisterIndicatorSet(
+        self, indicator_definitions: dict[str, tuple[str, dict[str, Any]]]
     ) -> None:
         """
         Initializes a set of indicators for every ticker and attaches them as
@@ -309,9 +306,9 @@ class BasePortfolio(ABC):
                                 row.ticker,
                                 row.timestamp,
                                 getattr(row, price_col),
-                                getattr(row, vol_col, 'N/A'),
-                                getattr(row, high_col, 'N/A'),
-                                getattr(row, low_col, 'N/A')
+                                getattr(row, vol_col, "N/A"),
+                                getattr(row, high_col, "N/A"),
+                                getattr(row, low_col, "N/A"),
                             )
 
         # Update the last processed time. If current_time is None, fall back to newest timestamp.
@@ -335,7 +332,7 @@ class BasePortfolio(ABC):
             executor=self.executor,
             portfolio_config=self.portfolio_config_dict,
             order_manager=self.order_manager,
-            )
+        )
 
         self.OnData(context)
 
@@ -351,7 +348,6 @@ class BasePortfolio(ABC):
         Args:
             context (StrategyContext): The stateful API object for this point in time.
         """
-        pass
 
     # --- Data Fetching Logic (Largely Unchanged) ---
     # The methods below are still required for the base class to function,

@@ -24,11 +24,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sqlalchemy.dialects.postgresql import insert  # noqa: E402
+from sqlalchemy.dialects.postgresql import insert
 
-from src.db.engine import create_sync_engine, sync_session_scope  # noqa: E402
-from src.db.init import init_database  # noqa: E402
-from src.models import Strategy  # noqa: E402
+from src.db.engine import create_sync_engine, sync_session_scope
+from src.db.init import init_database
+from src.models import Strategy
 
 # Where a vendored strategy's own config.json lives once lane B has copied it.
 ENGINE_STRATEGY_ROOT = REPO_ROOT / "engine" / "strategies"
@@ -74,8 +74,19 @@ _CONFIG_FALLBACKS: dict[str, dict[str, Any]] = {
     },
     "portfolio_3": {
         "TICKERS": [
-            "AAPL", "TSLA", "AMZN", "MSFT", "NVDA", "JPM", "XOM",
-            "UNH", "CAT", "WMT", "TLT", "GLD", "^VIX",
+            "AAPL",
+            "TSLA",
+            "AMZN",
+            "MSFT",
+            "NVDA",
+            "JPM",
+            "XOM",
+            "UNH",
+            "CAT",
+            "WMT",
+            "TLT",
+            "GLD",
+            "^VIX",
         ],
         "LOOKBACK_DAYS": 90,
         "INTERVAL": 60,

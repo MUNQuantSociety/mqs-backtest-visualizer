@@ -245,9 +245,7 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
     )
 
 
-async def _begin_validation(
-    key: str, name: str, config: dict, class_name: str
-) -> str:
+async def _begin_validation(key: str, name: str, config: dict, class_name: str) -> str:
     """Queue the validation run and report what a student should expect.
 
     A failure to *start* the run is not a failure of the upload, but it must

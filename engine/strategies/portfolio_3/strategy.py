@@ -2,12 +2,12 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Dict, Optional
 
 import pandas as pd
 
 from engine.strategies.order_interface import StrategyContext
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
+
 
 class RegimeAdaptiveStrategy(BasePortfolio):
     """
@@ -24,7 +24,7 @@ class RegimeAdaptiveStrategy(BasePortfolio):
         debug=False,
         config_dict=None,
         backtest_start_date=None,
-        order_manager=None
+        order_manager=None,
     ):
         # --- Base Class Initialization ---
         if config_dict is None:
@@ -35,7 +35,12 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                 config_dict = json.load(f)
 
         super().__init__(
-            db_connector, executor, debug, config_dict, backtest_start_date, order_manager
+            db_connector,
+            executor,
+            debug,
+            config_dict,
+            backtest_start_date,
+            order_manager,
         )
         self.logger = logging.getLogger(
             f"{self.__class__.__name__}_{self.portfolio_id}"
@@ -79,7 +84,7 @@ class RegimeAdaptiveStrategy(BasePortfolio):
         # 10-day ROC, threshold increased to 1.0, filter out noise.
         self.MOMENTUM_THRESHOLD = 1.3
 
-        # Base trade confidence. Scales position size: 0.6 -> ~60% of one bar's allocation. 
+        # Base trade confidence. Scales position size: 0.6 -> ~60% of one bar's allocation.
         self.BASE_CONF = 0.65
 
         # Stop-loss multiplier: exit if price drops this many ATRs below the recorded entry.
@@ -120,19 +125,16 @@ class RegimeAdaptiveStrategy(BasePortfolio):
         # at 9:30am) it permanently matched the 9:30-10:00 window, forcing the strategy
         # into mean-reversion mode 100% of the time and making the momentum branch
         # unreachable dead code.
-        # Fix 
-        self.vix_ema = self.AddIndicator(
-            "ExponentialMovingAverage",
-            "^VIX",
-            period=10
-        )
+        # Fix
+        self.vix_ema = self.AddIndicator("ExponentialMovingAverage", "^VIX", period=10)
 
         self.logger.info("RegimeAdaptiveStrategy initialized for OnData framework.")
-        self.logger.info(f"Registered indicators: {list(indicator_definitions.keys())} + VIX EMA(10)"  )
+        self.logger.info(
+            f"Registered indicators: {list(indicator_definitions.keys())} + VIX EMA(10)"
+        )
 
-    
     def generate_signals_and_trade(
-        self, data: Dict[str, pd.DataFrame], current_time: Optional[datetime] = None
+        self, data: dict[str, pd.DataFrame], current_time: datetime | None = None
     ):
         """
         Overrides BasePortfolio.generate_signals_and_trade, which isn't designed
@@ -154,15 +156,17 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     .reset_index()
                 )
             if not new_data.empty:
-                for timestamp, group in new_data.sort_values("timestamp").groupby("timestamp"):
+                for timestamp, group in new_data.sort_values("timestamp").groupby(
+                    "timestamp"
+                ):
                     for row in group.itertuples():
                         for indicator in self._indicators:
                             if indicator.ticker != row.ticker:
                                 continue
                             price_col = getattr(indicator, "price_col", "close_price")
-                            vol_col   = getattr(indicator, "vol_col",   "volume")
-                            high_col  = getattr(indicator, "high_col",  "high_price")
-                            low_col   = getattr(indicator, "low_col",   "low_price")
+                            vol_col = getattr(indicator, "vol_col", "volume")
+                            high_col = getattr(indicator, "high_col", "high_price")
+                            low_col = getattr(indicator, "low_col", "low_price")
 
                             # New
                             price_val = getattr(row, price_col, None)
@@ -184,7 +188,9 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                                 if v is not None and pd.notna(v):
                                     update_kwargs[low_col] = float(v)
 
-                            indicator.Update(row.timestamp, float(price_val), **update_kwargs)
+                            indicator.Update(
+                                row.timestamp, float(price_val), **update_kwargs
+                            )
 
         # Update the last-processed timestamp.
         if current_time is not None:
@@ -210,7 +216,6 @@ class RegimeAdaptiveStrategy(BasePortfolio):
 
         self.OnData(context)
 
-
     """
     Replacement for context.buy() / context.sell() that fixes the executor's
     equal-weight fallback. Weight fetched would be 0.0, fallback to 1/#oftickers
@@ -220,6 +225,7 @@ class RegimeAdaptiveStrategy(BasePortfolio):
 
     Is modular design, changes to buy/sell should be made within this method
     """
+
     def _execute_order(
         self,
         context: StrategyContext,
@@ -239,7 +245,9 @@ class RegimeAdaptiveStrategy(BasePortfolio):
 
         current_weight = context.Portfolio.get_asset_weight(ticker, latest_price)
         # Correct weight if 0.0 returned above
-        ticker_weight = current_weight if current_weight != 0.0 else 1.0 / max(n_tradeable, 1)
+        ticker_weight = (
+            current_weight if current_weight != 0.0 else 1.0 / max(n_tradeable, 1)
+        )
 
         context._executor.execute_trade(
             portfolio_id=context._portfolio_config["id"],
@@ -276,13 +284,13 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                 return
 
             vix_value = vix_asset.Close
-        
+
         except Exception as e:
             self.logger.error(f"Error getting VIX data: {e}")
             raise
-        
+
         # Number of tradeable tickers
-        #NOTE this is defined in other variables -> need to remove this and make one variable for whole class
+        # NOTE this is defined in other variables -> need to remove this and make one variable for whole class
         n_stocks = len([t for t in self.tickers if t != "^VIX"])
 
         # Loop through all tickers except vix
@@ -314,7 +322,6 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     self.logger.debug(f"No market data for {ticker} at {trade_ts}")
                     continue
 
-
                 # Fetch values from indicators
                 vwap_v = vwap_ind.Current
                 atr_v = atr_ind.Current
@@ -323,7 +330,14 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                 latest_price = asset_data.Close
                 quantity = positions_dict.get(ticker, 0.0)
 
-                all_values = [vwap_v, atr_v, momentum_v, sma50_v, latest_price, quantity]
+                all_values = [
+                    vwap_v,
+                    atr_v,
+                    momentum_v,
+                    sma50_v,
+                    latest_price,
+                    quantity,
+                ]
 
                 # Skip iteration if missing ticker value(s)
                 if any(v is None for v in all_values):
@@ -381,7 +395,10 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     else:
                         # Regime: Low Volatility -> Momentum
                         # Require price above SMA(50) to confirm the trend before buying.
-                        if momentum_v > self.MOMENTUM_THRESHOLD and latest_price > sma50_v:
+                        if (
+                            momentum_v > self.MOMENTUM_THRESHOLD
+                            and latest_price > sma50_v
+                        ):
                             signal = "BUY"
                         elif momentum_v < -self.MOMENTUM_THRESHOLD:
                             signal = "SELL"
@@ -416,14 +433,14 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     )
                     continue
 
-           
                 # Prevents re-buying/re-selling when at or near target weight.
-                # Target weight comes from config.json 
-                target_weight = (
-                    (self.portfolio_weights or {}).get(ticker)
-                    or 1.0 / max(n_stocks, 1)
+                # Target weight comes from config.json
+                target_weight = (self.portfolio_weights or {}).get(ticker) or 1.0 / max(
+                    n_stocks, 1
                 )
-                current_weight = context.Portfolio.get_asset_weight(ticker, latest_price)
+                current_weight = context.Portfolio.get_asset_weight(
+                    ticker, latest_price
+                )
                 if signal == "BUY" and current_weight >= target_weight * 0.9:
                     self.logger.debug(
                         f"[{ticker}] BUY suppressed: weight {current_weight:.3f} "
@@ -438,7 +455,6 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     )
                     continue
 
-                
                 # Compute is_reversal once so it is available in both confidence and logging.
                 # Confidence calculation:
                 #   - closes long if forced exit by MR or stoploss
@@ -472,7 +488,9 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     # History factor
                     recent_results = self.trade_results.get(ticker, [])
                     if len(recent_results) >= 2:
-                        lookback = recent_results[-3:] #ADJUST THIS if want further lookback
+                        lookback = recent_results[
+                            -3:
+                        ]  # ADJUST THIS if want further lookback
                         win_rate = sum(1 for p in lookback if p > 0) / len(lookback)
                         history_factor = 0.7 + 0.3 * win_rate
                     else:
@@ -506,15 +524,29 @@ class RegimeAdaptiveStrategy(BasePortfolio):
 
                     if signal == "BUY":
                         self._execute_order(
-                            context, ticker, "BUY", confidence, latest_price, trade_ts, n_stocks
+                            context,
+                            ticker,
+                            "BUY",
+                            confidence,
+                            latest_price,
+                            trade_ts,
+                            n_stocks,
                         )
                         # # Record entry price and entry regime for stop-loss and win/loss tracking.
                         self.entry_price[ticker] = latest_price
-                        self.entry_regime[ticker] = "high_vol" if is_high_vol else "low_vol"
+                        self.entry_regime[ticker] = (
+                            "high_vol" if is_high_vol else "low_vol"
+                        )
 
                     elif signal == "SELL":
                         self._execute_order(
-                            context, ticker, "SELL", confidence, latest_price, trade_ts, n_stocks
+                            context,
+                            ticker,
+                            "SELL",
+                            confidence,
+                            latest_price,
+                            trade_ts,
+                            n_stocks,
                         )
                         # Record completed trade result for history_factor scaling.
                         if ticker in self.entry_price:
@@ -523,7 +555,9 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                                 self.trade_results[ticker] = []
                             self.trade_results[ticker].append(pnl)
                             if len(self.trade_results[ticker]) > 5:
-                                self.trade_results[ticker] = self.trade_results[ticker][-5:]
+                                self.trade_results[ticker] = self.trade_results[ticker][
+                                    -5:
+                                ]
                             del self.entry_price[ticker]
                         # remove stored entry regime when sold
                         self.entry_regime.pop(ticker, None)
@@ -533,14 +567,16 @@ class RegimeAdaptiveStrategy(BasePortfolio):
 
                     if ticker not in self.order_log:
                         self.order_log[ticker] = []
-                    self.order_log[ticker].append({
-                        "timestamp": trade_ts,
-                        "signal": signal,
-                        "price": latest_price,
-                        "confidence": confidence,
-                        "mean_reversion_exit": is_mean_reversion_exit,
-                        "stop_loss_exit": is_stop_loss_exit,
-                    })
+                    self.order_log[ticker].append(
+                        {
+                            "timestamp": trade_ts,
+                            "signal": signal,
+                            "price": latest_price,
+                            "confidence": confidence,
+                            "mean_reversion_exit": is_mean_reversion_exit,
+                            "stop_loss_exit": is_stop_loss_exit,
+                        }
+                    )
                     if len(self.order_log[ticker]) > 10:
                         self.order_log[ticker] = self.order_log[ticker][-10:]
 

@@ -35,7 +35,7 @@ class _FailingDB:
     def execute_query(self, sql, params=None, fetch=False):
         return {
             "status": "error",
-            "message": 'could not connect to server: Connection timed out',
+            "message": "could not connect to server: Connection timed out",
             "data": [],
         }
 

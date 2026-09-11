@@ -44,11 +44,12 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from sqlalchemy import Engine, delete, func, insert, select, update
 
@@ -181,7 +182,9 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
                 # with no metrics, curve, or trades would be a lie the client
                 # cannot detect, so this is a failure with an honest message.
                 logger.exception("Run %s produced results that would not store", parsed)
-                return _fail(engine, parsed, f"result could not be stored: {_describe(exc)}")
+                return _fail(
+                    engine, parsed, f"result could not be stored: {_describe(exc)}"
+                )
             logger.info("Run %s completed", parsed)
             return "completed"
 
@@ -676,9 +679,7 @@ def apply_validation_outcome(engine: Engine, run_id: uuid.UUID, outcome: str) ->
                     # disabled by one, whatever a hand-edited row says.
                     _STRATEGIES.c.kind == "user",
                 )
-                .values(
-                    status=status, enabled=enabled, validation_run_id=run_id
-                )
+                .values(status=status, enabled=enabled, validation_run_id=run_id)
             )
     except Exception:
         # The run itself is already recorded correctly. Losing the strategy

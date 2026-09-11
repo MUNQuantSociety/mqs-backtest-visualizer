@@ -51,7 +51,7 @@ DUMMY_CLASS_PATH = "engine.strategies.portfolio_dummy.strategy:CrossoverRmiStrat
 # exercise the round-trip half of the trade persistence.
 WINDOW_START = date(2026, 3, 2)
 WINDOW_END = date(2026, 7, 15)
-INITIAL_CAPITAL = Decimal("100000")
+INITIAL_CAPITAL = Decimal(100000)
 
 # One ticker and a short indicator lookback. Constructing the strategy warms
 # three indicators per ticker straight from the remote database, so this is the
@@ -178,7 +178,9 @@ def test_run_reaches_completed(db_engine, completed_run) -> None:
     assert row.progress_pct == 100
 
 
-def test_headline_numbers_are_denormalised_onto_the_run(db_engine, completed_run) -> None:
+def test_headline_numbers_are_denormalised_onto_the_run(
+    db_engine, completed_run
+) -> None:
     """The list endpoint reads only the run row, so these must be filled in."""
     run_id, _ = completed_run
     row = _run_row(db_engine, run_id)
@@ -207,7 +209,9 @@ def test_metrics_row_matches_the_run_row(db_engine, completed_run) -> None:
     assert metrics.extra["equity_points_stored"] > 0
 
 
-def test_equity_curve_is_daily_and_ends_at_final_equity(db_engine, completed_run) -> None:
+def test_equity_curve_is_daily_and_ends_at_final_equity(
+    db_engine, completed_run
+) -> None:
     """The internal-consistency check: the run's final equity is its last point."""
     run_id, _ = completed_run
     row = _run_row(db_engine, run_id)
@@ -490,9 +494,7 @@ def test_a_dead_worker_parks_the_strategy_it_was_validating(
 ) -> None:
     """A killed validation worker strands an upload exactly like a restart does."""
     upload_key = _insert_user_strategy(db_engine)
-    run_id = _insert_run(
-        db_engine, upload_key, status="running", purpose="validation"
-    )
+    run_id = _insert_run(db_engine, upload_key, status="running", purpose="validation")
     try:
         assert fail_running_run(run_id, "The worker process died: boom", db_engine)
         assert _strategy_row(db_engine, upload_key).status == "failed_validation"
@@ -501,7 +503,9 @@ def test_a_dead_worker_parks_the_strategy_it_was_validating(
         _delete_strategy(db_engine, upload_key)
 
 
-def test_reconciler_leaves_queued_and_terminal_runs_alone(db_engine, strategy_key) -> None:
+def test_reconciler_leaves_queued_and_terminal_runs_alone(
+    db_engine, strategy_key
+) -> None:
     queued = _insert_run(db_engine, strategy_key)
     done = _insert_run(db_engine, strategy_key, status="completed")
     try:

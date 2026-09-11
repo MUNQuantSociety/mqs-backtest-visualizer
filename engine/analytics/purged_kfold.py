@@ -53,23 +53,19 @@ class PurgedKFold:
         self.n_splits: int = int(n_splits)
         self.t1: pd.Series = t1.copy()
 
-    def get_n_splits(self,
-        _X: None = None,
-        _y: None = None,
-        _groups: None = None
+    def get_n_splits(
+        self, _X: None = None, _y: None = None, _groups: None = None
     ) -> int:
         return self.n_splits
 
-    def split(self,
-        X,
-        _y = None,
-        _groups = None
+    def split(
+        self, X, _y=None, _groups=None
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         n = self._infer_n_samples(X)
         if len(self.t1) != n:
             raise ValueError(
-                f"t1 length ({len(self.t1)}) != X length ({n}); " +
-                "t1 must be aligned 1-to-1 with X."
+                f"t1 length ({len(self.t1)}) != X length ({n}); "
+                + "t1 must be aligned 1-to-1 with X."
             )
 
         indices = np.arange(n)
@@ -95,18 +91,15 @@ class PurgedKFold:
             test_feature_start = feature_times[test_start_idx]
             test_label_end = label_times.iloc[test_start_idx:test_stop_idx].max()
 
-            overlap_mask = (
-                (feature_times <= test_label_end)
-                & (label_times.values >= test_feature_start)
+            overlap_mask = (feature_times <= test_label_end) & (
+                label_times.values >= test_feature_start
             )
             purged_positions = set(np.where(overlap_mask)[0].tolist())
 
             embargo_positions: set = set()
             if self._embargo_td is not None:
                 emb_cut = test_label_end + self._embargo_td
-                emb_mask = (
-                    (feature_times > test_label_end) & (feature_times <= emb_cut)
-                )
+                emb_mask = (feature_times > test_label_end) & (feature_times <= emb_cut)
                 embargo_positions = set(np.where(emb_mask)[0].tolist())
             elif h_pos is not None and h_pos > 0:
                 start_emb = test_stop_idx

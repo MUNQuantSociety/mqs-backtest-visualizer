@@ -18,14 +18,14 @@ from src.models.strategies import STRATEGY_KINDS, STRATEGY_STATUSES, Strategy
 
 __all__ = [
     "APP_SCHEMA",
-    "Base",
+    "RUN_PURPOSES",
+    "RUN_STATUSES",
+    "STRATEGY_KINDS",
+    "STRATEGY_STATUSES",
     "BacktestRun",
+    "Base",
     "RunEquityPoint",
     "RunMetrics",
     "RunTrade",
-    "RUN_PURPOSES",
-    "RUN_STATUSES",
     "Strategy",
-    "STRATEGY_KINDS",
-    "STRATEGY_STATUSES",
 ]

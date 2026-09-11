@@ -3,13 +3,13 @@ File for the BacktestEngine class.
 """
 # engine/core/backtest_engine.py  (vendored from MQSMaster)
 
-import os
 import inspect
 import json
 import logging
-from logging import Logger
+import os
 from copy import deepcopy
 from datetime import datetime, timezone
+from logging import Logger
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,6 @@ import numpy as np
 import pandas as pd
 from pandas.core.tools.datetimes import DatetimeScalar
 
-from engine.contracts.errors import RunCancelled
 from engine.analytics.reporting import (
     _calculate_portfolio_risk_components,
     _calculate_rolling_portfolio_risk,
@@ -26,6 +25,7 @@ from engine.analytics.vector_strategy_adapters import (
     get_vector_adapter_for_portfolio,
 )
 from engine.analytics.vectorized_backtest import VectorBacktester
+from engine.contracts.errors import RunCancelled
 from engine.core.cost_model import CostModel
 from engine.core.runner import BacktestRunner
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
@@ -40,7 +40,7 @@ class BacktestEngine:
     def __init__(
         self,
         db_connector: Any,
-        backtest_executor = None,
+        backtest_executor=None,
         backtest_output_root: str | None = None,
         strict: bool = False,
     ):
@@ -74,7 +74,9 @@ class BacktestEngine:
         self.config_overrides: dict[str, Any] = {}
         self.on_progress = None
         self.should_cancel = None
-        self.fast_config: dict[str, int | str | bool | list[int] | None] = self._default_fast_config()
+        self.fast_config: dict[str, int | str | bool | list[int] | None] = (
+            self._default_fast_config()
+        )
 
     @staticmethod
     def _default_fast_config() -> dict[str, int | str | bool | list[int] | None]:
@@ -315,15 +317,20 @@ class BacktestEngine:
             .dropna(how="all")
         )
         if close_matrix.empty:
-            self.logger.warning("Fast mode skipped: unable to build ticker close matrix.")
+            self.logger.warning(
+                "Fast mode skipped: unable to build ticker close matrix."
+            )
             return
 
         selected_tickers = [
-            ticker for ticker in getattr(portfolio_instance, "tickers", [])
+            ticker
+            for ticker in getattr(portfolio_instance, "tickers", [])
             if ticker in close_matrix.columns
         ]
         if not selected_tickers:
-            self.logger.warning("Fast mode skipped: no overlapping ticker prices found.")
+            self.logger.warning(
+                "Fast mode skipped: no overlapping ticker prices found."
+            )
             return
 
         close_matrix = close_matrix[selected_tickers].dropna(how="all")
@@ -337,9 +344,7 @@ class BacktestEngine:
             columns=close_matrix.columns,
         ).fillna(0.0)
         returns_matrix = (
-            close_matrix.pct_change()
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(0.0)
+            close_matrix.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
         )
 
         weights_full = weights.copy(deep=True)
@@ -356,10 +361,10 @@ class BacktestEngine:
         benchmark_returns_full = returns_matrix_full.mean(axis=1)
         benchmark_close_full = close_matrix_full.mean(axis=1)
 
-        weights = weights_full.loc[ts[0]:ts[1]]
-        lagged_weights = lagged_weights_full.loc[ts[0]:ts[1]]
-        returns_matrix = returns_matrix_full.loc[ts[0]:ts[1]]
-        close_matrix = close_matrix_full.loc[ts[0]:ts[1]]
+        weights = weights_full.loc[ts[0] : ts[1]]
+        lagged_weights = lagged_weights_full.loc[ts[0] : ts[1]]
+        returns_matrix = returns_matrix_full.loc[ts[0] : ts[1]]
+        close_matrix = close_matrix_full.loc[ts[0] : ts[1]]
         if (
             weights.empty
             or lagged_weights.empty
@@ -368,7 +373,8 @@ class BacktestEngine:
         ):
             self.logger.warning(
                 "Fast mode skipped: no data remains in requested backtest window %s to %s.",
-                ts[0], ts[1]
+                ts[0],
+                ts[1],
             )
             return
 
@@ -712,7 +718,7 @@ class BacktestEngine:
                     )
                     self.logger.info(
                         "--- Running backtest for portfolio: %s ---",
-                        portfolio_instance.portfolio_id
+                        portfolio_instance.portfolio_id,
                     )
                     self._run_fast_vectorized(portfolio_instance)
                 else:
@@ -756,7 +762,7 @@ class BacktestEngine:
                     trade_logs.append(trade_log)
                 self.logger.info(
                     "\n--- Backtest for portfolio: %s finished ---",
-                    portfolio_instance.portfolio_id
+                    portfolio_instance.portfolio_id,
                 )
             except RunCancelled:
                 # VISUALIZER: a cancellation is a user decision, not an
@@ -766,7 +772,8 @@ class BacktestEngine:
             except Exception as e:
                 self.logger.exception(
                     "Error running backtest for %s: %s",
-                    portfolio_class.__name__, e,
+                    portfolio_class.__name__,
+                    e,
                     exc_info=True,
                 )
                 # VISUALIZER: upstream logged and moved to the next

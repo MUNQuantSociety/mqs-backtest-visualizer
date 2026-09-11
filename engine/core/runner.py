@@ -1,6 +1,6 @@
-from logging import Logger
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 from zoneinfo import ZoneInfo  # <-- ADDED for timezone fix
 
 import pandas as pd
@@ -61,7 +61,9 @@ class BacktestRunner:
 
         # FIX 3: Use new timezone-aware method
         self.start_date: datetime = self._ensure_datetime(start_date)
-        self.end_date: datetime = self._ensure_datetime(end_date, default_is_yesterday=True)
+        self.end_date: datetime = self._ensure_datetime(
+            end_date, default_is_yesterday=True
+        )
 
         # --- FIX 1: Save the *actual* backtest start date ---
         self.backtest_loop_start_date: datetime | None = self.start_date
@@ -78,9 +80,8 @@ class BacktestRunner:
         self.main_data_df: pd.DataFrame = pd.DataFrame()
         self.executor: BacktestExecutor | None = None
 
-    def _ensure_datetime(self,
-        dt_val: int | float | str | datetime,
-        default_is_yesterday: bool = False
+    def _ensure_datetime(
+        self, dt_val: float | str | datetime, default_is_yesterday: bool = False
     ) -> datetime:
         """
         FIX 3: Converts input to a timezone-AWARE datetime object at midnight
@@ -100,7 +101,6 @@ class BacktestRunner:
             return datetime(pd_dt.year, pd_dt.month, pd_dt.day).replace(tzinfo=NY_TZ)
         except Exception as e:
             raise e
-
 
     def _prepare_data(self) -> bool:
         """
@@ -266,8 +266,7 @@ class BacktestRunner:
             # end_index is the absolute index of the current bar
             end_index = current_data_chunk.index.max()
 
-            if start_index < 0:
-                start_index = 0
+            start_index = max(start_index, 0)
 
             # This slice is now correct: [data_from_90_days_ago ... data_from_today]
             historical_slice_df = self.main_data_df.iloc[start_index : end_index + 1]
@@ -312,7 +311,9 @@ class BacktestRunner:
             return None
         try:
             perf_df = pd.DataFrame(self.perf_records)
-            perf_df["timestamp"] = pd.to_datetime(perf_df["timestamp"], utc=True, errors="coerce")
+            perf_df["timestamp"] = pd.to_datetime(
+                perf_df["timestamp"], utc=True, errors="coerce"
+            )
             perf_df.sort_values("timestamp", inplace=True)
             perf_df.reset_index(drop=True, inplace=True)
 

@@ -10,7 +10,6 @@ skips the query entirely and loads from disk instead.
 import logging
 import os
 from pathlib import Path
-from typing import List, Tuple
 
 import pandas as pd
 
@@ -90,9 +89,7 @@ def save(ticker: str, df: pd.DataFrame) -> None:
         path = _path(ticker)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Sort values, save to parquet
-        df.sort_values("timestamp").reset_index(drop=True).to_parquet(
-            path, index=False
-        )
+        df.sort_values("timestamp").reset_index(drop=True).to_parquet(path, index=False)
         logger.debug("[%s] Cache saved: %d rows", ticker, len(df))
     except Exception as e:
         # Error occured while sorting or saving
@@ -103,7 +100,7 @@ def missing_ranges(
     cached: pd.DataFrame,  # cached data passed as element of a list (can be an empty df)
     start: pd.Timestamp,
     end: pd.Timestamp,
-) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
     """
     Return the sub-ranges within [start, end] not covered by the cache to be used
     in db query. Return up to 2 subranges, depending on whether data missing
@@ -121,7 +118,7 @@ def missing_ranges(
 
     start = pd.to_datetime(start, utc=True)
     end = pd.to_datetime(end, utc=True)
-    
+
     gaps = []
     if start < cached_min:
         gaps.append((start, cached_min))

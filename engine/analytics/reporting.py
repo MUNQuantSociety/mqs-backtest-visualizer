@@ -1,7 +1,6 @@
 import logging
 import os
 from datetime import datetime
-from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -68,7 +67,9 @@ def _compute_annual_return(perf_df: pd.DataFrame) -> float:
     if not np.isfinite(start_value) or not np.isfinite(end_value) or start_value <= 0:
         return 0.0
 
-    elapsed_days: float = ((df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).total_seconds() / 86400.0)
+    elapsed_days: float = (
+        df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]
+    ).total_seconds() / 86400.0
     if elapsed_days <= 0:
         return 0.0
 
@@ -161,7 +162,7 @@ def _compute_sortino_ratio(perf_df: pd.DataFrame) -> float:
 def compute_metrics_dict(
     perf_df: pd.DataFrame,
     initial_capital: float,
-) -> Dict[str, float | int | None]:
+) -> dict[str, float | int | None]:
     """Headline run metrics as numbers, keyed like the ``run_metrics`` columns.
 
     ``win_rate``, ``profit_factor`` and ``total_trades`` are deliberately
@@ -170,7 +171,7 @@ def compute_metrics_dict(
     service), and inventing a number here from the fill count would be wrong
     in a way nobody would notice.
     """
-    metrics: Dict[str, float | int | None] = {
+    metrics: dict[str, float | int | None] = {
         "total_return": 0.0,
         "cagr": 0.0,
         "sharpe": 0.0,
@@ -239,7 +240,10 @@ def _generate_minute_by_minute_performance(
         logging.warning(
             "Skipping minute-by-minute performance: %d tickers x %d-min span exceeds %d-cell limit",
             len(price_pivot.columns),
-            int((price_pivot.index.max() - price_pivot.index.min()).total_seconds() // 60),
+            int(
+                (price_pivot.index.max() - price_pivot.index.min()).total_seconds()
+                // 60
+            ),
             MINUTE_RESAMPLE_CELL_LIMIT,
         )
         return pd.DataFrame()
@@ -319,7 +323,10 @@ def _generate_buy_and_hold_benchmark(
         logging.warning(
             "Skipping buy-and-hold benchmark: %d tickers x %d-min span exceeds %d-cell limit",
             len(price_pivot.columns),
-            int((price_pivot.index.max() - price_pivot.index.min()).total_seconds() // 60),
+            int(
+                (price_pivot.index.max() - price_pivot.index.min()).total_seconds()
+                // 60
+            ),
             MINUTE_RESAMPLE_CELL_LIMIT,
         )
         return pd.DataFrame()
@@ -370,23 +377,21 @@ def _compute_rolling_stats(
     columns_to_analyze: list[str],
     windows_days: list[int] = [30, 90, 180],
     date_col: str = "timestamp",
-) -> Dict[str, pd.DataFrame]:
+) -> dict[str, pd.DataFrame]:
     """
     Computes rolling statistics allowing partial-window estimates
     (min_periods = w // 2), so results begin once at least half of
     the window has data.
     """
-    out: Dict[str, pd.DataFrame] = {}
+    out: dict[str, pd.DataFrame] = {}
     df = df_pct_returns.set_index(date_col)
     for w in windows_days:
         window_str = f"{w}D"
         rolling_mean = (
-            df[columns_to_analyze]
-            .rolling(window=window_str, min_periods=w // 2).mean()
+            df[columns_to_analyze].rolling(window=window_str, min_periods=w // 2).mean()
         )
         rolling_vol = (
-            df[columns_to_analyze]
-            .rolling(window=window_str, min_periods=w // 2).std()
+            df[columns_to_analyze].rolling(window=window_str, min_periods=w // 2).std()
         )
         wdf = pd.DataFrame(index=df.index)
         for col in columns_to_analyze:
@@ -459,7 +464,7 @@ def _calculate_portfolio_risk_components(
         return pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame()
 
     aligned_tickers = [
-        ticker for ticker in portfolio_weights.keys() if ticker in daily_returns.columns
+        ticker for ticker in portfolio_weights if ticker in daily_returns.columns
     ]
     daily_returns = daily_returns[aligned_tickers]
 
@@ -528,7 +533,10 @@ def _calculate_rolling_portfolio_risk(
         }
     )
 
-def _build_csv(df: pd.DataFrame, filename: str, logger: logging.Logger, out_dir: str) -> None:
+
+def _build_csv(
+    df: pd.DataFrame, filename: str, logger: logging.Logger, out_dir: str
+) -> None:
     """Helper function to save a DataFrame to CSV with error handling."""
     try:
         if not df.empty:
@@ -539,6 +547,7 @@ def _build_csv(df: pd.DataFrame, filename: str, logger: logging.Logger, out_dir:
             logger.warning(f"{filename} is empty; skipping CSV export")
     except Exception as e:
         logger.error(f"Error saving {filename}: {e}", exc_info=True)
+
 
 # --- Main Reporting Function ---
 def generate_backtest_report(
@@ -556,7 +565,7 @@ def generate_backtest_report(
     logger.info("Generating backtest report...")
     if perf_df.empty:
         logger.warning("Performance DataFrame is empty. Skipping report generation")
-        return None
+        return
     # VISUALIZER: upstream always wrote to a cwd-relative
     # "src/backtest/data/<ts>_backtest_<id>" directory, which only makes
     # sense when the engine is run from a checkout of the trading repo.
@@ -662,7 +671,9 @@ def generate_backtest_report(
             mdf = _compute_monthly_returns(pct_df, cols_to_analyze)
             reports["monthly_returns"] = mdf.copy()
             if len(cols_to_analyze) > 1:
-                reports["portfolio_return_correlations"] = _compute_return_correlations(pct_df, cols_to_analyze).copy()
+                reports["portfolio_return_correlations"] = _compute_return_correlations(
+                    pct_df, cols_to_analyze
+                ).copy()
     except Exception as e:
         logger.error(f"Error in advanced analytics: {e}", exc_info=True)
 
@@ -699,11 +710,14 @@ def generate_backtest_report(
 
     # concurrently save all reports to CSV
     from concurrent.futures import ThreadPoolExecutor
+
     try:
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = []
             for name, df in reports.items():
-                futures.append(executor.submit(_build_csv, df, f"{name}.csv", logger, out_dir))
+                futures.append(
+                    executor.submit(_build_csv, df, f"{name}.csv", logger, out_dir)
+                )
             for future in futures:
                 future.result()  # Wait for all to complete and catch exceptions
         logger.info(f"Completed saving reports to CSV in {out_dir}")

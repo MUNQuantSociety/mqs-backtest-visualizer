@@ -15,7 +15,9 @@ from src.integrations.strategy_store import (
     strategy_key,
 )
 
-SOURCE = "class MyStrategy(BasePortfolio):\n    def OnData(self, context):\n        pass\n"
+SOURCE = (
+    "class MyStrategy(BasePortfolio):\n    def OnData(self, context):\n        pass\n"
+)
 CONFIG = json.dumps({"TICKERS": ["AAPL", "MSFT"], "LOOKBACK_DAYS": 30})
 
 
@@ -128,7 +130,7 @@ def test_keys_cannot_escape_the_store_root(store: LocalStrategyStore) -> None:
 @pytest.mark.parametrize(
     "key",
     [
-        "..\\..\\pwned/",           # a separator to pathlib, one segment to str.split("/")
+        "..\\..\\pwned/",  # a separator to pathlib, one segment to str.split("/")
         "strategies/..\\..\\pwned/",
         "strategies/sub\\..\\..\\pwned/",
         "C:\\Windows\\Temp\\",
@@ -150,10 +152,7 @@ def test_backslash_keys_cannot_escape_the_store_root(tmp_path: Path, key: str) -
     with pytest.raises(ValueError):
         store.put(key, "owned.py", "ESCAPED")
 
-    escaped = [
-        path
-        for path in tmp_path.rglob("owned.py")
-    ]
+    escaped = [path for path in tmp_path.rglob("owned.py")]
     assert not escaped, f"wrote outside the store: {escaped}"
     # Nothing was created above the root either — an escape that raises after
     # doing the damage is not a fix.

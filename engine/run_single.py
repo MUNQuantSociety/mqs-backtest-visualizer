@@ -68,9 +68,7 @@ def load_strategy_class(class_path: str) -> type[BasePortfolio]:
     try:
         strategy_class = getattr(module, class_name)
     except AttributeError as exc:
-        raise ValueError(
-            f"{module_name} has no class named {class_name!r}."
-        ) from exc
+        raise ValueError(f"{module_name} has no class named {class_name!r}.") from exc
 
     if not (
         isinstance(strategy_class, type) and issubclass(strategy_class, BasePortfolio)
@@ -111,9 +109,7 @@ def _equity_curve(perf_df: pd.DataFrame) -> list[EquityPoint]:
 
     frame = perf_df[["timestamp", "portfolio_value"]].copy()
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-    frame["portfolio_value"] = pd.to_numeric(
-        frame["portfolio_value"], errors="coerce"
-    )
+    frame["portfolio_value"] = pd.to_numeric(frame["portfolio_value"], errors="coerce")
     frame = frame.dropna().sort_values("timestamp")
 
     local_dates = frame["timestamp"].dt.tz_convert("America/New_York").dt.date
@@ -229,7 +225,9 @@ def run_single(request: RunRequest) -> RunResult:
         else:
             runner = engine.last_runner
             perf_df = runner.perf_df if runner is not None else None
-            fills = list(runner.executor.trade_log) if runner and runner.executor else []
+            fills = (
+                list(runner.executor.trade_log) if runner and runner.executor else []
+            )
 
         if perf_df is None or perf_df.empty:
             # The engine got past its own data guard but produced no samples,

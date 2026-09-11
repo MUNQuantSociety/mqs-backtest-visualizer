@@ -8,6 +8,7 @@ are duplicated onto the run row so the list endpoint never has to join.
 from __future__ import annotations
 
 import uuid
+
 # ``date`` is aliased: RunEquityPoint/RunTrade have columns literally named
 # ``date``, and an unaliased import would shadow the type in Mapped[...].
 from datetime import date as DateType
@@ -59,7 +60,8 @@ class BacktestRun(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     strategy_key: Mapped[str] = mapped_column(
-        Text, ForeignKey(f"{APP_SCHEMA}.strategies.key", ondelete="RESTRICT"),
+        Text,
+        ForeignKey(f"{APP_SCHEMA}.strategies.key", ondelete="RESTRICT"),
         nullable=False,
     )
     status: Mapped[str] = mapped_column(Text, nullable=False, default="queued")
@@ -90,7 +92,9 @@ class BacktestRun(Base):
 
     # Auth lands in a parallel session; the column and the repository filter
     # seam exist now so that work is a filter change, not a migration.
-    owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
 
     # A validation run for an uploaded strategy goes through the identical
     # pipeline; this is the only thing that tells the two apart.
@@ -111,15 +115,15 @@ class BacktestRun(Base):
         DateTime(timezone=True), nullable=True
     )
 
-    metrics: Mapped["RunMetrics | None"] = relationship(
+    metrics: Mapped[RunMetrics | None] = relationship(
         back_populates="run", cascade="all, delete-orphan", uselist=False
     )
-    equity_points: Mapped[list["RunEquityPoint"]] = relationship(
+    equity_points: Mapped[list[RunEquityPoint]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
         order_by="RunEquityPoint.seq",
     )
-    trades: Mapped[list["RunTrade"]] = relationship(
+    trades: Mapped[list[RunTrade]] = relationship(
         back_populates="run", cascade="all, delete-orphan", order_by="RunTrade.seq"
     )
 

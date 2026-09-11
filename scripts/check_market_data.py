@@ -39,10 +39,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import psycopg2  # noqa: E402
+import psycopg2
 
-from scripts.seed_strategies import build_rows  # noqa: E402
-from src.core.config import settings  # noqa: E402
+from scripts.seed_strategies import build_rows
+from src.core.config import settings
 
 _FIRST_TICKER = "SELECT min(ticker) FROM public.market_data"
 _NEXT_TICKER = "SELECT min(ticker) FROM public.market_data WHERE ticker > %s"

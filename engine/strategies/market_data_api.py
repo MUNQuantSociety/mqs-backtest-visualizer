@@ -1,6 +1,5 @@
 import logging
 from datetime import datetime
-from typing import Optional
 
 import pandas as pd
 
@@ -16,7 +15,7 @@ class AssetData:
         self,
         ticker: str,
         asset_specific_df: pd.DataFrame,
-        current_time: Optional[datetime],
+        current_time: datetime | None,
     ):
         self._ticker = ticker
         self._df = asset_specific_df

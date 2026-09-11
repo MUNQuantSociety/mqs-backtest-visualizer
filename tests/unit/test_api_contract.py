@@ -29,7 +29,6 @@ from fastapi.testclient import TestClient
 
 from server import app
 from src.db.engine import dispose_async_engine
-from src.services import backtests as backtests_service
 from src.schemas.backtests import (
     BacktestDetail,
     BacktestRunRequest,
@@ -43,6 +42,7 @@ from src.schemas.strategies import (
     Strategy,
     StrategyCheckResult,
 )
+from src.services import backtests as backtests_service
 
 
 @pytest.fixture(scope="module")
@@ -106,9 +106,7 @@ def seeded_run(
 
 def _aliases(model: type) -> set[str]:
     """The wire-level key names of a Pydantic model — i.e. what Zod sees."""
-    return {
-        field.alias or name for name, field in model.model_fields.items()
-    }
+    return {field.alias or name for name, field in model.model_fields.items()}
 
 
 def test_health(client: TestClient) -> None:
@@ -126,9 +124,21 @@ def test_health(client: TestClient) -> None:
 
 def test_backtest_summary_keys_are_camel_case() -> None:
     assert _aliases(BacktestSummary) == {
-        "id", "name", "strategyId", "strategyName", "symbol", "timeframe",
-        "status", "startDate", "endDate", "createdAt", "initialCapital",
-        "finalEquity", "totalReturn", "sharpe", "maxDrawdown",
+        "id",
+        "name",
+        "strategyId",
+        "strategyName",
+        "symbol",
+        "timeframe",
+        "status",
+        "startDate",
+        "endDate",
+        "createdAt",
+        "initialCapital",
+        "finalEquity",
+        "totalReturn",
+        "sharpe",
+        "maxDrawdown",
     }
 
 
@@ -138,8 +148,15 @@ def test_backtest_detail_carries_curve_trades_and_metrics() -> None:
         BacktestDetail
     )
     assert _aliases(PerformanceMetrics) == {
-        "totalReturn", "cagr", "sharpe", "sortino", "maxDrawdown",
-        "volatility", "winRate", "profitFactor", "totalTrades",
+        "totalReturn",
+        "cagr",
+        "sharpe",
+        "sortino",
+        "maxDrawdown",
+        "volatility",
+        "winRate",
+        "profitFactor",
+        "totalTrades",
     }
     assert _aliases(EquityPoint) == {"date", "equity", "benchmark"}
     assert {"entryDate", "exitDate", "returnPct"} <= _aliases(Trade)
@@ -148,8 +165,13 @@ def test_backtest_detail_carries_curve_trades_and_metrics() -> None:
 def test_run_submission_request_keys_are_camel_case() -> None:
     """The New Run form's payload. These names are final and already shipped."""
     assert _aliases(BacktestRunRequest) == {
-        "name", "strategyKey", "startDate", "endDate", "initialCapital",
-        "mode", "params",
+        "name",
+        "strategyKey",
+        "startDate",
+        "endDate",
+        "initialCapital",
+        "mode",
+        "params",
     }
 
 
@@ -167,7 +189,11 @@ def test_backtest_detail_carries_progress_and_failure_reason() -> None:
 
 def test_strategy_keys_are_camel_case() -> None:
     assert {
-        "className", "runCount", "bestSharpe", "bestReturn", "lastRunAt",
+        "className",
+        "runCount",
+        "bestSharpe",
+        "bestReturn",
+        "lastRunAt",
     } <= _aliases(Strategy)
 
 
@@ -518,8 +544,12 @@ def test_check_agrees_with_what_submission_accepts(client: TestClient) -> None:
 
     submission = client.post(
         "/api/strategies",
-        json={"name": "Check agreement", "description": "", "source": source,
-              "filename": None},
+        json={
+            "name": "Check agreement",
+            "description": "",
+            "source": source,
+            "filename": None,
+        },
     )
     assert submission.status_code == 422
 
@@ -541,8 +571,12 @@ def test_oversized_strategy_source_is_rejected(client: TestClient) -> None:
     # Rejected on size before any database work, so this needs no marker.
     response = client.post(
         "/api/strategies",
-        json={"name": "Big", "description": "", "source": "x" * (256 * 1024 + 1),
-              "filename": None},
+        json={
+            "name": "Big",
+            "description": "",
+            "source": "x" * (256 * 1024 + 1),
+            "filename": None,
+        },
     )
     assert response.status_code == 413
 
@@ -637,5 +671,9 @@ def test_log_tail_respects_size(client: TestClient) -> None:
     body = response.json()
     assert len(body["entries"]) == 7
     assert body["entries"][0]["level"] in {
-        "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
     }

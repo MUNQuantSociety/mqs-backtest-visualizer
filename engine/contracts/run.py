@@ -9,9 +9,10 @@ or a database session.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable, NamedTuple
+from typing import Any, NamedTuple
 
 # The metrics dictionary is keyed exactly like the ``app.run_metrics`` columns
 # so persistence is a straight column-by-column write with no translation

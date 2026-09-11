@@ -1,8 +1,8 @@
-# [Incomplete: going to implement V2] module for vectorized strategy adapters. These functions provide a way to compute target weights and signal strength for various strategies in a vectorized manner, suitable for backtesting. Each adapter corresponds to a specific strategy and implements its logic using pandas DataFrames. The get_vector_adapter_for_portfolio function allows retrieval of the appropriate adapter based on the class name of the portfolio instance. This design enables separation of vectorized logic from event-driven strategy implementations, facilitating efficient backtesting while maintaining code clarity. 
+# [Incomplete: going to implement V2] module for vectorized strategy adapters. These functions provide a way to compute target weights and signal strength for various strategies in a vectorized manner, suitable for backtesting. Each adapter corresponds to a specific strategy and implements its logic using pandas DataFrames. The get_vector_adapter_for_portfolio function allows retrieval of the appropriate adapter based on the class name of the portfolio instance. This design enables separation of vectorized logic from event-driven strategy implementations, facilitating efficient backtesting while maintaining code clarity.
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -206,7 +206,7 @@ def trend_rotate_adapter(price_df: pd.DataFrame) -> VectorSignalResult:
     return VectorSignalResult(target_weights=weights, signal_strength=signal_strength)
 
 
-ADAPTERS_BY_CLASSNAME: Dict[str, Callable[[pd.DataFrame], VectorSignalResult]] = {
+ADAPTERS_BY_CLASSNAME: dict[str, Callable[[pd.DataFrame], VectorSignalResult]] = {
     "VolMomentum": vol_momentum_adapter,
     "MomentumStrategy": momentum_strategy_adapter,
     "RegimeAdaptiveStrategy": regime_adaptive_adapter,
@@ -216,5 +216,5 @@ ADAPTERS_BY_CLASSNAME: Dict[str, Callable[[pd.DataFrame], VectorSignalResult]] =
 
 def get_vector_adapter_for_portfolio(
     portfolio_instance,
-) -> Optional[Callable[[pd.DataFrame], VectorSignalResult]]:
+) -> Callable[[pd.DataFrame], VectorSignalResult] | None:
     return ADAPTERS_BY_CLASSNAME.get(portfolio_instance.__class__.__name__)

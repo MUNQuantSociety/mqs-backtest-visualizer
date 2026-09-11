@@ -149,7 +149,9 @@ class JobManager:
         except Exception:
             # Last resort only: the startup reconciler picks up whatever is
             # still ``running`` the next time the server boots.
-            logger.exception("Run %s could not be marked failed after its worker died", key)
+            logger.exception(
+                "Run %s could not be marked failed after its worker died", key
+            )
 
 
 _manager: JobManager | None = None
@@ -245,6 +247,5 @@ async def application_lifespan(app: object = None) -> AsyncIterator[None]:
     """
     from src.db.init import database_lifespan
 
-    async with database_lifespan(app):
-        async with job_manager_lifespan(app):
-            yield
+    async with database_lifespan(app), job_manager_lifespan(app):
+        yield

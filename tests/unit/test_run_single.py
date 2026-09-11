@@ -23,9 +23,7 @@ from engine.run_single import run_single
 
 pytestmark = pytest.mark.db
 
-DUMMY_CLASS_PATH = (
-    "engine.strategies.portfolio_dummy.strategy:CrossoverRmiStrategy"
-)
+DUMMY_CLASS_PATH = "engine.strategies.portfolio_dummy.strategy:CrossoverRmiStrategy"
 
 # A three-week window inside verified coverage (market_data holds AAPL from
 # 2019-11-11 to 2026-07-15). Short on purpose: this proves the pipeline runs,
@@ -123,7 +121,14 @@ def test_metrics_have_every_run_metrics_key(completed_run) -> None:
     assert set(result.metrics) == set(METRIC_KEYS)
     # The six the engine computes are numbers; the three round-trip metrics are
     # left to the caller's trade pairing and must be explicitly absent.
-    for key in ("total_return", "cagr", "sharpe", "sortino", "max_drawdown", "volatility"):
+    for key in (
+        "total_return",
+        "cagr",
+        "sharpe",
+        "sortino",
+        "max_drawdown",
+        "volatility",
+    ):
         assert isinstance(result.metrics[key], float), key
     for key in ("win_rate", "profit_factor", "total_trades"):
         assert result.metrics[key] is None, key
@@ -133,7 +138,9 @@ def test_fills_are_raw_executor_records(completed_run) -> None:
     result, _ = completed_run
     assert isinstance(result.fills, list)
     for fill in result.fills:
-        assert {"timestamp", "ticker", "signal_type", "shares", "fill_price"} <= set(fill)
+        assert {"timestamp", "ticker", "signal_type", "shares", "fill_price"} <= set(
+            fill
+        )
 
 
 def test_artifacts_are_written_into_the_requested_directory(completed_run) -> None:

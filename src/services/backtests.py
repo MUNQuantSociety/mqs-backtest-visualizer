@@ -432,7 +432,9 @@ def _validated_capital(raw: float) -> float:
     """Capital has to be positive and finite — it divides every return."""
     capital = float(raw)
     if not math.isfinite(capital):
-        raise RunSubmissionError(f"initialCapital must be a finite number; got {raw!r}.")
+        raise RunSubmissionError(
+            f"initialCapital must be a finite number; got {raw!r}."
+        )
     if capital <= 0:
         raise RunSubmissionError(
             f"initialCapital must be greater than zero; got {capital:g}."
@@ -541,7 +543,7 @@ def _validated_param_value(key: str, value: Any, spec: dict[str, Any]) -> Any:
     return value
 
 
-def _check_param_range(key: str, value: int | float, spec: dict[str, Any]) -> None:
+def _check_param_range(key: str, value: float, spec: dict[str, Any]) -> None:
     minimum, maximum = spec.get("min"), spec.get("max")
     if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
         if value < minimum:

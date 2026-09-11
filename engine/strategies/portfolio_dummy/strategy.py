@@ -1,8 +1,8 @@
 import logging
-from typing import Dict
 
 from engine.strategies.order_interface import StrategyContext
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
+
 
 class CrossoverRmiStrategy(BasePortfolio):
     """
@@ -18,10 +18,15 @@ class CrossoverRmiStrategy(BasePortfolio):
         debug=False,
         config_dict=None,
         backtest_start_date=None,
-        order_manager=None
+        order_manager=None,
     ):
         super().__init__(
-            db_connector, executor, debug, config_dict, backtest_start_date, order_manager
+            db_connector,
+            executor,
+            debug,
+            config_dict,
+            backtest_start_date,
+            order_manager,
         )
         self.logger = logging.getLogger(
             f"{self.__class__.__name__}_{self.portfolio_id}"
@@ -36,7 +41,7 @@ class CrossoverRmiStrategy(BasePortfolio):
         self.RegisterIndicatorSet(indicator_definitions)
 
         # --- State Tracking ---
-        self._previous_sma_values: Dict[str, Dict[str, float]] = {
+        self._previous_sma_values: dict[str, dict[str, float]] = {
             ticker: {"fast": 0.0, "slow": 0.0} for ticker in self.tickers
         }
 

@@ -76,9 +76,10 @@ and an interleaved one is still paired chronologically.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Literal, Mapping, Sequence, TypedDict
+from typing import Any, Literal, TypedDict
 
 __all__ = ["Fill", "TradeRow", "pair_fills"]
 

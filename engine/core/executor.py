@@ -1,7 +1,6 @@
 import logging
 import math
 from collections import namedtuple
-from typing import Dict, List
 
 import pandas as pd
 
@@ -22,12 +21,12 @@ class BacktestExecutor:
     def __init__(
         self,
         initial_capital: float,
-        tickers: List[str],
+        tickers: list[str],
         leverage: float = 2.0,
         slippage: float = 0.0,
         cost_model: CostModel | None = None,
-        adv_lookup: Dict[str, float] | None = None,
-        sigma_lookup: Dict[str, float] | None = None,
+        adv_lookup: dict[str, float] | None = None,
+        sigma_lookup: dict[str, float] | None = None,
     ):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.tickers = tickers
@@ -35,14 +34,14 @@ class BacktestExecutor:
         self.slippage = slippage
         # Legacy constant slippage stays available as a fallback (when cost_model is None).
         self.cost_model: CostModel | None = cost_model
-        self.adv_lookup: Dict[str, float] = dict(adv_lookup or {})
-        self.sigma_lookup: Dict[str, float] = dict(sigma_lookup or {})
+        self.adv_lookup: dict[str, float] = dict(adv_lookup or {})
+        self.sigma_lookup: dict[str, float] = dict(sigma_lookup or {})
 
         # --- Unified Portfolio State ---
         self.cash = initial_capital
-        self.positions: Dict[str, float] = {ticker: 0.0 for ticker in tickers}
-        self.latest_prices: Dict[str, float] = {ticker: 0.0 for ticker in tickers}
-        self.trade_log: List[Dict] = []
+        self.positions: dict[str, float] = {ticker: 0.0 for ticker in tickers}
+        self.latest_prices: dict[str, float] = {ticker: 0.0 for ticker in tickers}
+        self.trade_log: list[dict] = []
 
         self.logger.info(
             "BacktestExecutor initialized with %.2f capital, leverage=%.2f, slippage=%.2f, "
@@ -100,7 +99,7 @@ class BacktestExecutor:
         """Calculates the notional value of a single ticker's position."""
         return self.positions.get(ticker, 0.0) * self.latest_prices.get(ticker, 0.0)
 
-    def get_data_feeds(self) -> Dict[str, pd.DataFrame]:
+    def get_data_feeds(self) -> dict[str, pd.DataFrame]:
         """Generates the portfolio state dataframes required by the strategy."""
         cash_df = pd.DataFrame([{"notional": self.cash}])
         positions_list = [

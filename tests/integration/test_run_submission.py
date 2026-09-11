@@ -170,7 +170,9 @@ def _submit(client: TestClient, strategy_key: str, **overrides) -> dict:
     return client.post("/api/backtests", json=payload)
 
 
-def _poll_until(client: TestClient, run_id: str, wanted: set[str], timeout: float) -> dict:
+def _poll_until(
+    client: TestClient, run_id: str, wanted: set[str], timeout: float
+) -> dict:
     """Poll the detail endpoint the way the frontend does, and return the payload.
 
     Fails with the run's own error message rather than a bare timeout: a run
@@ -267,7 +269,9 @@ def test_headline_numbers_reach_the_list_row(client, completed_run) -> None:
     """The list view reads only the run row, so the run row must be filled in."""
     accepted, detail = completed_run
 
-    listing = client.get("/api/backtests", params={"strategyId": accepted["strategyId"]})
+    listing = client.get(
+        "/api/backtests", params={"strategyId": accepted["strategyId"]}
+    )
     assert listing.status_code == 200
 
     rows = {row["id"]: row for row in listing.json()["items"]}
@@ -353,7 +357,9 @@ def test_an_unknown_parameter_is_rejected_by_key(client, runnable_key) -> None:
 
 def test_a_parameter_below_its_minimum_is_rejected(client, runnable_key) -> None:
     detail = _rejection(
-        _submit(client, runnable_key, params={"LOOKBACK_DAYS": LOOKBACK_SPEC["min"] - 1})
+        _submit(
+            client, runnable_key, params={"LOOKBACK_DAYS": LOOKBACK_SPEC["min"] - 1}
+        )
     )
     assert "LOOKBACK_DAYS" in detail
     assert str(LOOKBACK_SPEC["min"]) in detail
@@ -361,7 +367,9 @@ def test_a_parameter_below_its_minimum_is_rejected(client, runnable_key) -> None
 
 def test_a_parameter_above_its_maximum_is_rejected(client, runnable_key) -> None:
     detail = _rejection(
-        _submit(client, runnable_key, params={"LOOKBACK_DAYS": LOOKBACK_SPEC["max"] + 1})
+        _submit(
+            client, runnable_key, params={"LOOKBACK_DAYS": LOOKBACK_SPEC["max"] + 1}
+        )
     )
     assert str(LOOKBACK_SPEC["max"]) in detail
 

@@ -12,8 +12,8 @@ Public API:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from itertools import combinations
-from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -47,6 +47,7 @@ def _coerce_matrix(returns_matrix_per_strategy):
 def _rank_array(x: np.ndarray) -> np.ndarray:
     try:
         from scipy.stats import rankdata
+
         return rankdata(x, method="average")
     except ImportError:
         order = np.argsort(np.argsort(x))
@@ -172,7 +173,7 @@ def cscv_pbo(
 
 
 def build_strategy_grid_matrix(
-    series_per_strategy: Dict[str, pd.Series],
+    series_per_strategy: dict[str, pd.Series],
     *,
     fill_value: float = 0.0,
 ) -> pd.DataFrame:
@@ -187,6 +188,6 @@ def build_strategy_grid_matrix(
 
 
 __all__ = [
-    "cscv_pbo",
     "build_strategy_grid_matrix",
+    "cscv_pbo",
 ]
