@@ -182,9 +182,10 @@ def workflow_env(monkeypatch, tmp_path):
         "PRODUCTION_DEPLOY_ENABLED": "true",
         "IMAGE_DIGEST": DIGEST, "PREVIOUS_TASK_DEFINITION": PREVIOUS,
         "BASELINE_DEPLOYMENT": "ecs-svc/previous", "TASK_DEFINITION": REVISION,
-        "DEPLOYMENT_ID": "ecs-svc/new",
+        "DEPLOYMENT_ID": "ecs-svc/new", "BASELINE_DESIRED": "1", "BOOTSTRAP": "false",
     }
     monkeypatch.setattr(os, "environ", env)
+    (tmp_path / "deployment-configuration.json").write_text(json.dumps(_service()["deploymentConfiguration"]))
     return env
 
 
@@ -248,7 +249,8 @@ def _service(revision=REVISION, deployment="ecs-svc/new"):
         "deploymentController": {"type": "ECS"},
         "deploymentConfiguration": {"deploymentCircuitBreaker": {"enable": True, "rollback": True}},
         "deployments": [{"id": deployment, "taskDefinition": revision,
-                         "status": "PRIMARY", "rolloutState": "COMPLETED"}],
+                         "status": "PRIMARY", "rolloutState": "COMPLETED",
+                         "desiredCount": 1, "runningCount": 1, "pendingCount": 0}],
     }
 
 
@@ -278,7 +280,8 @@ def _mock_aws(monkeypatch, responses):
     def check_output(args, **kwargs):
         assert args[0] == "aws" and args[2] in responses
         calls.append(args)
-        return json.dumps(responses[args[2]])
+        response = responses[args[2]]
+        return json.dumps(response(args) if callable(response) else response)
 
     def run(args, **kwargs):
         assert args[:4] == ["aws", "ecs", "wait", "services-stable"]
@@ -313,6 +316,7 @@ def test_registers_digest_revision_preserving_runtime_configuration(workflow_env
     assert registered == expected
     update = next(c for c in calls if c[2] == "update-service")
     assert update[update.index("--task-definition") + 1] == REVISION
+    assert "--desired-count" not in update and "--deployment-configuration" not in update
     assert calls.index(next(c for c in calls if c[2] == "register-task-definition")) < calls.index(update)
     output = Path(workflow_env["GITHUB_OUTPUT"]).read_text()
     assert f"previous={PREVIOUS}" in output and f"task-definition={REVISION}" in output
@@ -448,3 +452,175 @@ def test_postgres_report_requires_executed_passing_tests(tmp_path, xml, ok):
     else:
         with pytest.raises(ValueError):
             check_report(report)
+
+
+def _bootstrap(env):
+    env.update(BOOTSTRAP="true", GITHUB_EVENT_NAME="workflow_dispatch", BASELINE_DESIRED="0")
+    service = _service(PREVIOUS, "ecs-svc/previous")
+    service.update(desiredCount=0, runningCount=0)
+    service["deployments"][0].update(desiredCount=0, runningCount=0)
+    configuration = service["deploymentConfiguration"]
+    configuration.update(maximumPercent=200, minimumHealthyPercent=100, strategy="ROLLING", bakeTimeInMinutes=0)
+    configuration["deploymentCircuitBreaker"].update(resetOnHealthyTask=False, thresholdConfiguration={"type": "BOUNDED_PERCENT", "value": 50})
+    Path(env["RUNNER_TEMP"], "deployment-configuration.json").write_text(json.dumps(configuration))
+    temporary = copy.deepcopy(configuration)
+    temporary["deploymentCircuitBreaker"]["rollback"] = False
+    Path(env["RUNNER_TEMP"], "bootstrap-deployment-configuration.json").write_text(json.dumps(temporary))
+    return service, configuration, temporary
+
+
+def _healthy_task():
+    return {"taskArn": "task-1", "taskDefinitionArn": REVISION, "lastStatus": "RUNNING",
+            "desiredStatus": "RUNNING", "group": "service:api", "startedBy": "ecs-svc/new",
+            "healthStatus": "HEALTHY", "containers": [{"name": "api", "lastStatus": "RUNNING",
+            "healthStatus": "HEALTHY", "imageDigest": DIGEST}]}
+
+
+def test_bootstrap_is_explicit_manual_and_keeps_the_same_ci():
+    workflow = _load("deploy.yml")
+    bootstrap = _triggers(workflow)["workflow_dispatch"]["inputs"]["bootstrap"]
+    assert bootstrap["type"] == "boolean" and bootstrap["default"] is False
+    assert workflow["jobs"]["deploy"]["needs"] == "test"
+    assert "github.event_name == 'workflow_dispatch'" in workflow["jobs"]["deploy"]["env"]["BOOTSTRAP"]
+    cleanup = _step("Restore stopped service after failed bootstrap")["if"]
+    assert "failure()" in cleanup and "inputs.bootstrap" in cleanup
+    assert "steps.revision.outputs.task-definition" in cleanup  # Also handles a lost update response.
+
+
+@pytest.mark.parametrize("bad", [None, "push", "dev", "fork", "positive", "pending", "deployment-count", "no-healthcheck", "alarm-rollback", "insecure-tls", "missing-password"])
+def test_bootstrap_preflight_only_admits_prepared_stopped_service(workflow_env, monkeypatch, bad):
+    service, _, _ = _bootstrap(workflow_env)
+    definition = _definition()
+    if bad in {"push", "dev", "fork"}:
+        key, value = {"push": ("GITHUB_EVENT_NAME", "push"), "dev": ("GITHUB_REF", "refs/heads/dev"), "fork": ("GITHUB_REPOSITORY", "someone/fork")}[bad]
+        workflow_env[key] = value
+    elif bad == "positive":
+        service.update(desiredCount=1, runningCount=1)
+    elif bad == "pending":
+        service["pendingCount"] = 1
+    elif bad == "deployment-count":
+        service["deployments"][0]["runningCount"] = 1
+    elif bad == "no-healthcheck":
+        definition["containerDefinitions"][0].pop("healthCheck")
+    elif bad == "alarm-rollback":
+        service["deploymentConfiguration"]["alarms"] = {"enable": True, "rollback": True, "alarmNames": ["alarm"]}
+    elif bad == "insecure-tls":
+        definition["containerDefinitions"][0]["environment"][0]["value"] = "prefer"
+    elif bad == "missing-password":
+        definition["containerDefinitions"][0]["secrets"] = definition["containerDefinitions"][0]["secrets"][:-1]
+    calls = _mock_aws(monkeypatch, {"describe-services": {"services": [service]}, "describe-task-definition": {"taskDefinition": definition}})
+    if bad:
+        with pytest.raises(SystemExit):
+            _execute(_step("Validate service and preserve task configuration"))
+    else:
+        _execute(_step("Validate service and preserve task configuration"))
+        assert "desired=0" in Path(workflow_env["GITHUB_OUTPUT"]).read_text()
+    assert not any(c[2] in {"register-task-definition", "update-service"} for c in calls)
+
+
+@pytest.mark.parametrize("drift", [None, "desired", "running", "pending", "deployment", "deployment-count", "configuration"])
+def test_bootstrap_registers_one_digest_task_without_scaffold_rollback(workflow_env, monkeypatch, drift):
+    service, original, temporary = _bootstrap(workflow_env)
+    responses = {"describe-services": {"services": [service]}, "describe-task-definition": {"taskDefinition": _definition()},
+                 "register-task-definition": {"taskDefinition": {"taskDefinitionArn": REVISION}}}
+    calls = _mock_aws(monkeypatch, responses)
+    _execute(_step("Validate service and preserve task configuration"))
+    if drift in {"desired", "running", "pending"}:
+        service[drift + "Count"] = 1
+    elif drift == "deployment":
+        service["deployments"][0]["id"] = "ecs-svc/other"
+    elif drift == "deployment-count":
+        service["deployments"][0]["pendingCount"] = 1
+    elif drift == "configuration":
+        service["deploymentConfiguration"]["maximumPercent"] = 150
+    updated = _service()
+    updated["deploymentConfiguration"] = temporary
+    responses["update-service"] = {"service": updated}
+    if drift:
+        with pytest.raises(SystemExit, match="changed during build"):
+            _execute(_step("Register explicit revision and deploy"))
+        assert not any(c[2] in {"register-task-definition", "update-service"} for c in calls)
+    else:
+        _execute(_step("Register explicit revision and deploy"))
+        update = next(c for c in calls if c[2] == "update-service")
+        assert update[update.index("--desired-count") + 1] == "1"
+        sent = json.loads(Path(update[update.index("--deployment-configuration") + 1].removeprefix("file://")).read_text())
+        assert sent == temporary and original["deploymentCircuitBreaker"]["rollback"] is True
+        rendered = json.loads(Path(workflow_env["RUNNER_TEMP"], "task-definition.json").read_text())
+        assert rendered["containerDefinitions"][0]["image"].endswith("@" + DIGEST)
+
+
+@pytest.mark.parametrize("bad", [None, "task-health", "container-health", "digest", "deployment", "configuration"])
+def test_bootstrap_restores_full_rollback_configuration_only_after_owned_health(workflow_env, monkeypatch, bad):
+    _, original, temporary = _bootstrap(workflow_env)
+    service, task = _service(), _healthy_task()
+    service["deploymentConfiguration"] = copy.deepcopy(temporary)
+    if bad == "task-health":
+        task["healthStatus"] = "UNKNOWN"
+    elif bad == "container-health":
+        task["containers"][0]["healthStatus"] = "UNHEALTHY"
+    elif bad == "digest":
+        task["containers"][0]["imageDigest"] = "wrong"
+    elif bad == "deployment":
+        service["deployments"][0]["id"] = "ecs-svc/other"
+    elif bad == "configuration":
+        service["deploymentConfiguration"]["maximumPercent"] = 150
+    responses = {"describe-services": {"services": [service]}, "list-tasks": {"taskArns": ["task-1"]}, "describe-tasks": {"tasks": [task]}}
+    def update(args):
+        assert "--task-definition" not in args and "--desired-count" not in args
+        sent = json.loads(Path(args[args.index("--deployment-configuration") + 1].removeprefix("file://")).read_text())
+        assert sent == original
+        service["deploymentConfiguration"] = sent
+        return {"service": service}
+    responses["update-service"] = update
+    calls = _mock_aws(monkeypatch, responses)
+    if bad:
+        with pytest.raises(SystemExit):
+            _execute(_step("Restore rollback after healthy bootstrap"))
+        assert not any(c[2] == "update-service" for c in calls)
+    else:
+        _execute(_step("Restore rollback after healthy bootstrap"))
+        _execute(_step("Verify intended revision and running digest"))
+        task["healthStatus"] = "UNKNOWN"
+        with pytest.raises(SystemExit):
+            _execute(_step("Verify intended revision and running digest"))
+
+
+@pytest.mark.parametrize("scenario", ["owned", "lost-response", "restored-rollback", "unchanged", "other-revision", "other-deployment", "other-configuration", "other-count"])
+def test_failed_bootstrap_only_restores_its_owned_stopped_baseline(workflow_env, monkeypatch, scenario):
+    stopped, original, temporary = _bootstrap(workflow_env)
+    service = _service()
+    service["deployments"][0]["rolloutState"] = "FAILED"
+    service["deploymentConfiguration"] = copy.deepcopy(temporary)
+    if scenario == "lost-response":
+        workflow_env["DEPLOYMENT_ID"] = ""
+    elif scenario == "restored-rollback":
+        service["deploymentConfiguration"] = original
+    elif scenario == "unchanged":
+        service = stopped
+    elif scenario == "other-revision":
+        service["taskDefinition"] = PREVIOUS
+    elif scenario == "other-deployment":
+        service["deployments"][0]["id"] = "ecs-svc/other"
+    elif scenario == "other-configuration":
+        service["deploymentConfiguration"]["maximumPercent"] = 150
+    elif scenario == "other-count":
+        service["desiredCount"] = 2
+    responses = {"describe-services": {"services": [service]}}
+    def update(args):
+        assert args[args.index("--task-definition") + 1] == PREVIOUS
+        assert args[args.index("--desired-count") + 1] == "0"
+        sent = json.loads(Path(args[args.index("--deployment-configuration") + 1].removeprefix("file://")).read_text())
+        assert sent == original
+        responses["describe-services"] = {"services": [stopped]}
+        return {"service": stopped}
+    responses["update-service"] = update
+    calls = _mock_aws(monkeypatch, responses)
+    if scenario.startswith("other-") or scenario == "unchanged":
+        with pytest.raises(SystemExit) as error:
+            _execute(_step("Restore stopped service after failed bootstrap"))
+        assert (error.value.code == 0) == (scenario == "unchanged")
+        assert not any(c[2] == "update-service" for c in calls)
+    else:
+        _execute(_step("Restore stopped service after failed bootstrap"))
+        assert sum(c[2] == "update-service" for c in calls) == 1
