@@ -62,3 +62,51 @@ class MyStrategy(BasePortfolio):
             # Whatever you put in STATE is yours to keep across bars.
             self.last_price[ticker] = asset.Close
 '''
+
+
+def _starter_parts() -> tuple[str, tuple[tuple[str, str, dict], ...], dict]:
+    """The starter's ``OnData`` body and indicator spec, read from the source.
+
+    Derived rather than declared twice. The whole point of serving the template
+    from here is that one text teaches the contract; a hand-written copy of its
+    body and indicators would be the same drift in a smaller place.
+    """
+    import ast
+
+    tree = ast.parse(STARTER_SOURCE)
+    klass = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+
+    indicators: list[tuple[str, str, dict]] = []
+    state: dict = {}
+    for node in klass.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = {target.id for target in node.targets if isinstance(target, ast.Name)}
+        if "INDICATORS" in names:
+            for key, value in zip(node.value.keys, node.value.values):
+                name, params = value.elts
+                indicators.append(
+                    (ast.literal_eval(key), ast.literal_eval(name), ast.literal_eval(params))
+                )
+        elif "STATE" in names:
+            # The body the editor seeds reads `self.last_price`, and
+            # BasePortfolio only creates that attribute if STATE declares it.
+            # Served alongside the fragment so the seeded draft can actually run.
+            state = ast.literal_eval(node.value)
+
+    method = next(
+        node
+        for node in klass.body
+        if isinstance(node, ast.FunctionDef) and node.name == "OnData"
+    )
+    lines = STARTER_SOURCE.splitlines()
+    # `body[0]` is the docstring; its lineno is the first line of the body.
+    first = method.body[0].lineno
+    last = max(getattr(node, "end_lineno", node.lineno) for node in method.body)
+    fragment = [
+        line[8:] if line.startswith(" " * 8) else line for line in lines[first - 1 : last]
+    ]
+    return "\n".join(fragment), tuple(indicators), state
+
+
+STARTER_BODY, STARTER_INDICATORS, STARTER_STATE = _starter_parts()

@@ -358,6 +358,10 @@ def test_check_keys_are_camel_case() -> None:
         "issues",
         "warnings",
         "message",
+        # Set only by the draft check, and null on the full-file one — the
+        # editor needs the assembled file to preview what will actually run.
+        "assembledSource",
+        "bodyOffset",
     }
     assert _aliases(CompatibilityIssue) == {"line", "message"}
 
@@ -515,7 +519,17 @@ def test_the_template_passes_our_own_compatibility_check(client: TestClient) -> 
 
 
 def test_template_keys_are_camel_case(client: TestClient) -> None:
-    assert set(client.get("/api/strategies/template").json()) == {"filename", "source"}
+    # `body` and `indicators` are the fragment half of the same starter, added
+    # for the OnData-only editor; both are camelCase-safe single words.
+    assert set(client.get("/api/strategies/template").json()) == {
+        "filename",
+        "source",
+        "body",
+        "indicators",
+        # The starter body reads `self.last_price`; STATE is what makes that
+        # attribute exist, so the fragment seed carries it.
+        "state",
+    }
 
 
 def test_check_rejects_an_indicator_the_engine_does_not_have(

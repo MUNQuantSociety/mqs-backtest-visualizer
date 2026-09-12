@@ -83,6 +83,23 @@ server, not this one. Both drivers this application uses accept `disable` —
 `src/core/config.py` already translates the libpq vocabulary into asyncpg's
 `ssl` argument.
 
+You also need one line outside that block:
+
+```dotenv
+MARKET_DATA_SOURCE=database
+```
+
+Without it the engine never opens a connection. `MARKET_DATA_SOURCE` defaults
+to `fmp`, and the FMP adapter checks its API key before anything else, so every
+run fails with `FMPUnavailable: FMP_API_KEY is missing` — an error that says
+nothing about the database and sends you looking in the wrong place. The
+container can hold a perfectly seeded table and still serve none of it.
+
+Read `.env.example` before you set this: it calls `database` the *legacy* price
+source, and FMP is where the application is going. This whole document
+describes developing against that legacy path — which is the point, since it is
+what works offline and without a key, but it is not the production data source.
+
 One `.env` is enough for both halves of the application. The API reads these
 names through `src/core/config.py`; the engine reads the *same* names directly
 in `engine/data/db_adapter.py`. That is deliberate, and it means there is no
@@ -112,6 +129,28 @@ venv/bin/python scripts/seed_dev_db.py --days 730
 venv/bin/python scripts/seed_dev_db.py --tickers AAPL,MSFT --days 90
 ```
 
+### The parquet cache can hide an empty table
+
+`engine/core/utils.py` caches bars per ticker in `data/backfill_cache/*.parquet`
+and reads them before querying Postgres. A warm cache therefore satisfies a run
+that the database could not: with `market_data` truncated to zero rows, an
+event-mode backtest still completes with a full equity curve, served entirely
+from those files. The `NoMarketData` guard never fires because nothing ever
+asked the database.
+
+This does not affect a fresh clone — no cache, correct error. It bites when you
+switch an existing checkout from the warehouse to this container: runs keep
+succeeding on stale warehouse prices and nothing says so. Clear the cache when
+you change data sources.
+
+```bash
+rm -rf data/backfill_cache
+```
+
+Fast mode does not use this cache and fails correctly either way, so a run that
+succeeds in event mode and fails in fast mode with `NoMarketData` is this
+situation.
+
 The script refuses to run when `POSTGRES_HOST` is not local. `public.market_data`
 is owned by the live trading system and this is the only thing in the repository
 that inserts into it; the guard is what stops a forgotten `.env` from writing
@@ -132,6 +171,38 @@ it from the models — which is why the init SQL deliberately does not, one
 source of truth rather than two). Doing it here instead means the verification
 below passes on a database the API has never touched, and it is the step that
 gives you the strategies either way.
+
+### You also need a user
+
+Every request identifies its caller with an `X-User-Id` header, and
+`src/api/dependencies/current_user.py` returns 401 unless that id is a row in
+`public.user_creds`. Without one, `POST /api/backtests` answers *"Send
+X-User-Id with a public.user_creds id."* and no backtest can be submitted at
+all — however well `market_data` is seeded.
+
+`docker/dev-db/init/02-user-creds.sql` creates that table and inserts two dummy
+users, Alice and Bob, using the same UUIDs the test suite hard-codes:
+
+| User | `X-User-Id` |
+| --- | --- |
+| Alice | `4510522a-07e1-4dba-98c3-e83bbee3cfe3` |
+| Bob | `bb961a0d-52af-4303-9fdf-1ccc941e3c07` |
+
+Like every file in `init/`, it runs only while the data volume is empty. A
+container you created before this file existed will not have the table, and the
+symptom is that 401 rather than anything mentioning a missing table. Apply it
+without destroying your data:
+
+```bash
+docker compose exec -T db psql -U mqs -d mqsdb < docker/dev-db/init/02-user-creds.sql
+```
+
+Then send the header on every call:
+
+```bash
+curl -H "X-User-Id: 4510522a-07e1-4dba-98c3-e83bbee3cfe3" \
+  http://localhost:8000/api/backtests
+```
 
 ## Step 5 — run the API
 
@@ -225,9 +296,26 @@ run, which almost always means the volume already existed when you added it.
 different major version of PostgreSQL. `docker compose down -v` and start again;
 there is nothing in it worth keeping that the seeder cannot recreate.
 
+**`Send X-User-Id with a public.user_creds id.`** — either you omitted the
+header, or `public.user_creds` does not exist because your volume predates
+`init/02-user-creds.sql`. See Step 4; the fix does not require destroying the
+volume.
+
+**`FMPUnavailable: FMP_API_KEY is missing`** — not an FMP problem. The engine
+never consulted the database, because `MARKET_DATA_SOURCE` is unset and
+defaults to `fmp`. Set `MARKET_DATA_SOURCE=database` in `.env` (Step 2). The
+message names the key rather than the data source, so it reads like a missing
+credential when it is really a missing switch.
+
 **Coverage is empty, or a run finishes instantly with no trades** — the table
 exists but is empty, or your window is outside the seeded range. Check with
 `scripts/check_market_data.py` and seed more days if needed.
+
+**A run succeeds against a database you know is empty** — `data/backfill_cache`
+is serving it. Event mode reads those parquet files before it queries Postgres,
+so the `NoMarketData` guard never fires; fast mode skips the cache and fails
+correctly, which is the tell. `rm -rf data/backfill_cache` and run again. See
+Step 3.
 
 **`connection refused` right after `up -d`** — the container is up but
 PostgreSQL has not finished starting. Wait for `docker compose ps db` to say

@@ -66,6 +66,14 @@ services:
     # the connection settings, overridden below.
     env_file:
       - .env
+    volumes:
+      # Uploaded strategy source, which `STRATEGY_STORE_BACKEND=local` writes
+      # inside the container. Without this it lives only in the image's own
+      # filesystem, so every `--build` silently discards it and leaves registry
+      # rows pointing at source that is gone — a strategy the catalogue offers
+      # and the worker cannot load. The row and its source are two halves of
+      # one record; both have to be durable.
+      - mqs-dev-strategies:/app/.strategy_store
     environment:
       # Inside the compose network the database is the service name on its
       # container port — not the host mapping. TLS is not configured on this
@@ -86,3 +94,4 @@ services:
 
 volumes:
   mqs-dev-db:
+  mqs-dev-strategies:

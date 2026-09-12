@@ -144,6 +144,8 @@ def registry_row(key, storage_key):
         key=key, name=key, class_path="example.Strategy", description="", status="active",
         tags=[], param_specs=[], universe=["AAPL"], validation_run_id=None,
         storage_key=storage_key, enabled=True,
+        # NULL, like every row not authored as a fragment.
+        authoring=None,
     ), 0, None, None, None)
 
 

@@ -709,3 +709,114 @@ def _calls_super_init(initializer: ast.FunctionDef | ast.AsyncFunctionDef) -> bo
     return False
 
 
+
+
+def declared_indicators(source: str) -> list[str]:
+    """Indicator class names a strategy's ``INDICATORS`` block registers.
+
+    Parsed with ``ast``, never imported — same rule as every other read in this
+    module, and it has to hold for uploaded source in particular.
+
+    Used to mark which of the engine's indicators a strategy actually uses. The
+    run form lists all of them and cannot let anyone change the set (the engine
+    builds indicators from the class), so saying which ones are live is the only
+    honest thing that list can do.
+
+    Deliberately forgiving: anything unparseable, or a file with no
+    ``INDICATORS`` at all, is an empty list. A strategy that registers its
+    indicators by hand with ``AddIndicator`` is invisible here, and that is
+    accepted — this answers "what does the declarative block say", not "what
+    will exist at run time".
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = {t.id for t in node.targets if isinstance(t, ast.Name)}
+        if "INDICATORS" not in targets or not isinstance(node.value, ast.Dict):
+            continue
+        for value in node.value.values:
+            # ("IndicatorName", {params}) — the name is the first element.
+            if isinstance(value, ast.Tuple) and value.elts:
+                first = value.elts[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    names.append(first.value)
+    # Sorted and de-duplicated: two attributes may share one indicator class.
+    return sorted(set(names))
+
+
+def indicator_parameters(source: str) -> list[tuple[str, object]]:
+    """The keyword parameters an indicator class reads, with defaults.
+
+    These classes take ``**kwargs`` and pull values out with
+    ``kwargs.get("period", 14)``, so the signature says nothing and the body
+    says everything. Parsed rather than imported for the usual reason: these
+    modules pull in pandas.
+
+    Returned in source order, which is the order a person reading the class
+    would meet them — ``period`` before ``momentum_period`` — and is a better
+    order for a form than alphabetical.
+
+    A parameter with no literal default reports ``None``: the class requires it
+    and the editor should ask for it rather than invent a number.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    found: list[tuple[str, object]] = []
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        # Match `kwargs.get(...)` and nothing else.
+        if node.func.attr != "get" or not isinstance(node.func.value, ast.Name):
+            continue
+        if node.func.value.id != "kwargs" or not node.args:
+            continue
+
+        key = node.args[0]
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            continue
+        if key.value in seen:
+            continue
+
+        default: object = None
+        if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+            default = node.args[1].value
+        seen.add(key.value)
+        found.append((key.value, default))
+    return found
+
+
+def indicator_sources() -> dict[str, str]:
+    """Every indicator class name mapped to the source of its module.
+
+    :func:`known_indicators` answers "what may a strategy name"; this answers
+    "and what does each one accept", by handing the module text to
+    :func:`indicator_parameters`. Split so the catalogue endpoint reads each
+    file once instead of once per class.
+    """
+    directory = _indicator_directory()
+    if directory is None:
+        return {}
+
+    sources: dict[str, str] = {}
+    for path in sorted(directory.glob("*.py")):
+        if path.name in {"__init__.py", "base.py"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (OSError, SyntaxError):  # pragma: no cover - vendored source
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name != "Indicator":
+                sources[node.name] = text
+    return sources

@@ -6,21 +6,30 @@ Backed by the ``app.strategies`` registry through
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 
 from src.schemas.strategies import (
+    MAX_BODY_BYTES,
     MAX_SOURCE_BYTES,
     Strategy,
     StrategyCheckRequest,
+    StrategyDraftRequest,
+    StrategyDraftSubmission,
     StrategyCheckResult,
+    IndicatorCatalogue,
+    IndicatorDefinition,
+    IndicatorParameter,
     StrategyListResponse,
+    StrategySource,
     StrategySubmission,
     StrategySubmissionResult,
     StrategyTemplate,
 )
 from src.services import strategies as strategies_service
-from src.services.strategy_validation import StrategyValidationError
+from src.services.strategy_validation import ScaffoldEscape, StrategyValidationError
+from src.services.strategy_validation.scanning import indicator_parameters, indicator_sources
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
 
@@ -109,6 +118,68 @@ async def check_strategy(request: StrategyCheckRequest) -> StrategyCheckResult:
         )
 
     return strategies_service.check_strategy(request)
+
+
+@router.post("/check/draft", response_model=StrategyCheckResult)
+async def check_strategy_draft(request: StrategyDraftRequest) -> StrategyCheckResult:
+    """``POST /strategies/check`` for a fragment instead of a whole file.
+
+    The member wrote an ``OnData`` body and picked some indicators; the backend
+    assembles the file around them and checks that. Same verdict semantics as
+    the full-file check — incompatible source is still a 200, with the problems
+    in the body — and **every reported line is a line of the fragment**, which
+    is the entire reason this endpoint exists rather than the editor sending a
+    file it did not write.
+
+    The response carries ``assembledSource`` so the editor can show exactly
+    what will run. It must not rebuild that itself.
+    """
+    size = len(request.body.encode("utf-8"))
+    if size > MAX_BODY_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"The body is {size} bytes; the limit is {MAX_BODY_BYTES}.",
+        )
+
+    try:
+        return strategies_service.check_draft(request)
+    except ScaffoldEscape as exc:
+        # Not an issue to render beside a line: the fragment broke out of the
+        # method it was given, and there is nothing in it to point at.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+
+
+@router.post(
+    "/draft", response_model=StrategySubmissionResult, status_code=status.HTTP_201_CREATED
+)
+async def submit_strategy_draft(
+    submission: StrategyDraftSubmission,
+) -> StrategySubmissionResult:
+    """``POST /strategies`` for a fragment.
+
+    Assembles and then hands off to the same path an uploaded file takes: the
+    same scan, the same store, the same registry row, the same validation
+    backtest. Answers ``status="draft"`` immediately, like its sibling.
+    """
+    size = len(submission.body.encode("utf-8"))
+    if size > MAX_BODY_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=f"The body is {size} bytes; the limit is {MAX_BODY_BYTES}.",
+        )
+
+    try:
+        return await strategies_service.submit_draft(submission)
+    except ScaffoldEscape as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    except StrategyValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +283,95 @@ async def submit_strategy_file(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
+
+
+@router.get("/indicators", response_model=IndicatorCatalogue)
+async def list_indicators() -> IndicatorCatalogue:
+    """The indicator classes a strategy may register.
+
+    Read from ``engine/indicators`` by parsing it, never by importing — those
+    modules pull in pandas, and this answers a request. Sorted so the editor's
+    list is stable between calls.
+
+    Declared above ``/{key}`` for the same reason as ``/template``: a path
+    parameter would otherwise swallow it.
+    """
+    definitions = [
+        IndicatorDefinition(
+            name=name,
+            parameters=[
+                IndicatorParameter(
+                    key=key,
+                    default=default,
+                    kind="number" if isinstance(default, (int, float)) or default is None else "string",
+                )
+                for key, default in indicator_parameters(source)
+            ],
+        )
+        for name, source in sorted(indicator_sources().items())
+    ]
+    return IndicatorCatalogue(items=definitions, total=len(definitions))
+
+
+@router.get("/{key}/source", response_model=StrategySource)
+async def get_strategy_source(key: str) -> StrategySource:
+    """The Python a saved strategy was registered with, for the editor.
+
+    Uploads put their source in the store and, until this existed, nothing
+    could read it back: the editor always opened on the starter template, so
+    fixing a one-line mistake meant retyping the file. This answers with the
+    stored text, in the same ``{filename, source}`` shape as
+    ``GET /strategies/template`` so a client can load either into the same
+    editor.
+
+    404 when the key is unknown **or** when the row has no stored package —
+    the built-ins that ship with the engine were never uploaded, so there is
+    no source of theirs to hand out. The file is read as text and never
+    imported: a GET must not execute uploaded code.
+    """
+    source = await strategies_service.get_strategy_source(key)
+    if source is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No stored source for strategy {key!r}.",
+        )
+    return source
+
+
+@router.delete("/{key}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_strategy(key: str) -> Response:
+    """Remove a strategy from the registry, and its stored source with it.
+
+    Exposed for the failed and abandoned uploads a student accumulates while
+    getting a strategy to pass validation: without this they stay in the
+    drafts list forever. The service deletes the row first and empties the
+    store afterwards, so an interrupted delete leaves an orphaned object
+    rather than a row pointing at source that is gone.
+
+    **A strategy that has been backtested cannot be deleted.** Runs hold a
+    ``RESTRICT`` foreign key to it, deliberately: a run is a result that
+    happened, and orphaning its history to tidy up the catalogue is a product
+    decision, not something a delete button should do quietly. That case is a
+    409 naming the reason, not a 500 — which is what it was before, because the
+    IntegrityError surfaced at commit with nothing catching it.
+    """
+    try:
+        removed = await strategies_service.delete_strategy(key)
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"{key!r} has backtests recorded against it, so it cannot be "
+                "deleted. Their results would lose the strategy they name."
+            ),
+        ) from exc
+
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No strategy with id {key!r}.",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # Declared last on purpose: a path parameter would otherwise swallow
