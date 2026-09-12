@@ -488,8 +488,14 @@ def _assert_report(detail, tickers, minimum_days):
             assert isinstance(value, dict)
             continue
         assert value is None or (isinstance(value, (int, float)) and math.isfinite(value))
-    if "reportMetadata" in detail:
-        assert isinstance(detail["reportMetadata"], dict)
+    metadata = detail["reportMetadata"]
+    assert isinstance(metadata, dict)
+    execution = metadata["execution"]
+    assert isinstance(execution, dict)
+    fill_count = execution["fillCount"]
+    assert type(fill_count) is int and fill_count > 0, (
+        "This trading fixture must report a positive integer execution.fillCount"
+    )
     if "openPositions" in detail:
         assert isinstance(detail["openPositions"], list)
 

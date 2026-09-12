@@ -12,6 +12,7 @@ from engine.contracts import RunRequest
 from engine.core.backtest_engine import BacktestEngine
 from engine.core.cost_model import CostModel, CostModelParams
 from engine.core.executor import BacktestExecutor
+from engine.data import fmp
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 from src.services.trade_pairing import pair_fills
 
@@ -19,10 +20,17 @@ single = importlib.import_module("engine.run_single")
 
 
 @pytest.fixture(autouse=True)
-def no_database(monkeypatch):
+def no_external_data(monkeypatch):
+    # Local .env credentials must not turn a leaking unit test into a pass.
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    monkeypatch.setenv("FMP_API_KEY", "")
+    monkeypatch.setenv("MARKET_DATA_SOURCE", "fmp")
+
     def forbidden(*args, **kwargs):
-        pytest.fail("Cost unit tests must never contact a database")
+        pytest.fail("Cost unit tests must never access external FMP or database data")
     monkeypatch.setattr("psycopg2.connect", forbidden)
+    monkeypatch.setattr(fmp.FMPMarketData, "__init__", forbidden)
+    monkeypatch.setattr(fmp, "urlopen", forbidden)
 
 
 def trade(executor, side="BUY", weight=1.0, moment="2026-03-02 10:00"):
@@ -181,8 +189,17 @@ def test_browser_default_costs_reach_real_event_execution_and_artifacts(monkeypa
         "timestamp": pd.to_datetime(["2026-03-02 10:00", "2026-03-02 10:01"]).tz_localize("America/New_York"),
         "ticker": ["AAPL", "AAPL"], "close_price": [100.0, 100.0],
     })
-    monkeypatch.setattr("engine.core.runner.fetch_historical_data", lambda *args: prices.copy())
-    monkeypatch.setattr(single, "EngineDBAdapter", lambda: SimpleNamespace(close=lambda: None))
+    history_requests = []
+
+    def fixture_history(tickers, start, end, *, require_all=True):
+        assert tickers == ["AAPL"]
+        history_requests.append((start, end))
+        days = prices.timestamp.dt.date
+        return prices.loc[days.between(pd.Timestamp(start).date(), pd.Timestamp(end).date())].copy()
+
+    # Stub only the provider boundary: keep the real adapter's prefetch/cache
+    # and the runner's history lookup. A runner-only stub misses the prefetch.
+    monkeypatch.setattr(fmp, "fetch_daily_history", fixture_history)
     monkeypatch.setattr(CrossoverRmiStrategy, "__init__", BasePortfolio.__init__)
     monkeypatch.setattr(CrossoverRmiStrategy, "generate_signals_and_trade", lambda self, data, current_time: trade(self.executor, moment=current_time))
     def forbidden_model(*args, **kwargs):
@@ -190,6 +207,8 @@ def test_browser_default_costs_reach_real_event_execution_and_artifacts(monkeypa
     monkeypatch.setattr(CostModel, "apply_to_price", forbidden_model)
     result = single.run_single(run_request(tmp_path, slippage=5 / 10000, commission_per_share=0.005))
     assert result.status == "completed", result.error
+    assert len(history_requests) == 1, "The runner must reuse the adapter's prefetched fixture history"
+    assert result.report_metadata["marketData"] == {"source": "fmp", "resolution": "daily"}
     fill, = result.fills
     assert fill["shares"] == 9
     assert fill["fill_price"] == pytest.approx(100.05)
@@ -220,8 +239,9 @@ def test_browser_default_costs_reach_real_event_execution_and_artifacts(monkeypa
 ])
 def test_bad_or_unsupported_costs_fail_before_adapter_construction(monkeypatch, tmp_path, costs, message):
     def forbidden():
-        pytest.fail("Cost rejection must precede database construction")
+        pytest.fail("Cost rejection must precede market-data adapter construction")
     monkeypatch.setattr(single, "EngineDBAdapter", forbidden)
+    monkeypatch.setattr(single, "FMPDataAdapter", forbidden)
     result = single.run_single(run_request(tmp_path, **costs))
     assert result.status == "failed" and message in result.error
     assert result.fills == [] and result.equity_curve == []
