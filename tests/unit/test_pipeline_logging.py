@@ -70,10 +70,12 @@ def test_http_arrival_and_response_are_correlated_without_logging_secrets(caplog
     assert all("private-" not in message for message in messages)
 
 
-def test_http_rejection_is_visible_as_warning(caplog):
+def test_http_rejection_is_visible_as_warning(caplog, monkeypatch):
     from fastapi.testclient import TestClient
     from server import app
 
+    from src.api.dependencies.current_user import require_current_user
+    monkeypatch.setitem(app.dependency_overrides, require_current_user, lambda: "test-owner")
     with caplog.at_level(logging.INFO, logger="src.api.requests"):
         response = TestClient(app).post("/api/backtests", json={})
     assert response.status_code == 422

@@ -157,6 +157,7 @@ def test_uploaded_strategy_runs_in_spawned_worker_and_exports_persisted_results(
             "LOG_LEVEL": "WARNING",
             "API_PREFIX": "/api",
             "MARKET_TIMEZONE": "America/New_York",
+            "MARKET_DATA_SOURCE": "database",
             "STRATEGY_STORE_BACKEND": "local",
             "STRATEGY_STORE_S3_BUCKET": "",
             "AWS_EC2_METADATA_DISABLED": "true",
@@ -485,50 +486,22 @@ def _assert_identical_execution(first, repeated):
 
 def _assert_persisted(connection, detail, purpose):
     from psycopg2.extras import RealDictCursor
-
     with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-        cursor.execute("SELECT * FROM app.backtest_runs WHERE id = %s", (detail["id"],))
-        run = cursor.fetchone()
-        assert run["status"] == "completed" and run["purpose"] == purpose
-        assert run["strategy_key"] == detail["strategyId"]
-        assert run["started_at"] and run["finished_at"] and run["heartbeat_at"]
-        assert float(run["final_equity"]) == detail["finalEquity"]
-        cursor.execute(
-            "SELECT date, equity, benchmark FROM app.run_equity_points WHERE run_id = %s ORDER BY seq",
-            (detail["id"],),
-        )
-        stored_curve = [
-            {"date": row["date"].isoformat(), "equity": float(row["equity"]),
-             "benchmark": float(row["benchmark"]) if row["benchmark"] is not None else None}
-            for row in cursor.fetchall()
-        ]
-        assert stored_curve == detail["equityCurve"]
-        cursor.execute("SELECT * FROM app.run_metrics WHERE run_id = %s", (detail["id"],))
-        metrics = cursor.fetchone()
-        assert metrics is not None
-        # Preserve arbitrary additive metadata without naming its nested fields.
-        for key, value in detail.get("reportMetadata", {}).items():
-            assert metrics["extra"][key] == value
-        if "openPositions" in detail:
-            assert metrics["extra"].get("openPositions", []) == detail["openPositions"]
-        for key, value in detail["metrics"].items():
-            if key == "unavailable":
-                continue
-            snake_key = "".join("_" + ch.lower() if ch.isupper() else ch for ch in key)
-            stored = metrics[snake_key]
-            if stored is not None:
-                assert float(stored) == pytest.approx(value, abs=1e-9)
-        cursor.execute(
-            "SELECT * FROM app.run_trades WHERE run_id = %s ORDER BY seq", (detail["id"],)
-        )
-        trades = cursor.fetchall()
-        assert len(trades) == len(detail["trades"])
-        for stored, trade in zip(trades, detail["trades"]):
-            assert trade["id"] == f"{detail['id']}:{stored['seq']}"
-            for key in ("symbol", "side"):
-                assert stored[key] == trade[key]
-            for key in ("quantity", "pnl", "fees"):
-                assert float(stored[key]) == trade[key]
+        cursor.execute("SELECT * FROM app.backtest_reports WHERE id = %s", (detail["id"],))
+        row = cursor.fetchone()
+        assert row is not None
+        assert set(row) == {"id", "owner_id", "created_at", "strategy_key", "name", "version", "results"}
+        assert row["strategy_key"] == detail["strategyId"]
+        assert row["version"] == 1
+        expected = {key: value for key, value in detail.items()
+                    if key not in {"status", "progressPct", "errorMessage"}}
+        assert row["results"] == expected
+        assert row["results"]["reportMetadata"]["purpose"] == purpose
+        cursor.execute("SELECT count(*) AS count FROM app.backtest_runs WHERE id = %s", (detail["id"],))
+        assert cursor.fetchone()["count"] == 0
+        for table in ("run_equity_points", "run_metrics", "run_trades"):
+            cursor.execute(f"SELECT count(*) AS count FROM app.{table} WHERE run_id = %s", (detail["id"],))
+            assert cursor.fetchone()["count"] == 0
 
 
 def _assert_csv_rows(response, expected):
@@ -606,11 +579,21 @@ def _run_ci_proof():
     try:
         _seed_disposable_market_data(connection, tuple(DEFAULT_TICKERS))
         connection.autocommit = True
+        with connection.cursor() as cursor:
+            cursor.execute("""CREATE TABLE IF NOT EXISTS public.user_creds (
+                id UUID PRIMARY KEY, email TEXT NOT NULL, display_name TEXT)""")
+            cursor.execute("""INSERT INTO public.user_creds (id, email, display_name)
+                VALUES ('00000000-0000-0000-0000-000000000001', 'ci@example.invalid', 'CI')
+                ON CONFLICT (id) DO NOTHING""")
+            cursor.execute("""INSERT INTO public.user_creds (id, email, display_name)
+                VALUES ('00000000-0000-0000-0000-000000000002', 'other@example.invalid', 'Other')
+                ON CONFLICT (id) DO NOTHING""")
         from server import app
         from src.workers.job_manager import get_job_manager
 
         source = SOURCE_PATH.read_text(encoding="utf-8")
         with TestClient(app) as client:
+            client.headers["X-User-Id"] = "00000000-0000-0000-0000-000000000001"
             manager = get_job_manager()
             assert manager.running and manager.max_workers == 1
             assert manager._pool._mp_context.get_start_method() == "spawn"
@@ -670,6 +653,15 @@ def _run_ci_proof():
                 reruns.append(detail)
             _assert_identical_execution(*reruns)
             assert _get_json(client, f"/api/strategies/{key}")["runCount"] == 2
+            history = _get_json(client, f"/api/backtests?strategyId={key}")
+            assert history["total"] == 2
+            assert {item["id"] for item in history["items"]} == {run["id"] for run in reruns}
+            other = {"X-User-Id": "00000000-0000-0000-0000-000000000002"}
+            assert client.get(f"/api/backtests?strategyId={key}", headers=other).json()["total"] == 0
+            prefix = f"/api/backtests/{reruns[0]['id']}"
+            for suffix in ("", "/exports/report.json", f"/equity?period=max&endDate={days[-1]}"):
+                assert client.get(prefix + suffix, headers=other).status_code == 404
+            assert client.delete(prefix, headers=other).status_code == 404
 
             # Inspect only: the real pool must own a live child that differs
             # from this TestClient host. No artificial job is submitted.
@@ -680,7 +672,17 @@ def _run_ci_proof():
                 assert any((settings.artifact_dir / run["id"]).rglob("*.csv")), "Worker artifacts missing"
             # Drain completed futures before lifespan disposal closes API pools.
             manager.shutdown(wait=True)
-            print("CI_PIPELINE_PROOF_OK", flush=True)
+        # A fresh API lifespan has no prior in-memory jobs. History and exports
+        # must still come entirely from saved reports.
+        with TestClient(app) as client:
+            client.headers["X-User-Id"] = "00000000-0000-0000-0000-000000000001"
+            assert get_job_manager().submitted_run_ids() == []
+            assert _get_json(client, f"/api/backtests/{reruns[0]['id']}") == reruns[0]
+            _assert_exports(client, reruns[0])
+            assert client.delete(f"/api/backtests/{reruns[1]['id']}").status_code == 204
+            assert client.get(f"/api/backtests/{reruns[1]['id']}").status_code == 404
+            get_job_manager().shutdown(wait=True)
+        print("CI_PIPELINE_PROOF_OK", flush=True)
     finally:
         connection.close()
 

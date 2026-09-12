@@ -99,7 +99,8 @@ def to_schema(row: StrategyRow) -> Strategy:
         last_run_at=_iso(row.last_run_at),
         validation_state=strategy.status,
         validation_run_id=(
-            str(strategy.validation_run_id) if strategy.validation_run_id else None
+            str(getattr(strategy, "validation_job_id", None) or strategy.validation_run_id)
+            if (getattr(strategy, "validation_job_id", None) or strategy.validation_run_id) else None
         ),
     )
 
@@ -231,7 +232,7 @@ def _check_message(
     )
 
 
-async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionResult:
+async def submit_strategy(submission: StrategySubmission, *, owner_id: uuid.UUID | None = None) -> StrategySubmissionResult:
     """Store an upload and start the backtest that proves it works.
 
     Four steps, in this order for a reason. The source is scanned first, so a
@@ -290,7 +291,7 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
 
     logger.info("UPLOAD | Draft registered; strategy=%s; queueing validation", key)
     message, run_id = await _begin_validation(
-        key, submission.name, config, scan.class_name
+        key, submission.name, config, scan.class_name, owner_id=owner_id
     )
     return StrategySubmissionResult(
         id=key,
@@ -302,7 +303,7 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
 
 
 async def _begin_validation(
-    key: str, name: str, config: dict, class_name: str
+    key: str, name: str, config: dict, class_name: str, *, owner_id: uuid.UUID | None = None
 ) -> tuple[str, str | None]:
     """Queue the validation run; return the student-facing message and its id.
 
@@ -321,6 +322,7 @@ async def _begin_validation(
             strategy_key_value=key,
             strategy_name=name,
             tickers=list(config["TICKERS"]),
+            owner_id=owner_id,
         )
     except Exception as exc:
         logger.exception("Validation run for strategy %s could not be started", key)

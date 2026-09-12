@@ -1,256 +1,287 @@
-"""The process pool that runs backtests, and its lifespan.
+"""Transient job state. Only successful reports are written to PostgreSQL.
 
-An event-mode backtest is minutes of single-core, GIL-holding Python. Running
-it inline would freeze the API; running it in a thread would starve the event
-loop just as effectively. A ``ProcessPoolExecutor`` with a couple of workers
-gives queueing and a responsive API with no extra infrastructure — the price is
-that the run and the request that submitted it share nothing but a run id,
-which is why :mod:`src.workers.run_job` reads everything it needs from the
-database.
-
-**The pool is created in the lifespan and nowhere else.** On Windows a pool
-spawns its workers, and spawning re-imports the module tree; a pool built at
-import time would therefore be built again inside every worker it creates, and
-under ``uvicorn --reload`` that recurses into a fork bomb the first time a file
-changes. The lifespan runs exactly once per real server process, which is the
-only place it is safe.
-
-Shutdown does not wait for running backtests. Blocking a deploy or a Ctrl-C for
-the ten minutes a long run might have left would be worse than losing it, and
-losing it is recoverable: the reconciler marks abandoned rows ``failed`` on the
-next boot, with a message saying exactly that.
+A single API process owns the queue; unfinished jobs do not survive restart.
 """
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import multiprocessing
-import uuid
+import threading
+import time
 from collections.abc import AsyncIterator
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
+from sqlalchemy import case, exists, select, update
 from src.core.config import settings
-from src.workers.reconciler import orphaned_queued_run_ids, reconcile_interrupted_runs
-from src.workers.run_job import fail_running_run, run_job
+from src.db.engine import create_sync_engine
+from src.models import BacktestReport, Strategy
+from src.repositories import reports
+from src.schemas.backtests import BacktestDetail
+from src.workers.report_job import RunSpec, execute_report
 
 logger = logging.getLogger(__name__)
+TERMINAL_TTL_SECONDS = 3600
 
+@dataclass
+class _Job:
+    spec: RunSpec
+    state: object
+    lock: object = field(default_factory=threading.RLock)
+    future: object = None
+    finished_at: float | None = None
+    detail: BacktestDetail | None = None
+    saved: bool = False
 
 class JobManager:
-    """Owns the worker pool and the futures currently in it.
-
-    One instance per API process, created by the lifespan. Everything about it
-    is deliberately small: the pool is the queue, the run row is the state, and
-    this class is only the handle that submits and shuts down.
-    """
-
-    def __init__(self, max_workers: int | None = None) -> None:
+    def __init__(self, max_workers=None):
         self._max_workers = max(int(max_workers or settings.max_concurrent_runs), 1)
-        self._pool: ProcessPoolExecutor | None = None
-        self._futures: dict[str, Future] = {}
+        self._pool = self._ipc = None
+        self._jobs = {}
+        self._lock = threading.RLock()
+        self._closed = False
 
     @property
-    def max_workers(self) -> int:
+    def max_workers(self):
         return self._max_workers
 
     @property
-    def running(self) -> bool:
-        return self._pool is not None
+    def running(self):
+        return self._pool is not None and not self._closed
 
-    def start(self) -> None:
-        """Create the pool. Idempotent, so a double-started lifespan is fine."""
-        if self._pool is not None:
+    def start(self):
+        if self.running:
             return
-        self._pool = ProcessPoolExecutor(
-            max_workers=self._max_workers,
-            # Spawn explicitly rather than inheriting the platform default.
-            # Under fork (the Linux default) a worker would inherit the API's
-            # asyncpg pool and event loop — two processes reading the same
-            # sockets, which fails as data corruption rather than as an error.
-            # Spawn is also what Windows does, so behaviour matches everywhere.
-            mp_context=multiprocessing.get_context("spawn"),
-        )
-        logger.info("Job manager started with %d worker process(es)", self._max_workers)
+        context = multiprocessing.get_context("spawn")
+        self._ipc = context.Manager()
+        self._pool = ProcessPoolExecutor(max_workers=self._max_workers, mp_context=context)
+        self._closed = False
+        logger.info("Job manager started with %d transient workers", self._max_workers)
 
-    def submit(self, run_id: uuid.UUID | str) -> Future:
-        """Queue a run for execution and return its future.
+    def _prune(self):
+        now = time.monotonic()
+        for key, job in list(self._jobs.items()):
+            if job.finished_at is not None and now - job.finished_at > TERMINAL_TTL_SECONDS:
+                del self._jobs[key]
 
-        Raises ``RuntimeError`` if the pool is not running or has broken. The
-        caller is expected to catch that and mark the run ``failed`` — a run
-        row that exists but was never dispatched is the one failure mode the
-        student cannot see, because it looks exactly like a busy queue.
-        """
-        if self._pool is None:
-            raise RuntimeError(
-                "the job manager is not running; it is started by the "
-                "application lifespan"
-            )
+    def _lookup(self, key):
+        with self._lock:
+            self._prune()
+            return self._jobs.get(str(key))
 
-        key = str(run_id)
-        try:
-            future = self._pool.submit(run_job, key)
-        except Exception as exc:  # pool shut down, or broken by a dead worker
-            raise RuntimeError(f"could not queue run {key}: {exc}") from exc
+    def register(self, spec):
+        if spec.purpose == "user" and spec.owner_id is None:
+            raise ValueError("A user backtest requires an owner.")
+        with self._lock:
+            if not self.running:
+                raise RuntimeError("The job manager is not running.")
+            self._prune()
+            key = str(spec.id)
+            if key in self._jobs:
+                raise ValueError("This job ID is already registered.")
+            self._jobs[key] = _Job(spec, self._ipc.dict(
+                status="queued", progress_pct=0, cancel_requested=False, error_message=None))
 
-        self._futures[key] = future
-        future.add_done_callback(lambda done, key=key: self._on_done(key, done))
-        logger.info("Run %s queued (%d in flight)", key, len(self._futures))
-        return future
+    def submit(self, run_id):
+        job = self._lookup(run_id)
+        if job is None or not self.running:
+            raise RuntimeError("The job is unknown or its API process has restarted.")
+        with job.lock:
+            if job.future is not None:
+                return job.future
+            if job.finished_at is not None:
+                raise RuntimeError("This job has already finished.")
+            try:
+                job.future = self._pool.submit(execute_report, job.spec, job.state)
+            except Exception as exc:
+                self._fail(job, f"Could not queue the backtest: {exc}")
+                self._settle_validation(job, False)
+                raise RuntimeError(str(exc)) from exc
+            job.future.add_done_callback(lambda future: self._on_done(job, future))
+            return job.future
 
-    def submitted_run_ids(self) -> list[str]:
-        """Runs this process has submitted and not yet seen finish."""
-        return [key for key, future in self._futures.items() if not future.done()]
+    def get_detail(self, run_id, owner_id):
+        job = self._lookup(run_id)
+        if job is None or job.spec.owner_id != owner_id:
+            return None
+        with job.lock:
+            if job.saved:
+                return None
+            if job.detail is not None:
+                return job.detail.model_copy(deep=True)
+            state = dict(job.state)
+            return job.spec.empty_detail(state["status"], state["progress_pct"], state.get("error_message"))
 
-    def shutdown(self, wait: bool = False) -> None:
-        """Stop the pool. Does not wait for running backtests — see module doc."""
-        pool, self._pool = self._pool, None
-        self._futures.clear()
-        if pool is None:
-            return
-        pool.shutdown(wait=wait, cancel_futures=True)
-        logger.info("Job manager stopped")
+    def cancel(self, run_id, owner_id):
+        job = self._lookup(run_id)
+        if job is None or job.spec.owner_id != owner_id:
+            return "not_found"
+        with job.lock:
+            if job.saved:
+                return "saved"
+            if job.finished_at is not None:
+                with self._lock:
+                    self._jobs.pop(str(run_id), None)
+                return "deleted"
+            job.state["cancel_requested"] = True
+            if job.future is None:
+                self._fail(job, "Cancelled by user")
+            else:
+                job.future.cancel()
+            return "cancel_requested"
 
-    def _on_done(self, key: str, future: Future) -> None:
-        """Close the books on a job, including the ways it can end silently.
+    def cancel_internal(self, run_id):
+        job = self._lookup(run_id)
+        return self.cancel(run_id, job.spec.owner_id) if job else "not_found"
 
-        Nothing awaits these futures, so without this callback a worker that
-        died would leave its exception sitting inside one, unread. ``run_job``
-        marks its own failures, but it cannot mark the failure that kills it:
-        an OOM kill, a segfault in a native library, a pool broken by an
-        earlier death. Those end here, as an exception on the future and a run
-        row still saying ``running`` — which the frontend polls forever.
+    def submitted_run_ids(self):
+        with self._lock:
+            return [key for key, job in self._jobs.items() if job.finished_at is None]
 
-        Blocking on a database write is acceptable here because this runs on
-        the pool's own callback thread, not on the event loop, and only on the
-        path where a worker has already died.
-        """
-        self._futures.pop(key, None)
-        if future.cancelled():
-            # Cancelled before it was claimed, so the row is still ``queued``
-            # and the next boot's reconciler hands it back to a pool.
-            logger.info("Run %s was cancelled before it started", key)
-            return
-        error = future.exception()
-        if error is not None:
-            logger.error("Run %s worker raised: %r", key, error)
-            self._fail_dead_run(key, error)
-            return
-        logger.info("Run %s worker finished: %s", key, future.result())
+    def _fail(self, job, message):
+        message = str(message)[:2000]
+        job.detail = job.spec.empty_detail("failed", 0, message)
+        job.state.update(status="failed", error_message=message)
+        job.finished_at = time.monotonic()
+        logger.warning("Run %s failed; no report saved: %s", job.spec.id, message)
+
+    def _on_done(self, job, future):
+        # Cancel and final save use this same lock; callers enter from threads,
+        # never from the event loop, so a DB write cannot freeze HTTP handling.
+        with job.lock:
+            try:
+                if self._closed or job.state.get("cancel_requested") or future.cancelled():
+                    self._fail(job, "Interrupted by server shutdown" if self._closed else "Cancelled by user")
+                    self._settle_validation(job, False)
+                    return
+                outcome = future.result()
+                if "error" in outcome:
+                    self._fail(job, outcome["error"])
+                    self._settle_validation(job, False)
+                    return
+                detail = BacktestDetail.model_validate(outcome["report"])
+                if job.spec.owner_id is not None:
+                    engine = create_sync_engine()
+                    try:
+                        reports.save(engine, job.spec.owner_id, detail)
+                    finally:
+                        engine.dispose()
+                    job.saved = True
+                else:
+                    # Internal validation without a user has no personal report.
+                    job.detail = detail
+                job.state.update(status="completed", progress_pct=100)
+                job.finished_at = time.monotonic()
+                self._settle_validation(job, True)
+                logger.info("COMPLETED | run=%s report_saved=%s", job.spec.id, job.saved)
+            except Exception as exc:
+                if not job.saved:
+                    self._fail(job, f"Backtest or report persistence failed: {type(exc).__name__}: {exc}")
+                    self._settle_validation(job, False)
+                else:
+                    logger.exception("Report %s saved, but final notification failed", job.spec.id)
 
     @staticmethod
-    def _fail_dead_run(key: str, error: BaseException) -> None:
-        """Give the run of a dead worker a terminal state and a reason."""
-        message = f"The worker process died: {type(error).__name__}: {error}"
+    def _settle_validation(job, passed):
+        if job.spec.purpose != "validation":
+            return
+        engine = create_sync_engine()
         try:
-            if fail_running_run(key, message):
-                logger.warning("Run %s marked failed after its worker died", key)
+            with engine.begin() as connection:
+                connection.execute(update(Strategy).where(
+                    Strategy.key == job.spec.strategy_key, Strategy.kind == "user",
+                ).values(status="active" if passed else "failed_validation", enabled=passed,
+                         validation_job_id=job.spec.id))
         except Exception:
-            # Last resort only: the startup reconciler picks up whatever is
-            # still ``running`` the next time the server boots.
-            logger.exception("Run %s could not be marked failed after its worker died", key)
+            logger.exception("Could not record validation outcome for %s", job.spec.strategy_key)
+        finally:
+            engine.dispose()
 
+    def shutdown(self, wait=False):
+        self._closed = True
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            with job.lock:
+                if job.finished_at is None:
+                    job.state["cancel_requested"] = True
+                    if job.future is None:
+                        self._fail(job, "Interrupted by server shutdown")
+                        self._settle_validation(job, False)
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=wait, cancel_futures=True)
+        # IPC must outlive running callbacks, including their final state write.
+        if wait:
+            self._close_ipc()
+        else:
+            threading.Thread(target=self._close_when_finished, args=(jobs,), daemon=True).start()
 
-_manager: JobManager | None = None
+    def _close_when_finished(self, jobs):
+        while any(job.finished_at is None for job in jobs):
+            time.sleep(0.1)
+        self._close_ipc()
 
+    def _close_ipc(self):
+        with self._lock:
+            ipc, self._ipc = self._ipc, None
+        if ipc is not None:
+            ipc.shutdown()
 
-def get_job_manager() -> JobManager:
-    """The process-wide job manager.
+_manager = None
 
-    Raises rather than creating one on demand: a manager built outside the
-    lifespan is a pool built at an unpredictable moment, which is the failure
-    this whole module is arranged to prevent.
-    """
+def get_job_manager():
     if _manager is None:
-        raise RuntimeError(
-            "the job manager has not been started; the application lifespan "
-            "(src.workers.job_manager.job_manager_lifespan) does that"
-        )
+        raise RuntimeError("The job manager has not been started.")
     return _manager
 
-
-def start_job_manager(max_workers: int | None = None) -> JobManager:
-    """Create and start the singleton. Returns the existing one if started."""
+def start_job_manager(max_workers=None):
     global _manager
     if _manager is None:
-        _manager = JobManager(max_workers=max_workers)
+        _manager = JobManager(max_workers)
     _manager.start()
     return _manager
 
-
-def stop_job_manager(wait: bool = False) -> None:
-    """Shut the singleton down and forget it."""
+def stop_job_manager(wait=False):
     global _manager
-    if _manager is not None:
-        _manager.shutdown(wait=wait)
-    _manager = None
-
+    manager, _manager = _manager, None
+    if manager is not None:
+        manager.shutdown(wait=wait)
 
 @asynccontextmanager
-async def job_manager_lifespan(_app: object = None) -> AsyncIterator[None]:
-    """FastAPI lifespan: reconcile, start the pool, requeue, stop on the way out.
-
-    The order matters. Reconciliation must finish before the pool accepts
-    anything, or it would mark the runs it is about to start as interrupted.
-
-    A database that is unreachable at boot is logged, not raised: ``/live/*``
-    needs no database at all, and refusing to start the app would take those
-    routes down too. Submission of new runs still works — the worker connects
-    on its own — and stranded rows are reconciled at the next boot.
-    """
+async def job_manager_lifespan(_app=None) -> AsyncIterator[None]:
     try:
-        await asyncio.to_thread(reconcile_interrupted_runs)
-    except Exception as exc:
-        logger.warning(
-            "Could not reconcile interrupted runs at startup (%s: %s); "
-            "any run still marked running will be corrected on the next boot.",
-            type(exc).__name__,
-            exc,
-        )
-
-    manager = start_job_manager()
-    try:
-        await asyncio.to_thread(_requeue_orphans, manager)
-    except Exception as exc:
-        logger.warning(
-            "Could not requeue orphaned runs at startup (%s: %s)",
-            type(exc).__name__,
-            exc,
-        )
-
+        await asyncio.to_thread(_recover_validation_outcomes)
+    except Exception:
+        logger.exception("Could not recover interrupted strategy validation metadata")
+    start_job_manager()
     try:
         yield
     finally:
         stop_job_manager()
 
 
-def _requeue_orphans(manager: JobManager) -> None:
-    """Resubmit runs the previous process accepted but never got to start."""
-    for run_id in orphaned_queued_run_ids():
-        try:
-            manager.submit(run_id)
-        except RuntimeError as exc:
-            logger.warning("Could not requeue orphaned run %s: %s", run_id, exc)
-            return
-
+def _recover_validation_outcomes():
+    """Recover strategy metadata only; never create or restart a run/report."""
+    engine = create_sync_engine()
+    try:
+        saved = exists(select(BacktestReport.id).where(BacktestReport.id == Strategy.validation_job_id))
+        with engine.begin() as connection:
+            connection.execute(update(Strategy).where(
+                Strategy.kind == "user", Strategy.status == "validating",
+                Strategy.validation_job_id.is_not(None),
+            ).values(status=case((saved, "active"), else_="failed_validation"), enabled=saved))
+    finally:
+        engine.dispose()
 
 @asynccontextmanager
-async def application_lifespan(app: object = None) -> AsyncIterator[None]:
-    """Everything the server needs at boot: schema, then workers.
-
-    ``server.py`` should use this in place of ``database_lifespan`` — the
-    schema has to exist before the reconciler updates rows in it, and the pool
-    has to stop before the app's own shutdown completes.
-    """
+async def application_lifespan(app=None) -> AsyncIterator[None]:
     from src.db.init import database_lifespan
-
     from src.core.logging_config import configure_logging
-
     configure_logging(settings.log_level, non_blocking=True)
-    logger.info("STARTUP | API starting; log_level=%s strategy_store=%s", settings.log_level, settings.strategy_store_backend)
     async with database_lifespan(app):
         async with job_manager_lifespan(app):
-            logger.info("READY | Database initialized; workers ready; API accepting requests")
+            logger.info("READY | Completed-report storage and transient workers ready")
             yield
-    logger.info("SHUTDOWN | API and worker pool stopped")

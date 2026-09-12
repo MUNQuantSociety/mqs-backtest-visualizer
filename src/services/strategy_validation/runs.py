@@ -1,16 +1,10 @@
-"""Proving an upload works by running it.
-
-A validation run is not a separate code path. It is a row in
-``app.backtest_runs`` with ``purpose='validation'``, submitted to the same job
-manager and executed by the same worker. The student can open it like any other
-run, and the worker flips the strategy to ``active`` when it passes. Anything
-else would mean two run pipelines and one of them breaking silently.
-"""
+"""Validate strategies with transient jobs; persist reports only on success."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import date, timedelta
 
 from engine import ENGINE_VERSION
@@ -19,9 +13,7 @@ from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
 from src.repositories import market_data as market_data_repo
-from src.repositories import runs as runs_repo
 from src.repositories import strategies as strategies_repo
-from src.repositories.runs import TERMINAL_STATUSES
 from src.schemas.backtests import BacktestStatus, BacktestSummary
 from src.services.backtests import (
     MODE_KEY,
@@ -78,7 +70,7 @@ async def validation_window(tickers: list[str]) -> tuple[date, date]:
 
 
 async def start_validation(
-    *, strategy_key_value: str, strategy_name: str, tickers: list[str]
+    *, strategy_key_value: str, strategy_name: str, tickers: list[str], owner_id: uuid.UUID | None = None
 ) -> BacktestSummary:
     """Queue the backtest that proves an upload works.
 
@@ -105,6 +97,7 @@ async def start_validation(
         # approximation would prove nothing about the code the student wrote.
         params={MODE_KEY: "event"},
         purpose="validation",
+        owner_id=owner_id,
     )
 
     dispatched = await _dispatch(summary)
@@ -129,9 +122,8 @@ def _schedule_timeout(run_id: str) -> None:
 
     Honest about what this is: a timer in the API process that sets the same
     ``cancel_requested`` flag a student's Cancel button sets. If the API
-    restarts, the timer is gone and the run keeps going until the worker
-    finishes with it. The startup reconciler cleans up after that. It
-    is not a resource limit, and it cannot stop code that never returns to the
+    restarts, unfinished jobs are lost and strategy validation metadata is
+    reconciled at startup. This is not a resource limit and cannot stop code that never returns to the
     engine's loop; only process isolation can do either.
     """
     timeout = float(settings.validation_timeout_seconds)
@@ -155,15 +147,10 @@ async def _cancel_when_overdue(run_id: str, timeout: float) -> None:
     """Sleep out the timeout, then ask an unfinished validation run to stop."""
     try:
         await asyncio.sleep(timeout)
-        parsed = runs_repo.parse_run_id(run_id)
-        if parsed is None:  # pragma: no cover - the id came from a created row
+        from src.workers.job_manager import get_job_manager
+        outcome = await asyncio.to_thread(get_job_manager().cancel_internal, run_id)
+        if outcome != "cancel_requested":
             return
-
-        async with session_scope() as session:
-            row = await runs_repo.get_run(session, parsed)
-            if row is None or row.run.status in TERMINAL_STATUSES:
-                return
-            await runs_repo.request_cancel(session, parsed)
 
         logger.warning(
             "Validation run %s passed its %.0fs limit; cancellation requested",

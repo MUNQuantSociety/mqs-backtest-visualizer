@@ -165,7 +165,7 @@ def test_submission_stores_off_event_loop_before_registry_and_validation(isolate
         yield isolated_service.session
         calls.append("registry committed")
 
-    async def begin(*args):
+    async def begin(*args, **kwargs):
         calls.append("validation")
         return "Validation queued", None
 
