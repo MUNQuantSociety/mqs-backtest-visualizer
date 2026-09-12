@@ -135,10 +135,22 @@ render references to the provisioned integrations resources. A bucket override
 sets `STRATEGY_STORE_BACKEND=s3`, bucket and prefix; a task-role override sets
 `taskRoleArn`. Conflicting inherited S3 secret references are rejected.
 
-Before any image build or task registration, the workflow requires an active,
+Before any normal image build or task registration, the workflow requires an active,
 stable ECS rolling service with positive desired count and circuit-breaker
 rollback enabled. It checks an essential API container on port 8000,
 Fargate/awsvpc, and Linux/X86_64 compatibility.
+
+For the first deployment only, manually run `deploy` on `main` with the boolean
+`bootstrap` input selected (default: false). It accepts only a completed, stopped
+service with zero desired, running, and pending tasks, a configured API health
+check, and all the same CI, credentials, TLS, and platform checks. The workflow
+rechecks the baseline after building, then starts one task from the commit image
+digest. During bootstrap it keeps circuit-breaker detection enabled but temporarily
+disables automatic rollback, so the old scaffold image cannot start. It restores
+the full original deployment configuration after the intended task is healthy,
+then verifies the revision, digest, and health again. A failed bootstrap restores
+the original revision at zero tasks only while it still owns the deployment;
+concurrent changes require operator review. Ordinary pushes never bootstrap.
 
 The inherited API container must supply `HOST`, `DB`, `USER`, and `PASSWORD`
 through `POSTGRES_*` or `MARKET_DATA_*` environment entries or nonempty ECS
