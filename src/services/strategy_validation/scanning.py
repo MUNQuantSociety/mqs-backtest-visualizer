@@ -421,7 +421,7 @@ def known_indicators() -> frozenset[str]:
 
 
 def _indicator_issues(strategy: ast.ClassDef) -> list[CompatibilityIssue]:
-    """Names passed to AddIndicator or RegisterIndicatorSet that do not exist.
+    """Indicator names the engine does not have, wherever the class names them.
 
     Only string literals are checked. A name built at run time cannot be read
     here, and guessing at one would refuse working code.
@@ -430,22 +430,63 @@ def _indicator_issues(strategy: ast.ClassDef) -> list[CompatibilityIssue]:
     if not available:  # pragma: no cover - only if the engine is missing
         return []
 
-    issues: list[CompatibilityIssue] = []
+    name_nodes = _declared_indicator_nodes(strategy)
     for node in ast.walk(strategy):
-        for name_node in _indicator_name_nodes(node):
-            name = name_node.value
-            if name in available:
-                continue
-            module = _camel_to_snake(name)
-            issues.append(
-                CompatibilityIssue(
-                    name_node.lineno,
-                    f"there is no indicator called {name!r}. The engine looks for "
-                    f"engine/indicators/{module}.py and finds nothing. Available: "
-                    f"{', '.join(sorted(available))}.",
-                )
+        name_nodes.extend(_indicator_name_nodes(node))
+
+    issues: list[CompatibilityIssue] = []
+    for name_node in name_nodes:
+        name = name_node.value
+        if name in available:
+            continue
+        module = _camel_to_snake(name)
+        issues.append(
+            CompatibilityIssue(
+                name_node.lineno,
+                f"there is no indicator called {name!r}. The engine looks for "
+                f"engine/indicators/{module}.py and finds nothing. Available: "
+                f"{', '.join(sorted(available))}.",
             )
+        )
     return issues
+
+
+# The class attribute BasePortfolio reads to build indicators without the
+# strategy writing an __init__. Checked alongside the two call forms, because a
+# typo in a declaration fails exactly like a typo in a call — at construction,
+# with a ModuleNotFoundError — and this check exists to catch it in the editor.
+DECLARED_INDICATORS_ATTRIBUTE = "INDICATORS"
+
+
+def _declared_indicator_nodes(strategy: ast.ClassDef) -> list[ast.Constant]:
+    """Indicator names from ``INDICATORS = {...}`` in the class body.
+
+    Read from the body rather than from ``ast.walk``, so an ``INDICATORS`` dict
+    built inside a method of some other object is not mistaken for the
+    declaration the engine reads.
+    """
+    found: list[ast.Constant] = []
+    for statement in strategy.body:
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+            if isinstance(statement, ast.AnnAssign)
+            else []
+        )
+        names = {
+            target.id for target in targets if isinstance(target, ast.Name)
+        }
+        if DECLARED_INDICATORS_ATTRIBUTE not in names:
+            continue
+        if not isinstance(statement.value, ast.Dict):
+            continue
+        for value in statement.value.values:
+            if isinstance(value, ast.Tuple) and value.elts:
+                head = value.elts[0]
+                if _is_str(head):
+                    found.append(head)
+    return found
 
 
 def _indicator_name_nodes(node: ast.AST) -> list[ast.Constant]:

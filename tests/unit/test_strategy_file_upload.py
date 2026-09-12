@@ -46,7 +46,10 @@ def test_a_file_and_the_same_text_as_json_get_the_same_verdict(client) -> None:
 
 
 def test_an_incompatible_file_is_still_a_200_with_the_problems_listed(client) -> None:
-    source = STARTER_SOURCE.replace("import logging", "import os\nimport logging")
+    # Prepended rather than swapped for one of the starter's own imports: the
+    # starter is free to change which modules it needs, and this test is about
+    # the banned one it never needs.
+    source = "import os\n" + STARTER_SOURCE
     response = client.post(
         "/api/strategies/upload/check", files=_file("bad.py", source.encode())
     )
@@ -58,6 +61,20 @@ def test_an_incompatible_file_is_still_a_200_with_the_problems_listed(client) ->
     # The banned import is named with its line, not flattened into one string.
     assert any("os" in issue["message"] for issue in body["issues"])
     assert all(issue["line"] >= 1 for issue in body["issues"])
+
+
+def test_a_misspelled_indicator_in_the_declaration_is_reported(client) -> None:
+    # Declared in INDICATORS rather than passed to RegisterIndicatorSet. Both
+    # fail the same way at construction, so both are read here.
+    source = STARTER_SOURCE.replace("SimpleMovingAverage", "SimpleMovingAverge", 1)
+    response = client.post(
+        "/api/strategies/check", json={"source": source, "filename": "strategy.py"}
+    )
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["ok"] is False
+    assert any("SimpleMovingAverge" in issue["message"] for issue in body["issues"])
 
 
 def test_a_non_python_file_is_refused_by_extension(client) -> None:

@@ -1,5 +1,6 @@
 """Real strategy decisions with daily history, including the all-cash regression."""
 
+import copy
 import json
 import logging
 from types import SimpleNamespace
@@ -20,7 +21,11 @@ def decide(momentum, *, position=0, observations=42, ready=True, exists=True, re
     calls = []
     strategy = VolMomentum.__new__(VolMomentum)
     strategy.logger = logging.getLogger("vol-momentum-regression")
-    strategy.strategy_diagnostics = strategy._new_diagnostics()
+    # The same deep copy BasePortfolio._init_declared_state makes, so a test
+    # that bypasses __init__ still starts from fresh counters.
+    strategy.strategy_diagnostics = copy.deepcopy(
+        VolMomentum.STATE["strategy_diagnostics"]
+    )
     strategy.tickers = ["AAPL"]
     strategy.roc = {"AAPL": SimpleNamespace(IsReady=ready, Current=momentum)}
     context = SimpleNamespace(

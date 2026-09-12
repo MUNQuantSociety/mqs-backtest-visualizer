@@ -1,5 +1,6 @@
 # engine/strategies/portfolio_BASE/strategy.py  (vendored from MQSMaster)
 
+import copy
 import importlib
 import logging
 import re
@@ -24,7 +25,33 @@ class BasePortfolio(ABC):
     """
     Base class for all portfolio strategies, featuring a dynamic, stateful
     indicator manager and the StrategyContext API.
+
+    A strategy declares what it needs with the three class attributes below and
+    implements :meth:`OnData`. Nothing else is required: this ``__init__`` reads
+    the declarations and does the wiring, so a strategy file holds trading logic
+    and nothing about how the framework is plumbed together. Writing an explicit
+    ``__init__`` that calls ``super().__init__(...)`` and then
+    ``RegisterIndicatorSet``/``AddIndicator`` by hand still works exactly as
+    before — the declarative path is an addition, not a replacement, and every
+    strategy already uploaded keeps running unchanged.
     """
+
+    # Indicators to build before the first bar, as
+    # ``"attribute_name": ("IndicatorClassName", {kwargs})`` — one instance per
+    # ticker in the universe, reachable as ``self.attribute_name[ticker]``.
+    # A third element names a single ticker instead, and then the attribute is
+    # the indicator itself: ``"vix_ema": ("ExponentialMovingAverage",
+    # {"period": 10}, "^VIX")`` -> ``self.vix_ema.Current``.
+    INDICATORS: dict[str, tuple] = {}
+
+    # Instance state, as ``"attribute_name": default``. Each default is deep
+    # copied per instance, so a mutable one ({} or []) is never shared between
+    # two strategies the way a bare class attribute would be.
+    STATE: dict[str, Any] = {}
+
+    # Instance state that is per ticker, as ``"attribute_name": default``.
+    # Each becomes ``{ticker: deepcopy(default)}`` over the whole universe.
+    PER_TICKER_STATE: dict[str, Any] = {}
 
     def __init__(
         self,
@@ -46,6 +73,14 @@ class BasePortfolio(ABC):
         self.backtest_start_date = backtest_start_date
         self._last_processed_timestamp: datetime | None = None
 
+        # The declared default is None, so a caller that omits the config gets
+        # the documented defaults below instead of an AttributeError on .get.
+        config_dict = config_dict or {}
+
+        # Every key config.json can carry is assigned here. The whole document
+        # is kept as well, because PortfolioConfig allows extra keys: a
+        # strategy-specific block has nowhere else to be read from.
+        self.config: dict[str, Any] = dict(config_dict)
         self.portfolio_id: str = config_dict.get("PORTFOLIO_ID", "0")
         self.tickers: list[str] = config_dict.get("TICKERS", [])
         self.poll_interval: int = config_dict.get("INTERVAL", 60)
@@ -54,6 +89,19 @@ class BasePortfolio(ABC):
         self.data_feeds: list[str] = config_dict.get(
             "DATA_FEEDS",
             ["MARKET_DATA", "POSITIONS", "CASH_EQUITY", "PORT_NOTIONAL"]
+        )
+        # Listing venue for the universe. Carried for strategies and reporting
+        # that ask; the vendored engine's data path is venue-agnostic.
+        self.exchange: str | None = config_dict.get("EXCH")
+        # The OMS block is read so it stops being a config key that silently
+        # goes nowhere, but it is INERT in this application: the OMS belongs to
+        # the trading system and is not vendored, so BacktestEngine always
+        # passes order_manager=None (see backtest_engine.py, "upstream built a
+        # per-portfolio OMS here"). Present for inspection, not for execution.
+        self.oms_config: dict[str, Any] | None = config_dict.get("OMS")
+        # Overridable per portfolio, as DEFAULT_INITIAL_CAPITAL claims to be.
+        self.initial_capital: float = float(
+            config_dict.get("INITIAL_CAPITAL", self.DEFAULT_INITIAL_CAPITAL)
         )
 
         self.logger: logging.Logger = logging.getLogger(
@@ -65,16 +113,72 @@ class BasePortfolio(ABC):
             len(self.tickers)
         )
 
+        # What StrategyContext sees. The lowercase keys are the ones
+        # order_interface reads by name; "exchange", "oms" and the raw "config"
+        # are carried so a strategy reaching the context is not cut off from
+        # config keys its own instance can already see.
         self.portfolio_config_dict: dict[str, Any] = {
             "id": self.portfolio_id,
             "tickers": self.tickers,
             "weights": self.portfolio_weights,
             "poll_interval": self.poll_interval,
             "lookback_days": self.lookback_days,
+            "exchange": self.exchange,
+            "oms": self.oms_config,
+            "config": self.config,
         }
 
         # --- Indicator Management ---
         self._indicators: list[Indicator] = []
+
+        # --- Declared surface ---
+        # State first: a strategy's OnData may touch it on the very first bar,
+        # and building an indicator is the expensive step that can fail.
+        self._init_declared_state()
+        self._register_declared_indicators()
+
+    def _init_declared_state(self) -> None:
+        """Assign STATE and PER_TICKER_STATE onto this instance.
+
+        Deep copied rather than referenced: two runs of the same strategy in one
+        process would otherwise accumulate into the same dict on the class.
+        """
+        for attr_name, default in self.STATE.items():
+            setattr(self, attr_name, copy.deepcopy(default))
+
+        for attr_name, default in self.PER_TICKER_STATE.items():
+            setattr(
+                self,
+                attr_name,
+                {ticker: copy.deepcopy(default) for ticker in self.tickers},
+            )
+
+    def _count_diagnostic(self, ticker_diagnostics: dict[str, Any], key: str) -> None:
+        """Increment one counter on both the portfolio and one ticker.
+
+        ``run_single`` reads whatever ``strategy_diagnostics`` a strategy leaves
+        behind and puts it in the report, so which counters exist is the
+        strategy's business; keeping the two levels in step is the framework's.
+        """
+        self.strategy_diagnostics[key] += 1
+        ticker_diagnostics[key] += 1
+
+    def _register_declared_indicators(self) -> None:
+        """Build every indicator named in INDICATORS, in declaration order.
+
+        Order is the class's, because a strategy that declares a whole-universe
+        set and then one single-ticker indicator warms them in that sequence.
+        """
+        for attr_name, definition in self.INDICATORS.items():
+            class_name, kwargs, *single_ticker = definition
+            if single_ticker:
+                setattr(
+                    self,
+                    attr_name,
+                    self.AddIndicator(class_name, single_ticker[0], **kwargs),
+                )
+            else:
+                self.RegisterIndicatorSet({attr_name: (class_name, kwargs)})
 
     def _build_indicator_update_payload(self,
         indicator: Indicator,
@@ -482,7 +586,7 @@ class BasePortfolio(ABC):
         import pytz
 
         timezone = pytz.timezone("America/New_York")
-        initial_capital = self.DEFAULT_INITIAL_CAPITAL
+        initial_capital = self.initial_capital
         timestamp = datetime.now(timezone)
         date_part = timestamp.date()
 

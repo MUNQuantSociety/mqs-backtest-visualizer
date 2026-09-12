@@ -89,6 +89,53 @@ class StrategyContext:
             raise ValueError("Target weight must be finite")
         self._trade(ticker, "BUY", confidence, target_weight=weight)
 
+    def execute(
+        self,
+        ticker: str,
+        side: str,
+        confidence: float = 1.0,
+        *,
+        ticker_weight: float,
+    ):
+        """Trade under the executor's weight model, sizing from ``ticker_weight``.
+
+        A different model from :meth:`buy`/:meth:`sell`, not a spelling of them.
+        Those name the exposure to *end at* (``target_weight``), work in shares,
+        and cannot sell through flat into a short. This one names the weight to
+        size *from* and keeps the executor's original signal semantics, in which
+        a SELL targets the negative of that weight. Deliberately public: a
+        strategy that needs this model was reaching into ``_executor`` and
+        ``_positions_df`` to get it, which is a worse thing to depend on than a
+        documented method.
+
+        ``ticker_weight`` is required and never inferred. The equal-weight
+        fallback inside the executor divides by the executor's whole universe,
+        which is wrong for any strategy holding a ticker it never trades.
+        """
+        asset_data = self.Market[ticker]
+        if not asset_data.Exists or asset_data.Close is None or asset_data.Close <= 0:
+            logging.warning(
+                "Skip trade: no valid market data for %s at %s (Exists=%s, Close=%s)",
+                ticker,
+                self.time,
+                asset_data.Exists,
+                asset_data.Close,
+            )
+            return
+
+        self._executor.execute_trade(
+            portfolio_id=self._portfolio_config["id"],
+            ticker=ticker,
+            signal_type=side,
+            confidence=confidence,
+            arrival_price=asset_data.Close,
+            cash=self.Portfolio.cash,
+            positions=self._positions_df,
+            port_notional=self.Portfolio.total_value,
+            ticker_weight=ticker_weight,
+            timestamp=self.time,
+        )
+
     def _allocation_weight(self, ticker: str) -> float:
         # BasePortfolio passes the existing WEIGHTS/TICKERS config under these
         # lowercase keys. Absent weights mean equal allocation; explicit zero
