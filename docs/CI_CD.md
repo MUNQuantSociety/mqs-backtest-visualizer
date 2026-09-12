@@ -144,13 +144,18 @@ For the first deployment only, manually run `deploy` on `main` with the boolean
 `bootstrap` input selected (default: false). It accepts only a completed, stopped
 service with zero desired, running, and pending tasks, a configured API health
 check, and all the same CI, credentials, TLS, and platform checks. The workflow
-rechecks the baseline after building, then starts one task from the commit image
-digest. During bootstrap it keeps circuit-breaker detection enabled but temporarily
+rechecks the baseline after building, then stages the commit image's revision at
+zero tasks. It waits for that revision to be the only completed deployment, checks
+the zero counts and configuration again, and only then scales to one task with a
+desired-count-only update. Changing the revision and scaling together can start
+the old deployment during ECS scheduling. During bootstrap it keeps circuit-breaker detection enabled but temporarily
 disables automatic rollback, so the old scaffold image cannot start. It restores
 the full original deployment configuration after the intended task is healthy,
 then verifies the revision, digest, and health again. A failed bootstrap restores
-the original revision at zero tasks only while it still owns the deployment;
+the original revision at zero tasks only while it still owns the staged or running deployment;
 concurrent changes require operator review. Ordinary pushes never bootstrap.
+The ECS waiter verifies counts only, so bounded checks also wait for explicit
+rollout completion and task/container health without accepting identity or configuration drift.
 
 The inherited API container must supply `HOST`, `DB`, `USER`, and `PASSWORD`
 through `POSTGRES_*` or `MARKET_DATA_*` environment entries or nonempty ECS
