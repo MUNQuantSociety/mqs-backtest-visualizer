@@ -312,7 +312,9 @@ jobs:
           update_args = ["ecs", "update-service", "--cluster", os.environ["ECS_CLUSTER"],
                          "--service", os.environ["ECS_SERVICE"], "--task-definition", revision]
           if bootstrap:
-              update_args.extend(["--desired-count", "1"])
+              # Stage the new revision while stopped. Scaling in this same call
+              # can cause ECS to start tasks from the previous deployment too.
+              update_args.extend(["--desired-count", "0"])
               # Never roll the previous zero-task scaffold image back at count one.
               temporary_configuration = json.loads(json.dumps(original_configuration))
               temporary_configuration["deploymentCircuitBreaker"]["rollback"] = False
@@ -326,8 +328,63 @@ jobs:
               raise SystemExit("ECS did not accept the intended revision as PRIMARY")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print(f"deployment={primary[0]['id']}", file=output)
-          if updated["service"].get("desiredCount") != (1 if bootstrap else baseline_desired):
+          if updated["service"].get("desiredCount") != baseline_desired:
               raise SystemExit("ECS did not retain the intended desired task count")
+          if bootstrap:
+              import time
+
+              deployment = primary[0]["id"]
+              cluster, service_name = os.environ["ECS_CLUSTER"], os.environ["ECS_SERVICE"]
+              subprocess.run(["aws", "ecs", "wait", "services-stable", "--cluster", cluster,
+                              "--services", service_name], check=True)
+              last_stage = {}
+
+              def staged_revision_is_complete():
+                  response = aws("ecs", "describe-services", "--cluster", cluster, "--services", service_name)
+                  services = response.get("services", [])
+                  if response.get("failures") or len(services) != 1:
+                      raise SystemExit("Cannot identify the staged bootstrap service")
+                  current = services[0]
+                  deployments = current.get("deployments", [])
+                  primary = [d for d in deployments if d.get("status") == "PRIMARY"]
+                  last_stage.update(desired=current.get("desiredCount"), running=current.get("runningCount"),
+                                    pending=current.get("pendingCount"), deployment_count=len(deployments),
+                                    rollout=primary[0].get("rolloutState") if len(primary) == 1 else None,
+                                    revision_matches=current.get("taskDefinition") == revision,
+                                    deployment_matches=len(primary) == 1 and primary[0].get("id") == deployment,
+                                    configuration_matches=current.get("deploymentConfiguration") == temporary_configuration)
+                  if not (current.get("status") == "ACTIVE" and current.get("taskDefinition") == revision
+                          and all(current.get(key) == 0 for key in ("desiredCount", "runningCount", "pendingCount"))
+                          and current.get("deploymentConfiguration") == temporary_configuration
+                          and len(primary) == 1 and primary[0].get("id") == deployment
+                          and primary[0].get("taskDefinition") == revision
+                          and primary[0].get("rolloutState") in {"IN_PROGRESS", "COMPLETED"}
+                          and all(d.get("id") in {deployment, os.environ["BASELINE_DEPLOYMENT"]}
+                                  and all(d.get(key) == 0 for key in ("desiredCount", "runningCount", "pendingCount"))
+                                  for d in deployments)):
+                      print(json.dumps({"bootstrap_stage": last_stage}))
+                      raise SystemExit("Staged bootstrap changed; refusing to start tasks")
+                  return len(deployments) == 1 and primary[0].get("rolloutState") == "COMPLETED"
+
+              # services-stable can return before rolloutState reaches COMPLETED.
+              for attempt in range(60):
+                  if staged_revision_is_complete():
+                      break
+                  time.sleep(3)
+              else:
+                  print(json.dumps({"bootstrap_stage": last_stage}))
+                  raise SystemExit("The previous deployment has not drained from the stopped service")
+              if not staged_revision_is_complete():
+                  raise SystemExit("Staged bootstrap changed before scaling")
+              # A desired-count-only update scales the now-exclusive new revision.
+              scaled = aws("ecs", "update-service", "--cluster", cluster, "--service", service_name,
+                           "--desired-count", "1")["service"]
+              primary = [d for d in scaled.get("deployments", []) if d.get("status") == "PRIMARY"]
+              if not (scaled.get("taskDefinition") == revision and scaled.get("desiredCount") == 1
+                      and scaled.get("deploymentConfiguration") == temporary_configuration
+                      and len(primary) == 1 and primary[0].get("id") == deployment
+                      and primary[0].get("taskDefinition") == revision):
+                  raise SystemExit("ECS did not scale the staged revision as intended")
 
       - name: Restore rollback after healthy bootstrap
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.bootstrap }}
@@ -336,10 +393,12 @@ jobs:
           TASK_DEFINITION: ${{ steps.revision.outputs.task-definition }}
           DEPLOYMENT_ID: ${{ steps.revision.outputs.deployment }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          BASELINE_DEPLOYMENT: ${{ steps.baseline.outputs.deployment }}
         run: |
           import json
           import os
           import subprocess
+          import time
           from pathlib import Path
 
           def aws(*args):
@@ -352,6 +411,7 @@ jobs:
           temporary = json.loads(Path(os.environ["RUNNER_TEMP"], "bootstrap-deployment-configuration.json").read_text())
           subprocess.run(["aws", "ecs", "wait", "services-stable", "--cluster", cluster,
                           "--services", service_name], check=True)
+          last_service, last_task = {}, {}
 
           def owned_healthy_service():
               response = aws("ecs", "describe-services", "--cluster", cluster, "--services", service_name)
@@ -360,35 +420,60 @@ jobs:
                   raise SystemExit("Cannot identify bootstrap service")
               service = services[0]
               deployments = service.get("deployments", [])
+              primary = [d for d in deployments if d.get("status") == "PRIMARY"]
+              last_service.update(desired=service.get("desiredCount"), running=service.get("runningCount"),
+                                  pending=service.get("pendingCount"), deployment_count=len(deployments),
+                                  rollout=primary[0].get("rolloutState") if len(primary) == 1 else None,
+                                  revision_matches=service.get("taskDefinition") == revision,
+                                  deployment_matches=len(primary) == 1 and primary[0].get("id") == deployment,
+                                  configuration_matches=service.get("deploymentConfiguration") == temporary)
               if not (service.get("status") == "ACTIVE" and service.get("taskDefinition") == revision
-                      and service.get("desiredCount") == service.get("runningCount") == 1
-                      and service.get("pendingCount") == 0 and len(deployments) == 1
-                      and deployments[0].get("id") == deployment
-                      and deployments[0].get("taskDefinition") == revision
-                      and deployments[0].get("status") == "PRIMARY"
-                      and deployments[0].get("rolloutState") == "COMPLETED"
+                      and service.get("desiredCount") == 1
+                      and len(primary) == 1 and primary[0].get("id") == deployment
+                      and primary[0].get("taskDefinition") == revision
+                      and primary[0].get("rolloutState") in {"IN_PROGRESS", "COMPLETED"}
+                      and all(d.get("id") in {deployment, os.environ["BASELINE_DEPLOYMENT"]} for d in deployments)
                       and service.get("deploymentConfiguration") == temporary):
-                  raise SystemExit("Bootstrap is not healthy and owned; refusing to change rollback configuration")
+                  print(json.dumps({"bootstrap_service": last_service}))
+                  raise SystemExit("Bootstrap ownership or configuration changed; refusing to change rollback configuration")
+              return (service.get("runningCount") == 1 and service.get("pendingCount") == 0
+                      and len(deployments) == 1 and primary[0].get("rolloutState") == "COMPLETED")
 
-          owned_healthy_service()
-          arns = aws("ecs", "list-tasks", "--cluster", cluster, "--service-name", service_name,
-                     "--desired-status", "RUNNING")["taskArns"]
-          if len(arns) != 1:
-              raise SystemExit("Bootstrap must have exactly one running task")
-          response = aws("ecs", "describe-tasks", "--cluster", cluster, "--tasks", *arns)
-          tasks = response.get("tasks", [])
-          if response.get("failures") or len(tasks) != 1:
-              raise SystemExit("Cannot verify bootstrap task health")
-          task = tasks[0]
-          containers = [c for c in task.get("containers", []) if c.get("name") == os.environ["ECS_CONTAINER_NAME"]]
-          if not (task.get("taskArn") == arns[0] and task.get("taskDefinitionArn") == revision
-                  and task.get("startedBy") == deployment and task.get("healthStatus") == "HEALTHY"
-                  and task.get("lastStatus") == task.get("desiredStatus") == "RUNNING"
-                  and len(containers) == 1 and containers[0].get("healthStatus") == "HEALTHY"
-                  and containers[0].get("lastStatus") == "RUNNING"
-                  and containers[0].get("imageDigest") == os.environ["IMAGE_DIGEST"]):
-              raise SystemExit("Bootstrap task is not healthy at the intended revision and digest")
-          owned_healthy_service()  # Recheck immediately before the configuration-only update.
+          def healthy_intended_task():
+              arns = aws("ecs", "list-tasks", "--cluster", cluster, "--service-name", service_name,
+                         "--desired-status", "RUNNING")["taskArns"]
+              if len(arns) != 1:
+                  return False
+              response = aws("ecs", "describe-tasks", "--cluster", cluster, "--tasks", *arns)
+              tasks = response.get("tasks", [])
+              if response.get("failures") or len(tasks) != 1:
+                  raise SystemExit("Cannot verify bootstrap task health")
+              task = tasks[0]
+              containers = [c for c in task.get("containers", []) if c.get("name") == os.environ["ECS_CONTAINER_NAME"]]
+              last_task.update(status=task.get("lastStatus"), health=task.get("healthStatus"),
+                               container_health=containers[0].get("healthStatus") if len(containers) == 1 else None,
+                               revision_matches=task.get("taskDefinitionArn") == revision,
+                               deployment_matches=task.get("startedBy") == deployment,
+                               digest_matches=len(containers) == 1 and containers[0].get("imageDigest") == os.environ["IMAGE_DIGEST"])
+              if not (task.get("taskArn") == arns[0] and task.get("taskDefinitionArn") == revision
+                      and task.get("startedBy") == deployment and task.get("group") == f"service:{service_name}"
+                      and len(containers) == 1 and containers[0].get("imageDigest") == os.environ["IMAGE_DIGEST"]):
+                  print(json.dumps({"bootstrap_task": last_task}))
+                  raise SystemExit("Bootstrap task does not match the intended revision and digest")
+              return (task.get("lastStatus") == task.get("desiredStatus") == "RUNNING"
+                      and task.get("healthStatus") == containers[0].get("healthStatus") == "HEALTHY"
+                      and containers[0].get("lastStatus") == "RUNNING")
+
+          # The ECS waiter checks counts, not rollout completion or container health.
+          for attempt in range(60):
+              if owned_healthy_service() and healthy_intended_task():
+                  break
+              time.sleep(3)
+          else:
+              print(json.dumps({"bootstrap_service": last_service, "bootstrap_task": last_task}))
+              raise SystemExit("Bootstrap did not reach completed deployment and healthy task state")
+          if not owned_healthy_service():  # Recheck immediately before changing configuration.
+              raise SystemExit("Bootstrap stopped being stable before rollback restoration")
           updated = aws("ecs", "update-service", "--cluster", cluster, "--service", service_name,
                         "--deployment-configuration", f"file://{original_path}")["service"]
           if updated.get("deploymentConfiguration") != original:
@@ -401,10 +486,12 @@ jobs:
           TASK_DEFINITION: ${{ steps.revision.outputs.task-definition }}
           DEPLOYMENT_ID: ${{ steps.revision.outputs.deployment }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          BASELINE_DEPLOYMENT: ${{ steps.baseline.outputs.deployment }}
         run: |
           import json
           import os
           import subprocess
+          import time
           from pathlib import Path
 
           def aws(*args):
@@ -416,10 +503,32 @@ jobs:
           # This waiter alone can succeed after a circuit-breaker rollback.
           subprocess.run(["aws", "ecs", "wait", "services-stable", "--cluster", cluster,
                           "--services", service_name], check=True)
-          response = aws("ecs", "describe-services", "--cluster", cluster, "--services", service_name)
-          if response.get("failures") or len(response.get("services", [])) != 1:
-              raise SystemExit("Cannot verify the deployed service")
-          service = response["services"][0]
+          # Also wait for explicit rollout completion on ordinary main deployments.
+          # A different revision/deployment is drift, not a state to wait through.
+          for attempt in range(60):
+              response = aws("ecs", "describe-services", "--cluster", cluster, "--services", service_name)
+              if response.get("failures") or len(response.get("services", [])) != 1:
+                  raise SystemExit("Cannot verify the deployed service")
+              service = response["services"][0]
+              observed = service.get("deployments", [])
+              primary = [d for d in observed if d.get("status") == "PRIMARY"]
+              if not (service.get("status") == "ACTIVE" and service.get("taskDefinition") == revision
+                      and service.get("desiredCount", 0) > 0 and len(primary) == 1
+                      and primary[0].get("id") == os.environ["DEPLOYMENT_ID"]
+                      and primary[0].get("taskDefinition") == revision
+                      and primary[0].get("rolloutState") in {"IN_PROGRESS", "COMPLETED"}
+                      and all(d.get("id") in {os.environ["DEPLOYMENT_ID"], os.environ["BASELINE_DEPLOYMENT"]} for d in observed)):
+                  raise SystemExit("Intended ECS deployment changed or failed during verification")
+              if (len(observed) == 1 and primary[0].get("rolloutState") == "COMPLETED"
+                      and service.get("runningCount") == service.get("desiredCount")
+                      and service.get("pendingCount") == 0):
+                  break
+              time.sleep(3)
+          else:
+              print(json.dumps({"desired": service.get("desiredCount"), "running": service.get("runningCount"),
+                                "pending": service.get("pendingCount"), "deployment_count": len(observed),
+                                "rollout": primary[0].get("rolloutState")}))
+              raise SystemExit("Intended ECS deployment did not finish converging")
           deployments = service.get("deployments", [])
           desired = service.get("desiredCount", 0)
           original_configuration = json.loads(Path(os.environ["RUNNER_TEMP"], "deployment-configuration.json").read_text()) if bootstrap else None
@@ -527,7 +636,9 @@ jobs:
               deployment = primary[0].get("id")
           if not (
               service.get("status") == "ACTIVE"
-              and service.get("taskDefinition") == revision and service.get("desiredCount") == 1
+              and service.get("taskDefinition") == revision and service.get("desiredCount") in {0, 1}
+              and (service.get("desiredCount") == 1 or
+                   all(service.get(key) == 0 for key in ("runningCount", "pendingCount")))
               and deployment and len(primary) == 1 and primary[0].get("id") == deployment
               and primary[0].get("taskDefinition") == revision
               and all(d.get("id") in {deployment, os.environ["BASELINE_DEPLOYMENT"]} for d in deployments)
