@@ -10,6 +10,8 @@ from src.services import strategies
 
 
 def test_strategy_upload_storage_outage_is_sanitized(monkeypatch):
+    from src.api.dependencies.current_user import require_current_user
+    monkeypatch.setitem(app.dependency_overrides, require_current_user, lambda: "test-owner")
     monkeypatch.setattr(
         strategies,
         "submit_strategy",

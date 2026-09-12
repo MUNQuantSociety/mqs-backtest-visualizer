@@ -37,6 +37,7 @@ async def _session_scope():
 
 @pytest.fixture
 def api(monkeypatch):
+    monkeypatch.setattr(current_user, "settings", SimpleNamespace(temporary_user_id=""))
     monkeypatch.setattr(current_user, "session_scope", _session_scope)
     monkeypatch.setattr(
         current_user.user_creds_repo, "get_user",
@@ -69,6 +70,55 @@ def test_post_propagates_validated_owner_to_run_creation(api):
     assert response.status_code == 202
     assert response.json()["status"] == "queued"
     assert create.await_args.kwargs["owner_id"] == OWNER
+
+
+@pytest.mark.parametrize("identity", [None, "", "  "])
+def test_submission_without_identity_uses_configured_temporary_user(api, identity):
+    client, create = api
+    current_user.settings.temporary_user_id = str(OWNER)
+    headers = {} if identity is None else {"X-User-Id": identity}
+    response = client.post("/api/backtests", json=PAYLOAD, headers=headers)
+    assert response.status_code == 202
+    assert create.await_args.kwargs["owner_id"] == OWNER
+
+
+def test_temporary_user_applies_to_history_and_detail(api, monkeypatch):
+    from src.schemas.backtests import BacktestListResponse
+
+    client, _ = api
+    current_user.settings.temporary_user_id = str(OWNER)
+    listing = AsyncMock(return_value=BacktestListResponse(items=[], total=0, page=1, page_size=25))
+    detail = AsyncMock(return_value=None)
+    monkeypatch.setattr(backtests, "list_backtests", listing)
+    monkeypatch.setattr(backtests, "get_backtest", detail)
+    assert client.get("/api/backtests").status_code == 200
+    assert listing.await_args.kwargs["owner_id"] == OWNER
+    assert client.get(f"/api/backtests/{uuid.uuid4()}").status_code == 404
+    assert detail.await_args.kwargs["owner_id"] == OWNER
+
+
+def test_explicit_valid_user_takes_precedence_over_temporary_user(api):
+    client, create = api
+    current_user.settings.temporary_user_id = str(OTHER_OWNER)
+    response = client.post("/api/backtests", json=PAYLOAD, headers={"X-User-Id": str(OWNER)})
+    assert response.status_code == 202
+    assert create.await_args.kwargs["owner_id"] == OWNER
+
+
+@pytest.mark.parametrize("identity", ["not-a-uuid", str(OTHER_OWNER)])
+def test_invalid_explicit_identity_never_falls_back_to_temporary_user(api, identity):
+    client, create = api
+    current_user.settings.temporary_user_id = str(OWNER)
+    assert client.post("/api/backtests", json=PAYLOAD, headers={"X-User-Id": identity}).status_code == 401
+    create.assert_not_awaited()
+
+
+@pytest.mark.parametrize("identity", ["not-a-uuid", str(OTHER_OWNER)])
+def test_invalid_temporary_account_is_a_configuration_error(api, identity):
+    client, create = api
+    current_user.settings.temporary_user_id = identity
+    assert client.post("/api/backtests", json=PAYLOAD).status_code == 503
+    create.assert_not_awaited()
 
 
 @pytest.mark.parametrize("identity", [None, "", "not-a-uuid", str(OTHER_OWNER)])

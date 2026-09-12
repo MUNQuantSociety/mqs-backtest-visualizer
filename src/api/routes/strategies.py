@@ -48,7 +48,7 @@ async def list_strategies() -> StrategyListResponse:
 @router.post(
     "", response_model=StrategySubmissionResult, status_code=status.HTTP_201_CREATED
 )
-async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionResult:
+async def submit_strategy(submission: StrategySubmission, owner_id: uuid.UUID = Depends(require_current_user)) -> StrategySubmissionResult:
     """Accept strategy source, store it, and start its validation backtest.
 
     The submitted source is untrusted user code, and validating it means
@@ -72,7 +72,7 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
         )
 
     try:
-        return await strategies_service.submit_strategy(submission)
+        return await strategies_service.submit_strategy(submission, owner_id=owner_id)
     except StrategyValidationError as exc:
         # ``detail`` is a plain string, not FastAPI's list of error objects:
         # the client shows it verbatim in the editor's error slot.
@@ -255,6 +255,7 @@ async def submit_strategy_file(
     file: UploadFile = File(...),
     name: str = Form(...),
     description: str = Form(""),
+    owner_id: uuid.UUID = Depends(require_current_user),
 ) -> StrategySubmissionResult:
     """``POST /strategies`` for a multipart file instead of a JSON body.
 
@@ -278,7 +279,7 @@ async def submit_strategy_file(
         ) from exc
 
     try:
-        return await strategies_service.submit_strategy(submission)
+        return await strategies_service.submit_strategy(submission, owner_id=owner_id)
     except StrategyValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)

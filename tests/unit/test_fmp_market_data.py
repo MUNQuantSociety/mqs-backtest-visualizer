@@ -177,7 +177,8 @@ def test_provider_failure_is_503_and_is_not_cached(monkeypatch):
     monkeypatch.setattr(fmp.FMPMarketData, "get_historical_data", failure)
     client = TestClient(app)
     response = client.get("/market-data/coverage", params={"tickers": "CRWV"})
-    assert response.status_code == 503 and "Retry shortly" in response.json()["detail"]
+    assert response.status_code == 503
+    assert response.json() == {"detail": "FMP request limit reached. Retry shortly."}
     assert coverage_service._fmp_span.cache_info().currsize == 0
 
     async def fail_submission(request, *, owner_id):
@@ -189,6 +190,7 @@ def test_provider_failure_is_503_and_is_not_cached(monkeypatch):
         "endDate": "2025-04-04", "initialCapital": 10000, "mode": "event", "params": {},
     })
     assert response.status_code == 503
+    assert response.json() == {"detail": "FMP request limit reached. Retry shortly."}
 
 
 def test_upload_validation_uses_fmp_and_stays_inside_new_ticker_history(monkeypatch):

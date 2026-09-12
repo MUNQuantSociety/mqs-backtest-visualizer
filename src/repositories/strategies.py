@@ -13,10 +13,10 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import bindparam, func, select, text, update
+from sqlalchemy import Numeric, bindparam, cast, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models import BacktestRun, Strategy
+from src.models import BacktestReport, Strategy
 
 @dataclass(frozen=True)
 class StrategyRow:
@@ -38,14 +38,18 @@ def _aggregate_subquery():
     """
     return (
         select(
-            BacktestRun.strategy_key.label("strategy_key"),
+            BacktestReport.strategy_key.label("strategy_key"),
             func.count().label("run_count"),
-            func.max(BacktestRun.sharpe).label("best_sharpe"),
-            func.max(BacktestRun.total_return).label("best_return"),
-            func.max(BacktestRun.created_at).label("last_run_at"),
+            func.max(cast(BacktestReport.results["sharpe"].astext, Numeric)).filter(
+                BacktestReport.results["metrics"]["unavailable"]["sharpe"].astext.is_(None)
+            ).label("best_sharpe"),
+            func.max(cast(BacktestReport.results["totalReturn"].astext, Numeric)).filter(
+                BacktestReport.results["metrics"]["unavailable"]["totalReturn"].astext.is_(None)
+            ).label("best_return"),
+            func.max(BacktestReport.created_at).label("last_run_at"),
         )
-        .where(BacktestRun.purpose == "user")
-        .group_by(BacktestRun.strategy_key)
+        .where(func.coalesce(BacktestReport.results["reportMetadata"]["purpose"].astext, "user") == "user")
+        .group_by(BacktestReport.strategy_key)
         .subquery()
     )
 
@@ -214,8 +218,8 @@ async def attach_validation_run(session: AsyncSession, key: str, run_id: uuid.UU
     await session.execute(
         update(Strategy)
         .where(Strategy.key == key, Strategy.kind == "user",
-               (Strategy.validation_run_id.is_(None)) | (Strategy.validation_run_id == run_id))
-        .values(validation_run_id=run_id)
+               (Strategy.validation_job_id.is_(None)) | (Strategy.validation_job_id == run_id))
+        .values(validation_job_id=run_id)
     )
 
 

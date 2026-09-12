@@ -20,8 +20,11 @@ from src.services.strategy_validation.template import STARTER_SOURCE
 
 @pytest.fixture(scope="module")
 def client() -> Iterator[TestClient]:
-    with TestClient(app) as test_client:
-        yield test_client
+    from src.api.dependencies.current_user import require_current_user
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(app.dependency_overrides, require_current_user, lambda: "test-owner")
+        with TestClient(app) as test_client:
+            yield test_client
 
 
 def _file(name: str, content: bytes, mime: str = "text/x-python"):

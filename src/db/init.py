@@ -35,6 +35,7 @@ _CREATE_SCHEMA = text(f'CREATE SCHEMA IF NOT EXISTS "{APP_SCHEMA}"')
 # (``IF NOT EXISTS``) because this runs on every boot. This list is the
 # migration story until Alembic arrives — append, never edit.
 _ADDITIVE_MIGRATIONS = (
+    text(f'ALTER TABLE "{APP_SCHEMA}".strategies ADD COLUMN IF NOT EXISTS validation_job_id UUID'),
     text(
         f'ALTER TABLE "{APP_SCHEMA}".backtest_runs '
         "ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ"

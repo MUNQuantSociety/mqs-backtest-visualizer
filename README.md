@@ -1,5 +1,11 @@
 # MQS Backtest Visualizer — Backend
 
+Backtest storage now saves **successful reports only**, as one JSONB document
+in `app.backtest_reports`. Jobs, progress, and failures remain temporary until
+completion. See [completed report storage](docs/COMPLETED_REPORT_STORAGE.md)
+for the seven-column schema, API behavior, migration, and restart limits.
+This supersedes the database-backed job lifecycle described in older sections.
+
 A web application that lets MQS members run the society's quantitative
 backtests and read the results as charts and tables — without cloning the
 trading repo, editing constants in a Python file, or opening a database client.

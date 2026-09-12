@@ -54,10 +54,14 @@ def client() -> Iterator[TestClient]:
     so the second request would find a pool bound to a closed loop. Entering the
     context manager keeps one loop for the whole module.
     """
-    with TestClient(app) as test_client:
-        yield test_client
-        # Close the pool inside that loop, before it goes away.
-        test_client.portal.call(dispose_async_engine)
+    from src.api.dependencies.current_user import require_current_user
+    from uuid import UUID
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(app.dependency_overrides, require_current_user,
+                      lambda: UUID("00000000-0000-0000-0000-000000000001"))
+        with TestClient(app) as test_client:
+            yield test_client
+            test_client.portal.call(dispose_async_engine)
 
 
 # The disabled test harness, deliberately: a run against it can never be

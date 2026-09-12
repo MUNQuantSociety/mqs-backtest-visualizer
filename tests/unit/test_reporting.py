@@ -133,6 +133,8 @@ def test_exports_share_detail_contract_and_preserve_missing_values(report):
 
 
 def test_export_route_rejects_unknown_and_unfinished_runs(monkeypatch, report):
+    from src.api.dependencies.current_user import require_current_user
+    monkeypatch.setitem(app.dependency_overrides, require_current_user, lambda: "test-owner")
     lookup = AsyncMock(return_value=report)
     monkeypatch.setattr("src.services.backtests.get_backtest", lookup)
     client = TestClient(app)

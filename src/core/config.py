@@ -98,6 +98,9 @@ class Settings:
     # route it calls resolves under this. Changing it breaks the client.
     api_prefix: str = os.getenv("API_PREFIX", "/api")
 
+    # Explicit opt-in while sign-in is unfinished. Blank requires X-User-Id.
+    temporary_user_id: str = os.getenv("TEMPORARY_USER_ID", "").strip()
+
     repo_root: Path = REPO_ROOT
 
     # ------------------------------------------------------------------

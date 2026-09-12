@@ -17,7 +17,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
-from engine.data.fmp import FMPUnavailable
+from src.services.backtests import FMPUnavailable
 from src.api.dependencies.current_user import require_current_user
 from src.schemas.backtests import (
     BacktestDetail,
@@ -45,7 +45,7 @@ async def list_backtests(
     page_size: int = Query(default=25, ge=1, le=100, alias="pageSize"),
     owner_id: uuid.UUID = Depends(require_current_user),
 ) -> BacktestListResponse:
-    """This user's current and historical runs, newest first."""
+    """This user's saved successful reports, newest first."""
     return await backtests_service.list_backtests(
         owner_id=owner_id,
         search=search,
@@ -65,26 +65,15 @@ async def create_backtest(
     submission: BacktestRunRequest,
     owner_id: uuid.UUID = Depends(require_current_user),
 ) -> BacktestSummary:
-    """Run a backtest. Answers **202** with the row, not the result.
+    """Accept a transient job. Only successful completion creates a saved report.
 
-    The engine takes minutes, so the response is the queued run itself: the
-    client drops it straight into its list cache and polls
-    ``GET /backtests/{id}`` (which carries ``progressPct``) until the status is
-    terminal.
-
-    A 202 does not promise the run will succeed — only that it exists and is
-    the client's to watch. In the one case where the worker pool refuses the
-    job outright, the payload comes back already marked ``failed`` with the
-    reason on the row, because a run nothing will ever pick up must not look
-    like a run waiting its turn.
-
-    422 with a single-sentence ``detail`` for anything the student can fix: an
-    unknown or disabled strategy, a malformed or backwards date range, a window
-    past ``MAX_BACKTEST_WINDOW_DAYS``, capital of zero, or a parameter the
-    strategy does not accept.
+    The 202 body and detail polling retain the existing frontend contract.
+    Live progress and errors are temporary; history contains saved reports only.
     """
     try:
         return await backtests_service.submit_backtest_run(submission, owner_id=owner_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
     except FMPUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
     except RunSubmissionError as exc:
@@ -98,8 +87,8 @@ async def create_backtest(
 
 
 @router.get("/{backtest_id}", response_model=BacktestDetail)
-async def get_backtest(backtest_id: str) -> BacktestDetail:
-    detail = await backtests_service.get_backtest(backtest_id)
+async def get_backtest(backtest_id: str, owner_id: uuid.UUID = Depends(require_current_user)) -> BacktestDetail:
+    detail = await backtests_service.get_backtest(backtest_id, owner_id=owner_id)
     if detail is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -111,6 +100,7 @@ async def get_backtest(backtest_id: str) -> BacktestDetail:
 @router.get("/{backtest_id}/equity", response_model=BacktestEquity)
 async def get_backtest_equity(
     backtest_id: str,
+    owner_id: uuid.UUID = Depends(require_current_user),
     period: LookbackPeriod = Query(),
     end_date: date = Query(alias="endDate", ge=date(6, 1, 1)),
 ) -> BacktestEquity:
@@ -120,33 +110,16 @@ async def get_backtest_equity(
     so 1Y/2Y/5Y use the same calendar window. Max returns all saved observations
     through endDate. Available bounds explain short or missing history.
     """
-    detail = await backtests_service.get_backtest(backtest_id)
+    detail = await backtests_service.get_backtest(backtest_id, owner_id=owner_id)
     if detail is None:
         raise HTTPException(status_code=404, detail=f"No backtest with id {backtest_id!r}.")
     return window_equity(detail, period, end_date)
 
 
 @router.delete("/{backtest_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_backtest(backtest_id: str) -> Response:
-    """Delete a finished run, or cancel one that is still going.
-
-    Two behaviours behind one verb, because that is what the UI's delete button
-    means in both states:
-
-    * ``completed``/``failed`` — the run, its metrics, its equity curve, its
-      trades, and the engine's CSV artifact directory are all removed;
-    * ``queued`` — no worker has claimed it, so the row is removed too. It is
-      deleted under a ``status = 'queued'`` predicate, so a run claimed in the
-      same instant is cancelled instead of vanishing under its worker;
-    * ``running`` — the run cannot be deleted out from under the worker that
-      owns it, so ``cancel_requested`` is set and this returns immediately. The
-      worker notices within a second, unwinds the engine, and the run lands as
-      ``failed`` with ``errorMessage = "Cancelled by user"``. The row stays;
-      deleting it afterwards takes the terminal path above.
-
-    Both answer 204. An unknown id is 404.
-    """
-    outcome = await backtests_service.delete_backtest(backtest_id)
+async def delete_backtest(backtest_id: str, owner_id: uuid.UUID = Depends(require_current_user)) -> Response:
+    """Delete an owned saved report, or cancel its transient execution."""
+    outcome = await backtests_service.delete_backtest(backtest_id, owner_id=owner_id)
     if outcome is DeleteOutcome.NOT_FOUND:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -156,11 +129,11 @@ async def delete_backtest(backtest_id: str) -> Response:
 
 
 @router.get("/{backtest_id}/exports/{filename}")
-async def download_report(backtest_id: str, filename: str) -> Response:
+async def download_report(backtest_id: str, filename: str, owner_id: uuid.UUID = Depends(require_current_user)) -> Response:
     """Download one completed run as CSV or the exact detail JSON contract."""
     if filename not in EXPORT_NAMES:
         raise HTTPException(status_code=404, detail="Unknown report export.")
-    detail = await backtests_service.get_backtest(backtest_id)
+    detail = await backtests_service.get_backtest(backtest_id, owner_id=owner_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Backtest not found.")
     if detail.status is not BacktestStatus.COMPLETED:

@@ -6,7 +6,10 @@ reports keep their original values; metadata may be absent on older runs.
 
 The API models are in [src/schemas/backtests.py](../src/schemas/backtests.py),
 application calculations in [src/services/reporting.py](../src/services/reporting.py),
-and persistence in [src/workers/run_job.py](../src/workers/run_job.py).
+and persistence in [src/repositories/reports.py](../src/repositories/reports.py).
+Only successful reports are saved, as one JSONB document with no stored status.
+See [Completed report storage](COMPLETED_REPORT_STORAGE.md) for the current
+schema, temporary job polling, ownership, and migration behavior.
 See [Architecture Flow](ARCHITECTURE_FLOW.md) for the request/worker/database
 design and [README](../README.md) for startup, storage and deployment.
 
@@ -22,8 +25,8 @@ additive fields:
 | `openPositions` | Supplemental final marks and unrealized P&L for still-open FIFO lots. |
 
 The existing metric properties remain numeric for client compatibility.
-Undefined metrics are stored as SQL null and serialized as zero plus an entry
-in `metrics.unavailable`. A client must consult that map before displaying a
+Undefined metrics use zero placeholders plus an entry in `metrics.unavailable`
+in the saved JSON and API response. A client must consult that map before displaying a
 zero as a measured result. `totalTrades: 0` is a valid count; an empty
 `unavailable` map means the represented metrics are defined. Queued/failed
 status must also be checked before treating summary placeholders as results.

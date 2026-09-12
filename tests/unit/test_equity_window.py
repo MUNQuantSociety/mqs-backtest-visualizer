@@ -31,6 +31,8 @@ def client(monkeypatch, detail):
     monkeypatch.setattr(backtests, "get_backtest", AsyncMock(return_value=detail))
     app = FastAPI()
     app.include_router(router, prefix="/api")
+    from src.api.dependencies.current_user import require_current_user
+    app.dependency_overrides[require_current_user] = lambda: 'test-owner'
     return TestClient(app)
 
 

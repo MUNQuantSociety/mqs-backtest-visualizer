@@ -83,6 +83,9 @@ class Strategy(Base):
     )
 
     status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
+    # New executions have no database run row until successful. This pointer
+    # refers to a transient job or completed report, not the legacy run table.
+    validation_job_id: Mapped[str | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # Staging area for uploaded source between task 2 (persist the row) and

@@ -1,5 +1,24 @@
 # Project status and handoff
 
+## Completed-only reports (2026-09-11)
+
+The current checkout stores successful backtests in the seven-column
+`app.backtest_reports` table. It has no status column; failed, cancelled,
+queued, and running jobs are never inserted. Job state uses temporary IPC.
+See [the storage contract](docs/COMPLETED_REPORT_STORAGE.md) for migration and
+the single-API-process/restart limits. Older run tables are retained for
+non-destructive migration. The local auto-reloading API has loaded this code and
+created the table in the configured database. The 26 completed legacy reports
+were copied and verified; all 27 legacy rows remain intact. Existing owners
+were retained and unowned reports assigned to the agreed test account. Its
+history now lists 21 user runs. Live detail, equity and JSON export checks pass.
+The frontend upload identity header was also updated and tested. This does not
+claim a deployment to the hosted API.
+
+Until auth is implemented, local requests without `X-User-Id` use the existing
+test account configured by `TEMPORARY_USER_ID` in backend `.env`. This is the
+same UUID already configured in the frontend; saved reports remain owned by it.
+
 Status recorded: **2026-09-10**. Implementation baseline: backend `dev`
 at `a04e0f8`, frontend integration at `2debac8`, infrastructure integration
 at `93f7390`. This document records evidence and remaining work; it is not
