@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from engine.data.fmp import FMPUnavailable
 from src.schemas.market_data import CoverageResponse
 from src.services import market_data as market_data_service
+from src.services.market_data import FMPUnavailable
 
 router = APIRouter(prefix="/market-data", tags=["market-data"])
 

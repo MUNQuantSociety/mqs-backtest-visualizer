@@ -9,8 +9,9 @@ POSTGRES_USER=mqs_test and nonempty POSTGRES_PASSWORD; use POSTGRES_SSLMODE=disa
 Only a disposable database may be used. This test creates public.market_data and
 seeds synthetic bars when the table is absent; an existing table must match the
 fixture exactly. No table is dropped, truncated, or overwritten. App rows remain
-for diagnosis until the disposable server is removed. All filesystem outputs go
-under pytest's temporary directory, including the worker's materialized source.
+for diagnosis until the disposable server is removed. Reports and caches go
+under pytest's temporary directory. POSIX worker scratch uses a short, scoped
+/tmp directory so multiprocessing's Unix socket fits the platform path limit.
 
 The application runs in a fresh interpreter because root conftest.py and other
 tests import the frozen settings singleton at collection time. The environment
@@ -32,8 +33,10 @@ import math
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import date, datetime, time as day_time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -140,6 +143,61 @@ def test_disposable_target_uses_loopback_without_resolving_hostnames(host):
     assert target["POSTGRES_SSLMODE"] == "disable"
 
 
+@contextmanager
+def _worker_temp_directory(tmp_path: Path):
+    """Keep spawn's pymp-*/listener-* socket below the AF_UNIX path limit.
+
+    GitHub's pytest base path can exceed that limit before multiprocessing adds
+    its own names. Keep the short directory alive until the proof subprocess
+    has drained its worker pool, then remove its scratch files on every exit.
+    Windows uses named pipes and retains the existing pytest scratch location.
+    """
+    if os.name == "posix":
+        with tempfile.TemporaryDirectory(prefix="mqs-ci-", dir="/tmp") as directory:
+            yield Path(directory).resolve()
+    else:
+        directory = tmp_path / "worker-temp"
+        directory.mkdir(parents=True, exist_ok=True)
+        yield directory.resolve()
+
+
+def test_long_pytest_path_can_start_a_spawned_manager_and_cleanup(tmp_path):
+    long_path = tmp_path / ("long-ci-worker-" * 6)
+    with _worker_temp_directory(long_path) as worker_temp:
+        assert worker_temp.is_dir()
+        if os.name == "posix":
+            # Include multiprocessing's generated suffix, not just TMPDIR.
+            socket_path = worker_temp / "pymp-xxxxxxxx" / "listener-xxxxxxxx"
+            assert len(os.fsencode(socket_path)) < 104
+            assert not worker_temp.is_relative_to(long_path)
+        else:
+            assert worker_temp == (long_path / "worker-temp").resolve()
+        environment = dict(os.environ, TMPDIR=str(worker_temp),
+                           TEMP=str(worker_temp), TMP=str(worker_temp))
+        result = subprocess.run(
+            [sys.executable, "-c", """
+import multiprocessing
+import os
+import tempfile
+from pathlib import Path
+
+if __name__ == "__main__":
+    assert Path(tempfile.gettempdir()) == Path(os.environ["TMPDIR"])
+    with multiprocessing.get_context("spawn").Manager() as manager:
+        assert manager.list(["spawned"])[0] == "spawned"
+        if os.name == "posix":
+            assert Path(manager.address).is_relative_to(tempfile.gettempdir())
+            assert len(os.fsencode(manager.address)) < 104
+    print("SPAWN_MANAGER_TEMP_OK")
+"""],
+            env=environment, capture_output=True, text=True, timeout=20, check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "SPAWN_MANAGER_TEMP_OK" in result.stdout
+    if os.name == "posix":
+        assert not worker_temp.exists(), "POSIX scratch must be cleaned after the proof"
+
+
 @pytest.mark.ci_db
 def test_uploaded_strategy_runs_in_spawned_worker_and_exports_persisted_results(tmp_path):
     target = _database_target(os.environ)
@@ -183,9 +241,6 @@ def test_uploaded_strategy_runs_in_spawned_worker_and_exports_persisted_results(
         ("STRATEGY_STORE_ROOT", "strategies"),
         ("MARKET_CACHE_DIR", "market-cache"),
         ("ARTIFACT_DIR", "artifacts"),
-        ("TMPDIR", "worker-temp"),
-        ("TEMP", "worker-temp"),
-        ("TMP", "worker-temp"),
     ):
         directory = tmp_path / dirname
         directory.mkdir(exist_ok=True)
@@ -193,20 +248,23 @@ def test_uploaded_strategy_runs_in_spawned_worker_and_exports_persisted_results(
 
     # A subprocess also isolates application singletons from unrelated pytest
     # tests. No application, engine, store, or job-manager methods are patched.
-    try:
-        result = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--run-ci-proof"],
-            cwd=REPO_ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=PROCESS_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        pytest.fail(f"Disposable API/worker proof exceeded {PROCESS_TIMEOUT_SECONDS}s")
+    with _worker_temp_directory(tmp_path) as worker_temp:
+        for variable in ("TMPDIR", "TEMP", "TMP"):
+            environment[variable] = str(worker_temp)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--run-ci-proof"],
+                cwd=REPO_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=PROCESS_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"Disposable API/worker proof exceeded {PROCESS_TIMEOUT_SECONDS}s")
     diagnostic = (result.stdout + "\n" + result.stderr).replace(
         target["POSTGRES_PASSWORD"], "***"
     )
@@ -415,6 +473,9 @@ def _assert_report(detail, tickers, minimum_days):
     assert detail["totalReturn"] == pytest.approx(expected_return, rel=0, abs=1e-9)
     assert detail["metrics"]["totalReturn"] == pytest.approx(expected_return, rel=0, abs=1e-9)
     assert any(abs(point["equity"] - point["benchmark"]) > 0.01 for point in curve)
+    assert all(trade["side"] == "long" for trade in detail["trades"]), (
+        "This long-only fixture's context.sell must close a long, never reverse into a short"
+    )
     closed = [trade for trade in detail["trades"] if trade["exitDate"] is not None]
     assert closed, "Real context.buy/context.sell calls must persist closed trades"
     assert {trade["symbol"] for trade in closed} == set(tickers)

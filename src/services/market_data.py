@@ -14,6 +14,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from engine.data.fmp import FMPMarketData, market_data_source
+from engine.data.fmp import FMPUnavailable as FMPUnavailable
 
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
