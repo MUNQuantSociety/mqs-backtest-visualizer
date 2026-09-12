@@ -1,5 +1,11 @@
 # MQS Backtest Visualizer — Backend
 
+Backtest storage now saves **successful reports only**, as one JSONB document
+in `app.backtest_reports`. Jobs, progress, and failures remain temporary until
+completion. See [completed report storage](docs/COMPLETED_REPORT_STORAGE.md)
+for the seven-column schema, API behavior, migration, and restart limits.
+This supersedes the database-backed job lifecycle described in older sections.
+
 A web application that lets MQS members run the society's quantitative
 backtests and read the results as charts and tables — without cloning the
 trading repo, editing constants in a Python file, or opening a database client.
@@ -16,11 +22,29 @@ as a service instead of a CLI.
 | Frontend | The entire user interface (React + Vite). Nothing here renders UI. |
 | Infrastructure | Terraform and cloud resources. Nothing here provisions. |
 
-> **Status:** the backtest half of the product is real. `POST /api/backtests`
-> submits a run, a worker process executes it against `public.market_data`, and
-> the results are persisted and served. The `/live/*` endpoints still serve
-> generated sample data — see [What is real and what is
-> sample](#what-is-real-and-what-is-sample).
+Backtest submission, strategy validation, daily reports, CSV/JSON exports and
+local/S3 strategy storage are implemented in this checkout. `/live/*` still
+serves generated sample data. This describes repository behavior; it does not
+assert that a release is deployed.
+
+For the request/worker/database design, read [Architecture Flow](docs/ARCHITECTURE_FLOW.md).
+For current result semantics, read [Report Contract](docs/REPORT_CONTRACT.md).
+For portfolio publication, S3 execution and visible terminal logs, read
+[S3 strategy flow and logging](docs/S3_STRATEGY_FLOW.md).
+
+For a stable local Windows API, run `./scripts/start-dev-api.ps1`. It launches
+the application in your terminal on port 8000; press Ctrl+C to stop it. Only
+the explicit `-Background` option writes timestamped output/error files under
+`logs/` and waits for `/api/health` before reporting Ready. Stop the existing
+process before starting another; restart it after backend code changes. This
+avoids an auto-reloader retaining the port when its application child exits.
+API console logging runs on bounded background queues, so a stalled terminal
+does not block requests. S3 sessions and clients are confined to one thread
+and process, then reused there for concurrent catalogue checks.
+For completed work, verification evidence and remaining release blockers, read
+[Project Status and Handoff](PROJECT_STATUS.md).
+[CI and deployment](#ci-and-deployment) below summarizes the current workflow files;
+dated architecture/readiness notes remain useful historical context.
 
 ---
 
@@ -29,6 +53,8 @@ as a service instead of a CLI.
 - [Quick start](#quick-start)
 - [Run a backtest end to end](#run-a-backtest-end-to-end)
 - [API endpoints](#api-endpoints)
+- [Reports and exports](#reports-and-exports)
+- [CI and deployment](#ci-and-deployment)
 - [What is real and what is sample](#what-is-real-and-what-is-sample)
 - [The run pipeline, and why it is not synchronous](#the-run-pipeline-and-why-it-is-not-synchronous)
 - [Uploaded strategies: upload → validate → activate → rerun](#uploaded-strategies-upload--validate--activate--rerun)
@@ -40,73 +66,154 @@ as a service instead of a CLI.
 - [Tests](#tests)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations and deferred work](#known-limitations-and-deferred-work)
+- [Readiness report](docs/READINESS.md) — measured database latency, data horizon, and the ranked gap list
 
 ---
 
 ## Quick start
 
-A fresh clone plus a filled-in `.env` is a working application. There is no
-Redis, no Celery, no separate worker process to start, and no migration step.
+Use **Python 3.12** and run commands from the repository root. A reachable
+PostgreSQL database with permission to create/write `app.*` is needed to seed
+strategies and run the API. For prices, set `FMP_API_KEY` in the backend `.env`:
+coverage, indicator warmup, event runs and fast runs then use FMP daily history.
+The [isolated tests](#tests) do not need a database. There is no Redis, Celery or
+separate worker service to start.
 
-```bash
-python -m venv venv
-venv/Scripts/python.exe -m pip install -r requirements.txt   # Linux/macOS: venv/bin/python
+FMP uses the [stable daily OHLCV endpoint](https://site.financialmodelingprep.com/developer/docs/stable/historical-price-eod-full).
+Each run fetches its selected tickers and dates, including lookback history;
+the old database parquet cache is not used. Coverage answers are cached for up
+to five minutes and end on the latest available prior exchange date. A window
+before an IPO or past available history is rejected with the actual bounds.
+Provider failures appear as retryable errors, not missing tickers or demo data.
+`MARKET_DATA_SOURCE=database` restores database prices and requires readable
+`public.market_data`; `MARKET_DATA_SOURCE=fmp` explicitly requires the FMP key.
+With no source override, FMP is required. A missing key fails explicitly; it never
+switches to database prices. Each run downloads its tickers concurrently (up to
+four at a time) and shares that history between indicator warmup, simulation and
+benchmark construction.
+Daily FMP runs export observed daily results and skip the synthetic minute-by-minute
+CSV, which would expand daily closes across nights and weekends.
+Restart the API and workers after changing `.env`.
 
-cp .env.example .env          # then fill in the POSTGRES_* block
-venv/Scripts/python.exe scripts/seed_strategies.py
-venv/Scripts/python.exe -m uvicorn server:app --reload --port 8000
+### Windows PowerShell
+
+```powershell
+py -3.12 -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+if (-not (Test-Path -LiteralPath .env)) {
+    Copy-Item -LiteralPath .env.example -Destination .env
+}
 ```
 
-That is the whole install. What each step does:
+Edit the existing `.env` to configure your database before continuing; the
+copy step above leaves an existing file untouched. Then seed the catalogue
+and start the API in your terminal:
 
-| Step | Why it is needed |
-| --- | --- |
-| `pip install -r requirements.txt` | `pandas==2.2.2` and `numpy<=1.26.4` are **hard pins** — the engine's math was validated against exactly those versions. |
-| `cp .env.example .env` | Only the `POSTGRES_*` block must be filled in; every other key has a working default baked into `src/core/config.py`. |
-| `scripts/seed_strategies.py` | Creates the `app` schema if it is missing and upserts the four built-in strategies. Idempotent — safe to re-run after any schema change. |
-| `uvicorn server:app` | Starts the API. The `app` schema and the worker pool are created by the lifespan, so there is nothing else to launch. |
-
-Optional but worth doing on a laptop that also has MQSMaster checked out:
-
-```bash
-venv/Scripts/python.exe scripts/seed_market_cache.py   # warm the parquet cache
+```powershell
+.\venv\Scripts\python.exe scripts/seed_strategies.py
+.\venv\Scripts\python.exe -X faulthandler -u -m uvicorn server:app --host 127.0.0.1 --port 8000 --log-level info
 ```
 
-The engine caches market data as one parquet file per ticker under
-`data/backfill_cache/`. Without a warm cache the first run over a new ticker
-set spends minutes pulling bars from a remote university database; with one it
-starts immediately. `seed_market_cache.py` copies the already-backfilled files
-out of a local MQSMaster checkout. Reading them requires `pyarrow`, which is in
-`requirements.txt` for exactly this reason.
+Keep that terminal open; press **Ctrl+C** to stop the API. The helper
+`.\scripts\start-dev-api.ps1` runs the same foreground command after checking
+that the port is free. Use `-Port 8001` to choose another port. Only an explicit
+`-Background` starts a hidden process and redirects output and crash traces to
+timestamped files under `logs/`.
+
+### Linux/macOS
+
+```bash
+python3.12 -m venv venv
+venv/bin/python -m pip install -r requirements.txt
+if [ ! -e .env ]; then cp .env.example .env; fi
+```
+
+Configure `.env` before running these commands:
+
+```bash
+venv/bin/python scripts/seed_strategies.py
+venv/bin/python -X faulthandler -u -m uvicorn server:app --host 127.0.0.1 --port 8000 --log-level info
+```
+
+Open [API docs](http://localhost:8000/docs) or
+[health](http://localhost:8000/api/health). API startup creates missing schema
+objects and starts the process pool; seeding upserts built-in catalogue entries.
+Neither operation is a general schema migration system. `LOG_LEVEL` controls
+application logging; Uvicorn's flag controls its own logger. `logs/` and
+`*.log` are gitignored.
+
+The default launch omits `--reload`: its supervisor can retain the port after
+the application child exits, leaving HTTP requests unanswered. `faulthandler`
+prints Python thread stacks for native crashes. Logs show request arrival/response, S3 package checks
+and downloads, selected controls, coverage, queue/worker stages, progress and
+report persistence. See the [logging command and stage reference](docs/S3_STRATEGY_FLOW.md#start-the-backend-with-visible-logs).
+In S3 mode, seeding alone does not publish strategy files; follow the
+[portfolio publication steps](docs/S3_STRATEGY_FLOW.md#publish-the-two-built-in-portfolios).
+
+Keep the pandas/NumPy constraints in [requirements.txt](requirements.txt):
+the vendored engine depends on that compatible runtime. Optional cache warming
+from an existing MQSMaster checkout is available through
+`scripts/seed_market_cache.py --help` (use the virtual-environment interpreter).
+The market-data parquet cache lives under `data/backfill_cache/` by default;
+a cold cache can make the first run considerably slower.
+
+### Connect the frontend to the real API
+
+Keep the backend running, then open a second terminal. The sibling
+`Backtest_Visualiser_FE` checkout requires **Node >=20.19** in its `package.json`.
+From the backend repository root, use PowerShell:
+
+```powershell
+cd ../Backtest_Visualiser_FE
+npm.cmd ci
+$env:VITE_USE_FIXTURES = 'false'
+$env:VITE_API_BASE_URL = '/api'
+$env:DEV_API_PROXY_TARGET = 'http://127.0.0.1:8000'
+npm.cmd run dev -- --host 127.0.0.1 --port 5173 --strictPort
+```
+
+On Linux/macOS, in that same sibling checkout:
+
+```bash
+npm ci
+VITE_USE_FIXTURES=false VITE_API_BASE_URL=/api DEV_API_PROXY_TARGET=http://127.0.0.1:8000 npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
+```
+
+Open **http://127.0.0.1:5173**. Use that exact address: `localhost` may resolve
+to a different listener. `--strictPort` fails clearly if the requested port is
+occupied instead of silently selecting another one. These process-scoped
+settings do not overwrite the frontend's existing environment files. Vite
+proxies `/api` to this backend; check
+[proxied health](http://127.0.0.1:5173/api/health) before submitting a run.
+
+Use the project's existing login flow and approved access if prompted; do not
+put credentials or tokens in `VITE_*` variables, which reach the browser bundle.
+A frontend login is not backend authorization or an execution sandbox; the
+[security requirements](#security-this-executes-user-supplied-python) still apply.
 
 ### Why `--reload` is safe here
 
-`--reload` restarts the server on every file save, and this application owns a
-`ProcessPoolExecutor`. Those two things are only compatible because **the pool
-is built in the FastAPI lifespan and nowhere else** (`src/workers/job_manager.py`).
+The process pool is created in the FastAPI lifespan, not at module import, so
+Windows-spawned workers do not recursively create pools. Development reload
+can interrupt an in-flight run. On startup, reconciliation fails stale
+`running` rows whose worker heartbeat has expired and resubmits unclaimed
+`queued` rows; a recent heartbeat protects work owned by another process.
 
-On Windows a process pool *spawns* its workers, and spawning re-imports the
-module tree in each new interpreter. A pool constructed at import time would
-therefore be constructed again inside every worker it created, and every one of
-those would create its own — under `--reload`, the first file save turns that
-into a fork bomb. A lifespan runs exactly once per real server process and
-never inside a spawned worker, which makes it the only safe place.
-
-Two consequences you will actually see:
-
-- A reload kills any run in flight. That is not silent data loss: on the next
-  boot the reconciler (`src/workers/reconciler.py`) marks runs left `running`
-  as `failed` with `"Interrupted by server restart"`, and re-submits runs left
-  `queued`, which were never claimed by anything.
-- Nothing at import time touches the database or the pool, so `import server`,
-  `pytest`, and `python scripts/*.py` are all cheap and side-effect free.
+`RUN_HEARTBEAT_INTERVAL_SECONDS` and `RUN_HEARTBEAT_STALE_SECONDS` control that
+distinction. See [startup and worker flow](docs/ARCHITECTURE_FLOW.md#2-startup)
+for the lifecycle details. Do not run `--reload` as a production process manager.
 
 ---
 
 ## Run a backtest end to end
 
-This is a real transcript, not a sketch. Every value below came back from a
-running server against the live database.
+The following older worked example is retained as an API usage reference.
+Its run IDs, dates, numerical results and catalogue totals are historical,
+not current coverage or validation evidence. The curl examples below use Bash
+syntax; use the interactive API docs or adapt them with `curl.exe` on Windows. Check
+`GET /api/market-data/coverage?strategyKey=portfolio_2` before choosing a
+window. Newly generated reports follow the [Report Contract](docs/REPORT_CONTRACT.md),
+including additive metadata/availability fields absent from this example.
 
 ### 1. Find a strategy
 
@@ -114,7 +221,7 @@ running server against the live database.
 curl -s http://localhost:8000/api/strategies
 ```
 
-Trimmed to one of the three entries:
+Historical example, trimmed to one entry (the seeder now includes four built-ins):
 
 ```json
 {
@@ -138,9 +245,9 @@ Trimmed to one of the three entries:
 }
 ```
 
-`id` is what `strategyKey` takes. `parameters` is the complete set of keys
-`params` accepts — anything else is a 422 naming the key, because an unknown
-parameter is a typo, not a feature.
+`id` is what `strategyKey` takes. `parameters` lists the accepted **strategy**
+keys in `params`. The API also separates the reserved execution controls below;
+other unknown keys produce a 422 naming the key.
 
 ### 2. Submit the run
 
@@ -194,7 +301,18 @@ Request fields:
 | `startDate` / `endDate` | ISO dates, `start < end`, span ≤ `MAX_BACKTEST_WINDOW_DAYS` (1825). |
 | `initialCapital` | `> 0`. |
 | `mode` | `"event"` (default) or `"fast"`. Only `event` is dependable across every vendored strategy; see [Known limitations](#known-limitations-and-deferred-work). |
-| `params` | Overlaid onto the strategy's `config.json` at run time. Validated against `param_specs`: unknown key, wrong type, or out-of-range each give a 422 naming the key. |
+| `params` | Strategy keys overlay `config.json` and are validated against `param_specs`. Reserved execution controls are separated first; other unknown keys, wrong types and out-of-range values give a 422. |
+
+Execution controls use the existing `params` wire shape. `slippageBps: 5` maps
+to engine slippage `0.0005`; `commissionPerShare: 0.005` charges $0.005 per filled
+share on each side in event mode, separately from fill-price slippage. These
+are the browser form defaults; omitted controls retain legacy zero costs and
+explicit zero is respected. Fast mode requires zero per-share commission.
+The same `universe` ticker set preserves configured weights; an explicitly
+changed set gets equal weights and its own coverage validation. Empty `signals`
+and disabled `sentimentGate` are accepted; nonempty signals or enabled sentiment
+are rejected. See [Execution controls](docs/REPORT_CONTRACT.md#execution-controls)
+for the engine mapping and cost metadata.
 
 Every 422 carries `detail` as a **single sentence string**, not FastAPI's usual
 list of error objects, because the frontend's error reader only understands a
@@ -263,10 +381,11 @@ first and last of 308 points, `trades` the first of 10 rows:
 }
 ```
 
-That run took about 40 seconds of wall clock with a warm cache, produced 308
-daily equity points and 10 trade rows.
+The numbers above predate the current daily application statistics and populated
+benchmark series. Existing persisted runs are not recalculated just by upgrading
+the API; rerun a strategy to generate the current report.
 
-Three things about this payload that are easy to misread:
+Points about this payload that are easy to misread:
 
 - **Ratios, not percentages.** `totalReturn: -0.75` is −75%. So are
   `maxDrawdown`, `volatility` and `winRate` (`0.8` = 80%).
@@ -277,16 +396,18 @@ Three things about this payload that are easy to misread:
   of them closed. That is also why a run can show `winRate: 0.8` and still
   lose money — the losses are sitting in the open lots, marked to market in
   the equity curve.
-- **`benchmark` is always `null`.** The engine writes a buy-and-hold benchmark
-  to `benchmark_buy_and_hold.csv`, but on a minute grid that does not line up
-  with the event-loop samples. Emitting a mismatched series would draw a chart
-  that lies, so the field stays null until the engine computes it on the same
-  grid.
+- **New reports include a benchmark when prices are available.** It holds the
+  configured universe at its weights, using first valid in-window closes and
+  only observations known at each sample. Missing benchmark values remain
+  `null`; inspect `reportMetadata.benchmark` for coverage and entry rules.
+- **Open lots have separate marks.** Their realised `trades[].pnl` remains zero;
+  `openPositions` supplies `markPrice` and `unrealizedPnl` when a final mark
+  exists. Undefined statistics are identified by `metrics.unavailable`.
 
-Alongside the JSON, the engine writes its full CSV report — rolling windows,
-monthly returns, correlation matrix, risk decomposition, 14 files — into
-`.artifacts/<run_id>/`. That directory is gitignored and is deleted with the
-run.
+The engine can also write diagnostic CSVs into `.artifacts/<run_id>/`, including
+legacy analytics. These are separate from the [persisted report exports](#reports-and-exports)
+and may use different statistical conventions. Artifact files are local to the
+worker, gitignored, and removed when their run is deleted.
 
 ### 5. Delete it, or cancel it
 
@@ -323,13 +444,19 @@ Pydantic models in `src/schemas/`.
 | Method | Path | Backed by | Notes |
 | --- | --- | --- | --- |
 | `GET` | `/api/health` | — | Liveness. No database, no engine, no I/O. |
-| `POST` | `/api/backtests` | **Postgres + worker pool** | Submit a run. `202` + `BacktestSummary`; `422` with a one-sentence `detail` for anything the student can fix. |
+| `POST` | `/api/backtests` | **Postgres + worker pool** | Submit a run. `202` + `BacktestSummary`; `422` with a one-sentence `detail` for anything the student can fix, including a window outside the universe's market-data coverage. |
 | `GET` | `/api/backtests` | **Postgres** | Paginated, newest first. Filters: `search`, `status`, `strategyId`, `page`, `pageSize`. |
-| `GET` | `/api/backtests/{id}` | **Postgres** | Detail: metrics, equity curve, trades, `parameters`, plus `progressPct` and `errorMessage`. `404` if unknown. |
+| `GET` | `/api/backtests/{id}` | **Postgres** | Detail: metrics and availability, daily equity/benchmark, trades, `openPositions`, `reportMetadata`, parameters and progress/error fields. `404` if unknown. |
+| `GET` | `/api/backtests/{id}/exports/{filename}` | **Postgres** | `equity.csv`, `trades.csv`, `metrics.csv`, or `report.json`. Completed runs only (`409` otherwise); unknown run/filename is `404`. |
 | `DELETE` | `/api/backtests/{id}` | **Postgres** | Delete or cancel — see the table above. `204`, or `404`. |
 | `GET` | `/api/strategies` | **Postgres** | Catalogue of enabled strategies with SQL-computed run aggregates. |
 | `POST` | `/api/strategies` | **Postgres + store + worker pool** | Upload source. Scans it, stores it, and queues its validation backtest. `201` + `status: "draft"`; `422` for a rejected source; `413` over 256 KB. |
+| `GET` | `/api/strategies/template` | *nothing* | Starter source for the editor. Served so the contract it teaches cannot drift from the engine; a test asserts it passes the check below. |
 | `POST` | `/api/strategies/check` | *nothing* | Pre-flight: would this source run here? Reads it with `ast`; stores nothing, executes nothing. Always `200` when the check ran, verdict in `ok`/`issues`; `413` over 256 KB. |
+| `POST` | `/api/strategies/upload` | **Postgres** + store | `POST /strategies` for a real file: multipart `file` (`.py`, UTF-8, ≤ 256 KB) plus `name`/`description` form fields. Same scan, same store, same validation backtest, same `201` — with `validationRunId` to poll. |
+| `POST` | `/api/strategies/upload/check` | *nothing* | `POST /strategies/check` for a file. Same verdict semantics: `200` either way, problems listed by line. |
+| `GET` | `/api/strategies/{key}` | **Postgres** | One strategy **including the ones the catalogue hides**. `validationState` is the real lifecycle (`validating` / `active` / `failed_validation`), `validationRunId` the backtest to open for progress or the failure reason. This is how a client watches an upload. `404` if unknown. |
+| `GET` | `/api/market-data/coverage` | **Postgres** | Which dates have prices, by `tickers` or `strategyKey`. `start`/`end` are the window safe for the whole universe, null when a ticker has none. Read-only against `public.market_data`. |
 | `GET` | `/api/live/portfolios` | *sample data* | Live portfolio list. |
 | `GET` | `/api/live/portfolios/{id}` | *sample data* | Detail — config, positions. |
 | `GET` | `/api/live/portfolios/{id}/equity` | *sample data* | `days`. |
@@ -365,80 +492,85 @@ OpenAPI schema and look identical from the outside:
 
 ---
 
+## Reports and exports
+
+`GET /api/backtests/{id}` and the download endpoints read the same persisted
+report. For a completed run:
+
+```bash
+curl --fail -o equity.csv http://localhost:8000/api/backtests/RUN_ID/exports/equity.csv
+curl --fail -o trades.csv http://localhost:8000/api/backtests/RUN_ID/exports/trades.csv
+curl --fail -o metrics.csv http://localhost:8000/api/backtests/RUN_ID/exports/metrics.csv
+curl --fail -o report.json http://localhost:8000/api/backtests/RUN_ID/exports/report.json
+```
+
+Replace `RUN_ID`; on Windows PowerShell use `curl.exe`. Downloads do not read
+a filesystem path supplied by the caller or depend on worker artifact files.
+
+The public curve keeps the last observation per New York date. Total return
+uses initial capital; risk metrics use consecutive observed daily closes.
+No prior-date baseline, weekend prices or missing benchmark bars are invented.
+A same-date capital baseline is retained as metadata after daily downsampling,
+with `includedInDailyCurve: false` and no raw engine `curve_index`.
+
+`metrics.unavailable` maps undefined metric names to reasons. Legacy numeric
+fields retain a zero compatibility placeholder, which clients should display
+as unavailable when the map contains that key. `metrics.csv` exports an empty
+value with a reason instead. `report.json` includes the full camelCase detail,
+including `reportMetadata` and supplemental `openPositions`.
+
+See [Report Contract](docs/REPORT_CONTRACT.md) for formulas, benchmark coverage,
+fee/lot semantics, metadata keys and exact CSV columns.
+
+## CI and deployment
+
+The intended contribution flow is feature branch → PR into `dev` → PR into
+`main`. Configure GitHub branch protection/rulesets to require review and CI;
+a workflow file alone does not enforce PR-only merges.
+
+- **`dev` is CI-only.** Pushes to `dev` and PRs targeting `dev` or `main`
+  run [ci.yml](.github/workflows/ci.yml): Python 3.12 import/layer checks,
+  isolated tests, a disposable PostgreSQL pipeline proof, and an image smoke
+  build without an AWS push. The aggregate `test` job checks their outcomes.
+- **`main` is the deployment path.** A push after merging a PR, or an explicit
+  dispatch on `main`, invokes [deploy.yml](.github/workflows/deploy.yml).
+  It reruns CI for that commit before assuming the configured OIDC role,
+  building/pushing an image, and updating the existing ECS service.
+- **Deployment is gated.** It requires the production environment's configuration,
+  `AWS_DEPLOY_ROLE_ARN`, and `PRODUCTION_DEPLOY_ENABLED=true`. Missing settings
+  or a closed gate fail clearly. The workflow checks secure database TLS,
+  preserves task configuration, deploys an image by digest, and verifies the
+  intended task revision/digest after ECS becomes stable. It provisions no
+  infrastructure and defines no separate development deployment.
+
+[CI/CD operational notes](docs/CI_CD.md) retain older setup/reference material.
+Use the current workflow files for actual triggers, required variables and
+release gates; the older no-op-deploy and skip-based test descriptions in that
+document do not describe these workflows. Nothing here asserts that the
+production gate, cloud resources or a release have been verified live.
+
 ## The run pipeline, and why it is not synchronous
 
-An event-mode backtest steps timestamp by timestamp across the requested window
-plus a lookback prefix. It is minutes of single-core, GIL-holding Python. There
-is no version of this that returns inside an HTTP request:
+The API returns `202` with a queued run ID. A process-pool worker claims the
+row, executes the existing engine with progress/cancellation callbacks, and
+persists metrics, daily observations and FIFO-paired trades before marking the
+run terminal. Only the run ID crosses the process boundary; each worker owns
+its database connection. Claim predicates prevent duplicate execution.
 
-- **Inline** would block the event loop for the whole run — one student's
-  backtest freezes the API for everyone.
-- **A thread** would do exactly the same thing, because the work holds the GIL.
-- **A process pool** is the smallest thing that works. It gives queueing and a
-  responsive API with no extra infrastructure: no broker, no separate worker
-  deployment, no second thing to keep alive.
+The request/worker diagrams and layer-by-layer file map live in
+[Architecture Flow](docs/ARCHITECTURE_FLOW.md), rather than being duplicated here.
+Operational details to keep in mind:
 
-So `POST /backtests` returns `202` with a run id, and the client polls. The
-frontend's `useBacktest` hook already refetches while the status is
-non-terminal. No SSE, no websockets this phase.
+- The pool is created in the FastAPI lifespan, not at import time.
+- Progress writes are throttled; cancellation is cooperative between engine
+  operations, not an interrupt of a running query or strategy callback.
+- Daily persistence keeps the last sample on a date, including the final
+  engine mark. Money and ratios use `NUMERIC` columns.
+- Shutdown can interrupt runs; heartbeat-based reconciliation handles stale
+  running rows and unclaimed queued rows at startup.
 
-```
-POST /api/backtests
-      │  validate against the strategy registry
-      │  INSERT app.backtest_runs (status='queued')
-      │  submit run_id to the pool ─────────────┐
-      ▼                                         │
-   202 + BacktestSummary                        ▼
-                                    ProcessPoolExecutor (max_workers=2)
-   GET /api/backtests/{id}                      │  src/workers/run_job.py
-      ▲  polls, reads progressPct               │
-      │                                         ▼
-      │                        UPDATE ... SET status='running'
-      │                        WHERE id=%s AND status='queued'   ← the claim
-      │                                         │
-      │                                         ▼
-      │                             engine/run_single.py
-      │                             ├─ on_progress(pct, stage)  → throttled UPDATE
-      │                             ├─ should_cancel()          → reads cancel_requested
-      │                             └─ market data: public.market_data + parquet cache
-      │                                         │
-      └───── app.run_metrics ◄──────────────────┤  one transaction:
-             app.run_equity_points              │  metrics + equity + paired trades,
-             app.run_trades                     │  then the run row goes terminal
-             app.backtest_runs                  │
-                                                └─ CSVs → .artifacts/<run_id>/
-```
-
-Details worth knowing before changing any of it:
-
-- **Only the run id crosses the process boundary.** The worker spawns into a
-  fresh interpreter that inherited nothing, so it opens its own *synchronous*
-  database connection and reads everything else from the run row. The API's
-  asyncpg pool does not survive a `fork`/`spawn`; a worker holding one would be
-  reading another process's sockets.
-- **The claim is the concurrency control.**
-  `UPDATE ... WHERE id = ? AND status = 'queued'` affecting zero rows means
-  someone else already claimed it, and the job returns. That is what makes
-  re-submission (by the reconciler, say) harmless.
-- **Progress and cancellation share one throttled round trip.**
-  `PROGRESS_WRITE_INTERVAL_SECONDS` (default 1.0) floors the rate; when the
-  percentage changed the poll is an `UPDATE ... RETURNING cancel_requested`,
-  and when it did not it is a bare `SELECT`. Without a floor a run would spend
-  its time talking to Postgres instead of simulating.
-- **Cancellation is cooperative.** There is nothing to signal — killing a pool
-  worker would leave its run row claimed forever. The engine polls
-  `should_cancel()` between timestamp groups, plus once before constructing
-  the strategy and once before loading data, so a run cancelled while it is
-  still warming up stops in about a second rather than after a multi-minute
-  data load.
-- **The equity curve is downsampled to daily last-value** before insert. Event
-  mode records one sample per poll interval; the charts are daily, and this
-  keeps the row count at roughly one per trading day.
-- **Money and ratios are `NUMERIC`, not float**, all the way into the table.
-- **Shutdown does not wait for running backtests.** Blocking a deploy or a
-  Ctrl-C for the ten minutes a long run might have left is worse than losing
-  it, and losing it is recoverable — see the reconciler note in
-  [Why `--reload` is safe](#why---reload-is-safe-here).
+The architecture document's dated limitations are historical; use this README
+and the report contract for current fast-mode, benchmark and storage behavior.
 
 ---
 
@@ -508,14 +640,39 @@ where the class comes from.
 
 ### The store layout
 
-Uploaded source goes through one interface, `src/integrations/strategy_store.py`,
-written in **S3 vocabulary from day one** — opaque keys, whole-object
-put/get/delete, no seeking, no partial writes. The bucket does not exist yet,
-so `LocalStrategyStore` backs it with disk today; when infrastructure
-provisions one, `S3StrategyStore` is a new class behind the same Protocol, not
-a refactor of the callers. (It exists already as a stub whose every method
-raises `NotImplementedError("S3 backend arrives with infrastructure")`.
-`STRATEGY_STORE_BACKEND=local|s3` selects; do not select `s3`.)
+Uploaded source goes through [StrategyStore](src/integrations/strategy_store.py).
+`LocalStrategyStore` is the development default; `S3StrategyStore` implements
+the same whole-object operations and per-run materialization. Select S3 with
+`STRATEGY_STORE_BACKEND=s3` and `STRATEGY_STORE_S3_BUCKET`; optionally set
+`STRATEGY_STORE_S3_PREFIX`, `AWS_REGION`, and an explicit local-emulator
+`STRATEGY_STORE_S3_ENDPOINT_URL`. Credentials come from the SDK's default
+chain (for example, an ECS task role), not hardcoded access keys.
+
+**Stored/staged → validating → active:** source and generated config are stored
+under one newly allocated `strategies/<key>/` package before a disabled
+`validating` registry row is submitted for validation. Only a successful
+validation marks that row `active` and enables it. Failure leaves it disabled.
+This is a registry lifecycle: there is no copy/rename into an `active/` S3
+prefix. Both stages use the same stored package. Workers materialize it into
+a temporary directory before importing it.
+
+A partial write to a fresh package triggers cleanup; an identical completed
+package can be retried, and a conflicting existing package is not overwritten.
+The configured bucket and task-role permissions must already exist; selecting
+S3 does not provision them.
+
+The integration stack's `strategy_bucket_name` output currently identifies
+`mqs-backtest-visualizer-strategies-855603407903-us-east-2` in `us-east-2`.
+Local S3 development uses `STRATEGY_STORE_S3_PREFIX=development` with an approved
+developer AWS profile. Production uses `STRATEGY_STORE_S3_PREFIX=production`:
+the task role permits bucket listing for, and object access only under,
+`production/strategies/*`. It cannot read development packages. Keep the
+registry, chosen prefix and IAM scope aligned; configuring storage does not
+deploy the API or grant permissions. Reconfirm the infrastructure output before
+an operational cutover.
+
+The local layout below maps to
+`s3://<bucket>/<optional-prefix>/strategies/<key>/` for S3:
 
 ```
 .strategy_store/                          ← STRATEGY_STORE_ROOT, gitignored
@@ -536,6 +693,54 @@ Worker side, per run: materialize into a per-run temp dir, import
 `strategy.py` via `importlib.util.spec_from_file_location`, register it in
 `sys.modules` under a synthetic per-run name, find the `BasePortfolio`
 subclass, hand it to `run_single` like any built-in, delete the temp dir.
+
+### Migrate existing local packages to S3
+
+This is an opt-in operator cutover, not an isolated test. It reads the configured
+application registry and contacts the explicitly named S3 bucket. Review the
+database target, `STRATEGY_STORE_ROOT`, AWS identity and destination first;
+retain backups of the registry and local packages. The source is always local,
+even if `STRATEGY_STORE_BACKEND` already says `s3`.
+
+From the backend repository root, start with the **read-only dry-run** (default):
+
+```powershell
+$strategyBucket = 'mqs-backtest-visualizer-strategies-855603407903-us-east-2'
+.\venv\Scripts\python.exe scripts/migrate_strategy_store_s3.py --bucket $strategyBucket --prefix development --region us-east-2
+```
+
+The example targets local-development storage. For an approved production
+cutover, explicitly use `--prefix production` with an identity authorized there;
+do not weaken IAM or reuse the development prefix for the production task.
+
+Before applying, stop **all API instances and workers, including validation
+workers on other hosts**, and prevent package edits. Keep them stopped through
+verification and the coordinated backend switch. The flag below acknowledges
+that prerequisite; the script cannot stop or inspect remote workers for you.
+
+```powershell
+# Only after all API/worker instances are stopped; keep the reviewed target.
+.\venv\Scripts\python.exe scripts/migrate_strategy_store_s3.py --bucket $strategyBucket --prefix development --region us-east-2 --apply --api-workers-stopped
+```
+
+On Linux/macOS use `venv/bin/python`, assign `strategyBucket='...'` to the same
+reviewed bucket, and pass `--bucket "$strategyBucket"` with the same flags.
+The script copies registry-referenced user packages regardless of active/disabled
+status, preserving `storage_key` and exact bytes. It excludes built-ins and
+unreferenced local files. Conditional writes do not overwrite existing objects;
+equal objects are accepted and conflicts fail. Both `strategy.py` and
+`config.json` are verified byte-for-byte and with SHA-256. No registry updates,
+deletes, bucket provisioning or IAM changes occur.
+
+Only after an **apply exit code of 0** and complete verification, set
+`STRATEGY_STORE_BACKEND=s3`, the reviewed bucket, matching prefix and region in
+the existing configuration for every API/worker instance, then restart together.
+A dry-run exit of 0 is a plan, not a completed copy. On a nonzero exit, do not
+switch or restart: keep services stopped, resolve the cause and rerun. Two S3
+objects are not an atomic package write, so an interruption may leave one half;
+a rerun verifies existing bytes and copies only missing objects. Local originals
+remain available for rollback, but reconcile any post-cutover uploads/deletions
+before switching back. See the script's `--help` for bounded inventory limits.
 
 ### What an uploadable strategy looks like
 
@@ -568,75 +773,61 @@ Exactly one `BasePortfolio` subclass per file — zero means the file is not a
 strategy, and two means the answer depends on which one the loader happens to
 find first. Both are a 422.
 
+`context.buy(ticker)` moves toward the configured long `WEIGHTS` allocation,
+covering a short first; absent weights use equal allocation. `context.sell(ticker)`
+reduces an existing long to flat and does nothing when flat or short.
+`context.close_position(ticker)` closes either side. For deliberate signed
+exposure, use `context.target_weight(ticker, weight)`: `0.25` targets a 25% long,
+`-0.25` targets a 25% short, and `0` targets flat. Each helper accepts `confidence`
+to trade that fraction of the remaining adjustment, subject to whole-share
+rounding, cash, margin, and execution costs.
+
 ---
 
 ## Security: this executes user-supplied Python
 
-Stated plainly, because it is the largest risk in this codebase and softening
-it would be dishonest:
+Validation imports uploaded Python into a worker with the configured database
+and storage access. The AST scan restricts imports, dangerous builtins and
+interpreter escape attributes; a short data window and cooperative timeout
+bound ordinary validation work. These controls are not a sandbox, and a
+strategy that never returns to the engine may not observe cancellation.
 
-**Validating an uploaded strategy means importing and executing untrusted
-Python inside a worker process that holds admin credentials to the production
-MQS trading database.** That is a deliberate product decision — functional
-first, for a small authenticated club — and it is the only reason the
-guardrails below are considered sufficient.
+Authentication/owner enforcement and execution isolation remain separate
+requirements before broader exposure. Use least-privilege roles and restrict
+access. A future sandbox needs process/container resource limits, controlled
+network access and database permissions restricted to the intended scope:
 
-The guardrails are:
+- Read `public.market_data`; the application owns its `app.*` schema.
+- Do not touch live-trading tables such as `positions_book`, `cash_equity_book`,
+  `pnl_book`, `risk_book`, `portfolio_weights`, `trade_execution_logs`,
+  `news_sentiment`, `rbp_forecasts` or `user_creds`.
 
-1. **An AST scan** (`src/services/strategy_validation.scan_source`) that
-   refuses imports outside a small allowlist (`engine`, `pandas`, `numpy`,
-   `math`, `datetime`, `typing`, `collections`, `statistics`, `logging`),
-   refuses `exec` / `eval` / `compile` / `__import__` / `open` / `input` /
-   `breakpoint` anywhere they appear, refuses attribute access into `os`,
-   `sys`, `subprocess`, `socket`, `pathlib` and friends, and refuses the usual
-   routes back into the interpreter (`__globals__`, `__subclasses__`,
-   `__code__`, …).
-2. **A wall-clock timeout** on validation runs, enforced through the ordinary
-   cancellation flag.
-3. **A short validation window**, so a validation run is a minute of CPU
-   rather than an hour of it.
-
-**None of these is a security boundary.** The scan reads source the interpreter
-is about to execute anyway, and any author who wants past it can get past it
-with a string, a dunder, or a decorator — it is a speed bump against accidents
-and casual mischief, nothing more. The timeout is cooperative: it sets a flag
-the engine polls, and code that never returns to the engine loop never sees it.
-
-Real isolation is deferred work and is **required before this application is
-exposed beyond the club**: a container per run, no network egress, and a
-database role scoped to `SELECT` on `public.market_data` instead of the admin
-credentials the worker holds today.
-
-Two related rules that are enforced by code review and nothing else, because
-the credentials in `.env` are admin-level:
-
-- The app may **read** `public.market_data` and **owns** everything under the
-  `app` schema.
-- It must never read or write `positions_book`, `cash_equity_book`, `pnl_book`,
-  `risk_book`, `portfolio_weights`, `trade_execution_logs`, `news_sentiment`,
-  `rbp_forecasts`, or `user_creds`. This platform simulates; it does not trade.
+See the historical [backend design](BACKEND_PLAN.md) for the original scope
+and the [source scan](src/services/strategy_validation/scanning.py) for the
+actual allowlist. Passing validation means the strategy ran, not that it is
+safe to execute without isolation.
 
 ---
 
 ## Configuration
 
-`.env.example` is the annotated template. Copy it and fill in the `POSTGRES_*`
-block; every other key has a working default.
+`.env.example` is the annotated template; use the non-overwriting copy commands
+in [Quick start](#quick-start) only if `.env` is absent. Configure the database
+and, if selected, the S3 store.
 
-```bash
-cp .env.example .env
-```
-
-**Nothing reads `os.environ` outside `src/core/config.py`.** Importing
-`settings` is the only supported way to get configuration, so a typo fails at
-startup rather than three screens deep in a worker at 2 a.m.
+Application settings come from [src/core/config.py](src/core/config.py).
+The standalone engine's [database adapter](engine/data/db_adapter.py) is the
+intentional independent reader. Both accept `MARKET_DATA_*` aliases for
+`HOST`, `PORT`, `DB`, `USER`, `PASSWORD` and `SSLMODE`; a nonempty
+`POSTGRES_*` value wins over its alias. Existing process environment values
+take precedence over the same names loaded from `.env`.
 
 The knobs most worth knowing:
 
 | Variable | Default | What it controls |
 | --- | --- | --- |
-| `POSTGRES_HOST` / `_PORT` / `_DB` / `_USER` / `_PASSWORD` | — | The MQS instance. The only block you must fill in. |
-| `POSTGRES_SSLMODE` | `prefer` | **`require` is rejected by this server**; `prefer` connects and still encrypts. Verified — do not "harden" without retesting. |
+| `POSTGRES_HOST` / `_PORT` / `_DB` / `_USER` / `_PASSWORD` | Port `25060`, database `mqsdb` | Database connection; equivalent `MARKET_DATA_*` aliases are accepted by API and engine. |
+| `POSTGRES_SSLMODE` / `MARKET_DATA_SSLMODE` | `prefer` | Preserve the database operator's explicit TLS policy. `prefer` permits fallback; production deployment requires `require`, `verify-ca`, or `verify-full`. No automatic TLS downgrade on failure. |
 | `MAX_CONCURRENT_RUNS` | `2` | Worker pool size. Bounded by cores, not by request volume. |
 | `MAX_BACKTEST_WINDOW_DAYS` | `1825` | Largest window `POST /backtests` accepts. |
 | `PROGRESS_WRITE_INTERVAL_SECONDS` | `1.0` | Floor between a worker's progress/cancel round trips. |
@@ -644,7 +835,11 @@ The knobs most worth knowing:
 | `VALIDATION_WINDOW_DAYS` / `_INITIAL_CAPITAL` | `30` / `100000` | The window and capital a validation run uses. |
 | `ARTIFACT_DIR` | `.artifacts` | Engine CSVs, one directory per run. |
 | `MARKET_CACHE_DIR` | `data/backfill_cache` | Parquet market-data cache, one file per ticker. |
-| `STRATEGY_STORE_ROOT` / `_BACKEND` | `.strategy_store` / `local` | Uploaded strategy source. |
+| `STRATEGY_STORE_ROOT` / `_BACKEND` | `.strategy_store` / `local` | Uploaded strategy source; `local` or `s3`. |
+| `STRATEGY_STORE_S3_BUCKET` / `_PREFIX` | Empty | Bucket required for S3; optional namespace prefix. |
+| `STRATEGY_STORE_S3_ENDPOINT_URL` | Empty | Optional LocalStack/MinIO URL; falls back to `AWS_ENDPOINT_URL`. Leave unset for normal AWS S3. |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | Empty | Explicit region, otherwise SDK resolution. |
+| `LOG_LEVEL` / `MARKET_TIMEZONE` | `INFO` / `America/New_York` | Application logging and fill calendar dates; keep New York for alignment with engine equity/benchmark dates. |
 
 Relative paths resolve against the **repository root**, not the working
 directory, because workers and scripts get launched from wherever the operator
@@ -664,7 +859,9 @@ repositories that currently no-ops).
 
 ## The database
 
-One PostgreSQL instance (17.6, `mqsdb`), used for two different things.
+The application uses PostgreSQL for market-data reads and its own report/registry
+schema. The historical MQS instance below was recorded as 17.6/`mqsdb`; the
+current connection is determined by configuration.
 
 ### `public.market_data` — read-only
 
@@ -686,11 +883,12 @@ Per-ticker ranges: `AAPL`, `AMD`, `AMZN`, `MSFT`, `NVDA`, `TSLA`
 2020-01-02 → 2026-06-22 · `CAT` → 2026-05-26 · `UNH`, `XOM` → 2026-05-21 ·
 `GLD`, `^VIX` → 2026-05-20 · `TLT` 2019-11-11 → 2025-11-07.
 
-**The thing to internalise: coverage ends weeks behind today's date.** A window
-computed from `now()` returns zero rows, and a run over it fails loudly rather
-than returning an empty success. `POST /backtests` does *not* pre-check the
-window against coverage — it accepts the dates and the engine reports the empty
-range on the run row. Pick dates inside the table.
+These ranges are historical, not a current coverage guarantee. Query
+`GET /api/market-data/coverage` by strategy or ticker before choosing dates.
+`POST /api/backtests` checks the requested window against the universe's
+coverage and rejects out-of-range submissions. Boundary coverage does not prove
+that every interior bar exists; the engine still fails if a run has no usable
+observations. Validation windows are anchored to available data, not today's date.
 
 Note also that `open_price` / `high_price` / `low_price` are NULL for the more
 recent bars; only `close_price` and `volume` are populated, which is why the
@@ -721,87 +919,30 @@ never share a connection.
 
 ## Repository layout
 
-> For the call-by-call flow — startup, submitting a run, worker execution,
-> strategy upload — with rendered diagrams and `file:line` references, see
-> **[docs/ARCHITECTURE_FLOW.md](docs/ARCHITECTURE_FLOW.md)**.
+The full [file map](docs/ARCHITECTURE_FLOW.md#8-file-map) and
+[layering rules](docs/ARCHITECTURE_FLOW.md#7-layering-rules) live in Architecture Flow.
 
-Code is placed by role. A file that needs two roles is two files.
+| Area | Responsibility |
+| --- | --- |
+| `server.py`, `src/api/`, `src/schemas/` | ASGI entrypoint, HTTP routes and camelCase contracts. |
+| `src/services/`, `src/repositories/`, `src/models/` | Reporting/business rules, async database access and `app.*` models. |
+| `src/workers/` | Process-pool execution, synchronous persistence and reconciliation. |
+| `src/integrations/` | Local/S3 strategy storage; vendor SDKs stay here. |
+| `engine/` | Standalone vendored engine, contracts, strategies and analytics. |
+| `scripts/`, `tests/` | Operational tools and isolated/explicit database checks. |
 
-```
-mqs-backtest-visualizer/
-│
-├── server.py                  ASGI entrypoint. Builds the app, mounts CORS and
-│                              the router, and attaches the composed lifespan
-│                              (schema first, then the worker pool).
-│
-├── src/
-│   ├── api/routes/            HTTP only: parse, delegate, serialize.
-│   │                          Never imports SQLAlchemy or engine.*
-│   ├── schemas/               Pydantic request/response models — the frontend
-│   │                          contract. camelCase via CamelModel; mirrors the
-│   │                          client's Zod types.
-│   ├── services/              Business logic. No SQL strings.
-│   │                          backtests · strategies · strategy_validation ·
-│   │                          trade_pairing · sample_data (/live/* only)
-│   ├── repositories/          All async database access. The owner-scoping
-│   │                          seam (for_user) lives here.
-│   ├── models/                SQLAlchemy ORM models for the app schema.
-│   ├── db/                    Engine/session plumbing and schema init.
-│   ├── workers/               Job execution. Sync DB only; may import engine.*
-│   │                          job_manager · run_job · reconciler
-│   ├── integrations/          Adapters to external systems (the strategy
-│   │                          store). Vendor SDK types stop here.
-│   └── core/                  Settings. The only module that reads the
-│                              environment.
-│
-├── engine/                    The vendored backtest engine. Zero FastAPI,
-│   │                          SQLAlchemy or src.* imports — it must stay
-│   │                          runnable standalone.
-│   ├── contracts/             RunRequest / RunResult / RunCancelled /
-│   │                          NoMarketData — the seam the worker calls.
-│   ├── run_single.py          run_single(request) -> RunResult. One portfolio,
-│   │                          one window, structured data back.
-│   ├── core/                  Simulation kernel: engine, event-loop runner,
-│   │                          executor, cost model, market-data query.
-│   ├── analytics/             Reporting, metrics, vectorised/fast mode, CSCV.
-│   ├── strategies/            portfolio_BASE + the four vendored portfolios,
-│   │                          each a folder of strategy.py + config.json.
-│   ├── indicators/            Technical indicators, loaded by name.
-│   ├── data/                  db_adapter.py (the only DB seam) and the
-│   │                          parquet cache.
-│   └── VENDORED_FROM          Upstream SHA, full copy map, and what was
-│                              deliberately not copied.
-│
-├── scripts/                   Operational one-offs. Import from src/engine,
-│                              never duplicate logic.
-├── tests/unit/ · tests/integration/
-├── .env.example · requirements.txt · pytest.ini
-└── BACKEND_PLAN.md            The work order this backend was built from.
-```
-
-Two structural rules that are enforced, not aspirational:
-
-- **`engine/` imports nothing from `src/`.** Its only database access is
-  `engine/data/db_adapter.py`, which reproduces the exact
-  `{"status": ..., "data": [dict-rows]}` contract MQSMaster's connector
-  returned. That is what keeps the engine testable without an API and
-  swappable later.
-- **Routes → services → repositories → database.** A route that imports
-  SQLAlchemy is a bug.
-
-Every local modification to vendored engine code carries a `# VISUALIZER:`
-comment (33 of them across 7 files), so an upstream diff stays readable.
-`engine/VENDORED_FROM` records the SHA it came from.
-
-### Legacy placeholders
-
-`auth/` and `route/` predate this layout and are empty. Remove when convenient.
+Routes delegate to services and repositories. `engine/` does not import
+`src/`, FastAPI or SQLAlchemy; its independent database adapter preserves
+that boundary. [engine/VENDORED_FROM](engine/VENDORED_FROM) records upstream
+provenance. Older `auth/` and `route/` directories are scaffold placeholders.
 
 ---
 
 ## Operational scripts
 
-All are safe to re-run and take `--help`.
+Read each script's `--help` before running it. Seeding writes to the configured
+application database; the S3 verifier performs an explicit temporary-object
+round trip. These are operator commands, not part of isolated tests.
 
 | Script | What it does |
 | --- | --- |
@@ -809,38 +950,9 @@ All are safe to re-run and take `--help`.
 | `scripts/check_market_data.py` | Measures `market_data` coverage for the seeded universes — first and last bar per ticker, and the window that is safe for all of them. `--all-tickers` walks the whole tape and is opt-in for good reason. |
 | `scripts/smoke_engine.py` | Proves the vendored engine can reach the real database: builds `portfolio_dummy` through `EngineDBAdapter` and pulls a short window of daily bars. Run it after touching `engine/data/` or `engine/core/utils.py`. |
 | `scripts/seed_market_cache.py` | Copies already-backfilled parquet files out of a local MQSMaster checkout into `data/backfill_cache/`. Optional; turns a first run into a cache hit. |
-
----
-
-## Tests
-
-```bash
-venv/Scripts/python.exe -m pytest -q          # everything: 212 passing
-venv/Scripts/python.exe -m pytest -q tests/unit    # no database needed
-```
-
-Anything that needs the live database carries `@pytest.mark.db`. A session
-fixture in `tests/conftest.py` attempts a 3-second connect once; if it fails,
-every `db`-marked test **skips with a clear reason** instead of failing, so the
-suite is green on a laptop off the university network.
-
-Two traps that have already cost time here:
-
-- **`TestClient` must be used as a context manager.** Outside a `with` block,
-  Starlette spins a fresh event loop per request, and the asyncpg pool's
-  connections belong to the loop that opened them — the second DB-backed
-  request raises `Event loop is closed`. Entering the block also runs the
-  lifespan, which is what creates the worker pool at all.
-- **A module- or session-scoped fixture is set up *before* the function-scoped
-  `db`-marker skip.** A module-scoped DB fixture must therefore request
-  `database_available` and `pytest.skip` itself, or an offline machine gets a
-  connection error instead of a skip — and an online one can burn ten minutes
-  on a backtest before reporting "skipped".
-
-The integration tests submit real backtests against real market data over a
-window pinned inside verified coverage (2026-03-02 → 2026-07-15). They are the
-end-to-end proof that the pipeline works; they are also why the suite takes
-around a minute rather than a second.
+| `scripts/verify_s3_store.py` | Opt-in store verification against an explicitly named bucket (`--bucket` required); writes/reads/deletes a unique temporary key and tests materialization. Supports an emulator endpoint. |
+| `scripts/migrate_strategy_store_s3.py` | Read-only dry-run by default; opt-in conditional copy and byte verification of registry-referenced local packages. Apply requires all API/validation workers stopped; see [cutover instructions](#migrate-existing-local-packages-to-s3). |
+| `scripts/check_ci_test_report.py` | Checks the disposable-PostgreSQL JUnit report; rejects empty or skipped integration coverage. |
 
 ---
 
@@ -849,8 +961,8 @@ around a minute rather than a second.
 | Symptom | Cause and fix |
 | --- | --- |
 | Every `db` test skips | The database is unreachable — check the `POSTGRES_*` block, and that you are on a network that can reach the host. The skip reason names the failure. |
-| `sslmode=require` connection failures | This server rejects `require`. Use `prefer` (the default). |
-| A run fails immediately with a message about no market data | The window is outside coverage. Data ends **2026-07-15**; a window computed from today returns nothing. Run `scripts/check_market_data.py`. |
+| TLS connection failures | Verify the server certificate, trust configuration and configured SSL mode with the database operator. Do not weaken TLS to make a connection succeed; production deploy rejects insecure modes. |
+| A run fails immediately with a message about no market data | Check current universe coverage and the run's requested window. Query `/api/market-data/coverage` or use `scripts/check_market_data.py`; the historical dates above may be stale. |
 | The first run of the day takes minutes at "loading data" | Cold parquet cache against a remote database. Expected once per ticker set; `scripts/seed_market_cache.py` avoids it. |
 | Runs stay `queued` forever | The worker pool lives in the lifespan. If the app was constructed without it (e.g. a bare `TestClient(app)` with no `with`), nothing dispatches. |
 | A run says "Interrupted by server restart" | Exactly what it says — `--reload` or a deploy killed its worker. The reconciler wrote that message on the next boot. Re-submit. |
@@ -862,6 +974,11 @@ around a minute rather than a second.
 
 ## Known limitations and deferred work
 
+> The measured, dated picture — smoke-test numbers, per-ticker data horizon,
+> and every gap ranked by what blocks a deploy — lives in
+> **[docs/READINESS.md](docs/READINESS.md)**. Regenerate the numbers with
+> `venv/Scripts/python.exe scripts/smoke_db.py`.
+
 Honest list of what is not built, so nobody discovers it the hard way.
 
 | Item | Status |
@@ -869,14 +986,77 @@ Honest list of what is not built, so nobody discovers it the hard way.
 | `/live/*` endpoints | Generated sample data. Backing them with the real trading tables is a separate product decision. |
 | Authentication | Out of scope here. The seams exist (`owner_id` column, a `for_user()` repository filter that no-ops); a parallel session builds Supabase OAuth. Until it lands, **every run is visible to everyone**. |
 | Real sandboxing for uploaded code | Deferred, and required before this is exposed beyond the club. See [Security](#security-this-executes-user-supplied-python). |
-| `mode: "fast"` (the vectorised path) | Accepted by the API but not implemented by every strategy, and `portfolio_dummy` cannot use it at all. An unsupported combination fails the run with a message naming the strategy rather than being rejected at submit time — checking properly would mean importing the strategy class inside the request. Use `event`. |
-| Benchmark series on the equity curve | Always `null`. The engine computes buy-and-hold on a minute grid that does not align with event-loop samples. |
-| A strategy that raises inside `OnData` still passes validation | The engine's event loop catches per-timestamp strategy exceptions, logs them and continues, so the run completes. Import-time and construction-time failures *are* caught. Fixing this means having the runner re-raise when `strict` is set. |
+| `mode: "fast"` (the vectorised path) | Available for registered adapters, including the built-in `VolMomentum`, `MomentumStrategy` and `RegimeAdaptiveStrategy`; `portfolio_dummy` is unsupported. It is an approximation, retains warmup/first-day-return behavior, and emits no fills. Unsupported classes fail clearly in the engine. |
+| Benchmark coverage | Configured-universe buy-and-hold is populated from observed prices. Missing/late entries and stale marks remain possible; inspect metadata. No calendar grid or future-price backfill. |
+| Strategy exceptions during validation | The application runs the engine in strict mode: strategy exceptions propagate and fail the run. This is functional validation, not sandboxing. |
 | OMS (TWAP/VWAP child-order slicing) | Not vendored — it is live-trading machinery. The engine always takes upstream's documented direct-execution path, so fills differ from an MQSMaster run of the same portfolio. |
-| Real `S3StrategyStore` | Stub. Arrives when the infrastructure repo provisions a bucket; the swap is one class behind the existing Protocol. |
-| Alembic migrations | Not yet. `create_all` builds the schema; add migrations at the first change after other people depend on `app.*`. |
+| S3 strategy persistence | Implemented behind the same store protocol as local disk; bucket, region, credentials/task role and permissions are deployment prerequisites. |
+| Legacy engine analytics | Kept as diagnostic output; they can differ from daily application metrics and extreme short-window CAGR can overflow. API statistics/availability use the report contract. |
+| Alembic migrations | Not yet. `create_all` creates missing objects; existing schemas need an explicit migration plan for incompatible changes. |
 | SSE / websocket progress | Polling only. Revisit if polling proves insufficient. |
 | Portfolios 4–8 as built-ins | They depend on RBP / screener / NLP chains that are not part of this product yet. |
 
-Full design rationale, the task-by-task work order this backend was built from,
-and the verified database facts behind it: `BACKEND_PLAN.md`.
+Full historical design rationale and the task-by-task work order:
+[BACKEND_PLAN.md](BACKEND_PLAN.md). Current report behavior is described in
+[Report Contract](docs/REPORT_CONTRACT.md).
+
+
+## Tests
+
+Start with the isolated suite. A file being under `tests/unit/` does not imply
+that it avoids the database; select by markers explicitly.
+
+Windows PowerShell:
+
+```powershell
+.\venv\Scripts\python.exe -m pytest -q -m 'not db and not ci_db'
+```
+
+Linux/macOS:
+
+```bash
+venv/bin/python -m pytest -q -m 'not db and not ci_db'
+```
+
+For a bounded report check, append
+`tests/unit/test_report_benchmark.py tests/unit/test_db_adapter.py tests/unit/test_reporting.py`.
+Do not use an unfiltered `pytest` invocation as an offline check.
+
+**Disposable PostgreSQL integration is opt-in.** The proof in
+[tests/integration/test_ci_pipeline.py](tests/integration/test_ci_pipeline.py)
+is marked `ci_db`. It requires `CI_DATABASE_TESTS=1`,
+`POSTGRES_HOST=127.0.0.1` (or `localhost`), `POSTGRES_DB=mqs_test`, and
+explicit `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`.
+Use only a disposable local instance. It creates fixture market data when the
+table is absent, checks existing fixture contents, and writes application rows.
+With opt-in enabled, a wrong target or unavailable database fails rather than
+silently skipping. The CI workflow supplies its own disposable PostgreSQL
+service; it does not use the MQS market-data database.
+
+After configuring that disposable test environment, run:
+
+```powershell
+.\venv\Scripts\python.exe -m pytest -q -m ci_db tests/integration/test_ci_pipeline.py
+```
+
+On Linux/macOS substitute `venv/bin/python`. Local disposable PostgreSQL may
+use `POSTGRES_SSLMODE=disable`; this is not a production TLS recommendation.
+
+**Actual configured-database tests are a separate opt-in operation.** Tests
+marked `db` connect to the configured database, read market data and may
+create application rows or execute real backtests. Review their fixture dates
+and target before choosing individual files. For example, after intentionally
+configuring a suitable database:
+
+```powershell
+.\venv\Scripts\python.exe -m pytest -q -m 'db and not ci_db' tests/unit/test_run_single.py
+```
+
+Again, use `venv/bin/python` on Linux/macOS. The `db` fixture skips if its
+connection probe fails; a skipped test is not successful database verification.
+
+When adding integration tests, use `TestClient` as a context manager when the
+test needs application lifespan/worker startup. Tests that mock every service
+and intentionally avoid lifespan can use the client without starting a pool.
+Module/session-scoped live-DB fixtures must depend on `require_database` (or
+explicitly check `database_available`) before opening their own connections.

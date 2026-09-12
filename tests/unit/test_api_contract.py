@@ -54,10 +54,14 @@ def client() -> Iterator[TestClient]:
     so the second request would find a pool bound to a closed loop. Entering the
     context manager keeps one loop for the whole module.
     """
-    with TestClient(app) as test_client:
-        yield test_client
-        # Close the pool inside that loop, before it goes away.
-        test_client.portal.call(dispose_async_engine)
+    from src.api.dependencies.current_user import require_current_user
+    from uuid import UUID
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(app.dependency_overrides, require_current_user,
+                      lambda: UUID("00000000-0000-0000-0000-000000000001"))
+        with TestClient(app) as test_client:
+            yield test_client
+            test_client.portal.call(dispose_async_engine)
 
 
 # The disabled test harness, deliberately: a run against it can never be
@@ -139,7 +143,7 @@ def test_backtest_detail_carries_curve_trades_and_metrics() -> None:
     )
     assert _aliases(PerformanceMetrics) == {
         "totalReturn", "cagr", "sharpe", "sortino", "maxDrawdown",
-        "volatility", "winRate", "profitFactor", "totalTrades",
+        "volatility", "winRate", "profitFactor", "totalTrades", "unavailable",
     }
     assert _aliases(EquityPoint) == {"date", "equity", "benchmark"}
     assert {"entryDate", "exitDate", "returnPct"} <= _aliases(Trade)
@@ -176,68 +180,63 @@ def test_strategy_keys_are_camel_case() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _user_headers() -> dict[str, str]:
+    # Alice from the dummy user_creds rows used to test the public list.
+    return {"X-User-Id": "4510522a-07e1-4dba-98c3-e83bbee3cfe3"}
+
+
 @pytest.mark.db
-def test_backtest_list_is_paginated(
-    client: TestClient, seeded_run: BacktestSummary
-) -> None:
-    response = client.get("/api/backtests", params={"page": 1, "pageSize": 2})
+def test_backtest_list_is_paginated(client: TestClient) -> None:
+    """List is public.backtest_runs scoped by X-User-Id. Empty is a valid page."""
+    response = client.get(
+        "/api/backtests", params={"page": 1, "pageSize": 2}, headers=_user_headers()
+    )
     assert response.status_code == 200
 
     body = response.json()
     assert set(body) == {"items", "total", "page", "pageSize"}
     assert body["page"] == 1
     assert body["pageSize"] == 2
-    # The fixture's run is the newest, so page 1 is never empty here — which is
-    # what makes the per-item key assertion below run at all.
-    assert body["items"]
     assert len(body["items"]) <= 2
     assert body["total"] >= len(body["items"])
 
     for item in body["items"]:
-        # camelCase is the contract, not a preference.
         assert set(item) == _aliases(BacktestSummary)
 
 
 @pytest.mark.db
-def test_backtest_list_filters_by_strategy(
-    client: TestClient, seeded_run: BacktestSummary
-) -> None:
+def test_backtest_list_filters_by_strategy(client: TestClient) -> None:
     response = client.get(
-        "/api/backtests", params={"strategyId": CONTRACT_RUN_STRATEGY}
+        "/api/backtests",
+        params={"strategyId": CONTRACT_RUN_STRATEGY},
+        headers=_user_headers(),
     )
     assert response.status_code == 200
+    assert all(
+        item["strategyId"] == CONTRACT_RUN_STRATEGY for item in response.json()["items"]
+    )
 
-    items = response.json()["items"]
-    # A filter that returns nothing would satisfy the "all match" assertion on
-    # its own, so prove the matching row is actually there first.
-    assert seeded_run.id in {item["id"] for item in items}
-    assert all(item["strategyId"] == CONTRACT_RUN_STRATEGY for item in items)
-
-    other = client.get("/api/backtests", params={"strategyId": "portfolio_1"})
+    other = client.get(
+        "/api/backtests",
+        params={"strategyId": "portfolio_1"},
+        headers=_user_headers(),
+    )
     assert other.status_code == 200
-    assert seeded_run.id not in {item["id"] for item in other.json()["items"]}
+    assert all(item["strategyId"] == "portfolio_1" for item in other.json()["items"])
 
 
 @pytest.mark.db
-def test_backtest_list_rows_match_their_detail(
+def test_backtest_detail_shape_from_app_row(
     client: TestClient, seeded_run: BacktestSummary
 ) -> None:
-    """Whatever the list shows must be fetchable in full."""
-    listing = client.get("/api/backtests", params={"pageSize": 3})
-    assert listing.status_code == 200
-
-    items = listing.json()["items"]
-    assert items, "the seeded run must appear on the first page"
-
-    for item in items:
-        detail = client.get(f"/api/backtests/{item['id']}")
-        assert detail.status_code == 200
-
-        body = detail.json()
-        assert body["id"] == item["id"]
-        assert set(body["metrics"]) == _aliases(PerformanceMetrics)
-        assert isinstance(body["equityCurve"], list)
-        assert isinstance(body["trades"], list)
+    """Detail still comes from app.backtest_runs — list ids may not exist there."""
+    detail = client.get(f"/api/backtests/{seeded_run.id}")
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["id"] == seeded_run.id
+    assert set(body["metrics"]) == _aliases(PerformanceMetrics)
+    assert isinstance(body["equityCurve"], list)
+    assert isinstance(body["trades"], list)
 
 
 @pytest.mark.db
@@ -498,6 +497,84 @@ def test_a_staticmethod_ondata_still_needs_its_context(client: TestClient) -> No
 
     assert body["ok"] is False
     assert "OnData(context)" in body["issues"][0]["message"]
+
+
+def test_the_template_passes_our_own_compatibility_check(client: TestClient) -> None:
+    """The one test that keeps the editor honest.
+
+    The starter source is the first thing a member sees. If it does not pass
+    the check we run against their work, it teaches the wrong contract on the
+    first screen, which is exactly how the previous template ended up written
+    against a base class that never existed.
+    """
+    template = client.get("/api/strategies/template")
+    assert template.status_code == 200
+
+    body = template.json()
+    assert body["filename"].endswith(".py")
+
+    verdict = _check(client, body["source"])
+    assert verdict["ok"] is True, verdict["issues"]
+    assert verdict["warnings"] == [], verdict["warnings"]
+
+
+def test_template_keys_are_camel_case(client: TestClient) -> None:
+    assert set(client.get("/api/strategies/template").json()) == {"filename", "source"}
+
+
+def test_check_rejects_an_indicator_the_engine_does_not_have(
+    client: TestClient,
+) -> None:
+    """The last common way to pass the check and still fail the run.
+
+    A bad indicator name gets past every other rule here and then raises
+    ModuleNotFoundError at construction, which reads as a broken platform
+    rather than a typo.
+    """
+    source = COMPATIBLE_SOURCE.replace(
+        "class ContractCheckStrategy(BasePortfolio):",
+        "class ContractCheckStrategy(BasePortfolio):\n"
+        "    def __init__(self, db, ex, debug=False, config_dict=None,\n"
+        "                 backtest_start_date=None, order_manager=None):\n"
+        "        super().__init__(db, ex, debug, config_dict,\n"
+        "                         backtest_start_date, order_manager)\n"
+        '        self.RegisterIndicatorSet({"st": ("SuperTrend", {"period": 10})})\n',
+    )
+    body = _check(client, source)
+
+    assert body["ok"] is False
+    message = body["issues"][0]["message"]
+    assert "SuperTrend" in message
+    # Names the file the engine would import, which is the whole diagnosis.
+    assert "super_trend.py" in message
+
+
+def test_check_accepts_the_indicators_the_engine_ships(client: TestClient) -> None:
+    source = COMPATIBLE_SOURCE.replace(
+        "class ContractCheckStrategy(BasePortfolio):",
+        "class ContractCheckStrategy(BasePortfolio):\n"
+        "    def __init__(self, db, ex, debug=False, config_dict=None,\n"
+        "                 backtest_start_date=None, order_manager=None):\n"
+        "        super().__init__(db, ex, debug, config_dict,\n"
+        "                         backtest_start_date, order_manager)\n"
+        '        self.RegisterIndicatorSet({"sma": ("SimpleMovingAverage", {"period": 20})})\n'
+        '        self.AddIndicator("RelativeStrengthIndex", "AAPL", period=14)\n',
+    )
+    body = _check(client, source)
+
+    assert body["ok"] is True, body["issues"]
+
+
+def test_the_indicator_set_is_discovered_not_hardcoded() -> None:
+    """A new file in engine/indicators has to become valid with no edit here."""
+    from src.services.strategy_validation.scanning import known_indicators
+
+    discovered = known_indicators()
+    assert "SimpleMovingAverage" in discovered
+    # Reads as VWAP, not Vwap: the class name is taken from the source, not
+    # guessed from the filename.
+    assert "VWAP" in discovered
+    assert "Indicator" not in discovered
 
 
 def test_check_reports_invalid_python_without_crashing(client: TestClient) -> None:

@@ -1,8 +1,8 @@
 """The strategy registry — one row per thing a student can backtest.
 
 Built-in strategies (the vendored MQSMaster portfolios) and user uploads share
-this table deliberately: the run pipeline treats them identically and only
-``kind`` decides where the class is loaded from. That is why there is no
+this table deliberately: a storage_key selects a stored package for either
+kind; unpublished built-ins can still run in local mode. That is why there is no
 separate "drafts" table — an upload's whole lifecycle is the ``status`` column.
 """
 
@@ -47,8 +47,8 @@ class Strategy(Base):
     kind: Mapped[str] = mapped_column(Text, nullable=False, default="builtin")
     # Import path for built-ins ("engine.strategies.portfolio_1.strategy.VolMomentum").
     class_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # Strategy-store key for uploads ("strategies/<key>/"). Exactly one of
-    # class_path / storage_key is set, decided by `kind`.
+    # Stored package for uploads or published built-ins ("strategies/<key>/").
+    # Takes precedence over class_path, retained as builtin metadata/rollback.
     storage_key: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # The run that proved an uploaded strategy works. ``use_alter`` because
@@ -66,6 +66,9 @@ class Strategy(Base):
     )
 
     status: Mapped[str] = mapped_column(Text, nullable=False, default="active")
+    # New executions have no database run row until successful. This pointer
+    # refers to a transient job or completed report, not the legacy run table.
+    validation_job_id: Mapped[str | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # Staging area for uploaded source between task 2 (persist the row) and

@@ -1,4 +1,5 @@
 from logging import Logger
+from math import isfinite
 from datetime import datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo  # <-- ADDED for timezone fix
@@ -11,6 +12,7 @@ from engine.analytics.reporting import generate_backtest_report
 from engine.contracts.errors import NoMarketData, RunCancelled
 from engine.core.executor import BacktestExecutor
 from engine.core.utils import fetch_historical_data
+from engine.data.fmp import FMPDataAdapter
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 # Define the exchange timezone
@@ -36,6 +38,7 @@ class BacktestRunner:
         should_cancel: Callable[[], bool] | None = None,
         output_dir: str | None = None,
         strict: bool = False,
+        commission_per_share: float = 0.0,
     ):
         """
         Initializes the BacktestRunner.
@@ -58,6 +61,12 @@ class BacktestRunner:
         # VISUALIZER: the results frame used to be local to run(); the
         # caller needs it to build the equity curve.
         self.perf_df: pd.DataFrame | None = None
+        # VISUALIZER: the buy-and-hold frame the report builds, kept so the
+        # caller can chart it against the curve without re-reading its CSV,
+        # and the per-ticker closes in force when the last performance record
+        # was taken — the marks final equity was valued at.
+        self.benchmark_df: pd.DataFrame | None = None
+        self.final_prices: dict[str, float] = {}
 
         # FIX 3: Use new timezone-aware method
         self.start_date: datetime = self._ensure_datetime(start_date)
@@ -69,6 +78,7 @@ class BacktestRunner:
 
         self.slippage: float = slippage
         self.cost_model: Any = cost_model
+        self.commission_per_share = commission_per_share
 
         lookback_days = getattr(self.portfolio, "lookback_days", 365)
         self.strategy_lookback_window = pd.Timedelta(days=lookback_days)
@@ -154,6 +164,7 @@ class BacktestRunner:
             tickers=self.portfolio.tickers,
             slippage=self.slippage,
             cost_model=self.cost_model,
+            commission_per_share=self.commission_per_share,
         )
         # Thread the OMS through the portfolio so it reaches StrategyContext
         # (the single shared seam, same as live); None keeps the direct path.
@@ -177,6 +188,7 @@ class BacktestRunner:
         # This series is built from the *full* dataframe, so lookups are correct
         timestamps_series = self.main_data_df["timestamp"]
         self.perf_records = []
+        self.final_prices = {}
         last_poll_time: pd.Timestamp | None = None
 
         # --- FIX 2: Filter the timestamps we iterate over ---
@@ -297,13 +309,39 @@ class BacktestRunner:
                     if self.strict:
                         raise
 
-            record = {"timestamp": current_timestamp}
-            for ticker in self.portfolio.tickers:
-                record[ticker] = self.executor.get_position_value(ticker)
-            record["portfolio_value"] = self.executor.get_port_notional()
-            self.perf_records.append(record)
+            self._record_performance(current_timestamp)
+
+        # VISUALIZER: close the curve on the last bar. Records are only taken
+        # at poll boundaries, but prices move and OMS child orders fill on
+        # every bar in between — so a run could end with fills the curve never
+        # saw and a final equity up to one poll interval stale. Recording the
+        # last bar means every fill precedes the last sample and the marks it
+        # carries are the ones final equity was valued at.
+        last_timestamp = loop_timestamps[-1]
+        if self.perf_records and self.perf_records[-1]["timestamp"] != last_timestamp:
+            self._record_performance(last_timestamp)
 
         self.logger.info("Event loop finished.")
+
+    def _record_performance(self, timestamp: Any) -> None:
+        """Append one performance sample and remember the marks it used.
+
+        VISUALIZER: ``final_prices`` is snapshotted here rather than read off
+        the executor after the loop because ``update_price`` runs on every bar
+        while a record is only taken at some of them; the prices that satisfy
+        ``cash + sum(qty * mark) == portfolio_value`` are the ones in force at
+        the *last record*, not whatever the last bar after it said.
+        """
+        record: dict[str, Any] = {"timestamp": timestamp}
+        for ticker in self.portfolio.tickers:
+            record[ticker] = self.executor.get_position_value(ticker)
+        record["portfolio_value"] = self.executor.get_port_notional()
+        self.perf_records.append(record)
+        self.final_prices = {
+            ticker: float(price)
+            for ticker, price in self.executor.latest_prices.items()
+            if price is not None and isfinite(float(price)) and float(price) > 0
+        }
 
     def _calculate_results(self) -> pd.DataFrame | None:
         """Calculates performance metrics from recorded data."""
@@ -387,7 +425,7 @@ class BacktestRunner:
 
             if perf_df is not None and not perf_df.empty:
                 self.on_progress(100, "writing report")
-                generate_backtest_report(
+                reports = generate_backtest_report(
                     portfolio=self.portfolio,
                     perf_df=perf_df,
                     initial_capital=self.total_start_capital,
@@ -395,7 +433,19 @@ class BacktestRunner:
                     # VISUALIZER: artifacts land in this run's own
                     # directory instead of a path relative to the cwd.
                     out_dir=self.output_dir,
+                    # VISUALIZER: the benchmark is bought on the run's first
+                    # bar, not the first bar of the lookback prefix.
+                    benchmark_start=self.backtest_loop_start_date,
+                    benchmark_end=perf_df["timestamp"].max(),
+                    # Daily FMP closes cannot supply intraday observations.
+                    # Avoid expanding them into hundreds of thousands of
+                    # synthetic minute rows and serializing a redundant CSV.
+                    include_minute_report=not isinstance(
+                        getattr(self.portfolio, "db", None), FMPDataAdapter
+                    ),
                 )
+                # VISUALIZER: keep the in-memory benchmark for run_single.
+                self.benchmark_df = (reports or {}).get("benchmark_buy_and_hold")
                 if self.executor:
                     trade_log = self.executor.dump_trade_log()
                 else:

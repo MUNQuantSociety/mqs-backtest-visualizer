@@ -28,6 +28,7 @@ class BacktestExecutor:
         cost_model: CostModel | None = None,
         adv_lookup: Dict[str, float] | None = None,
         sigma_lookup: Dict[str, float] | None = None,
+        commission_per_share: float = 0.0,
     ):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.tickers = tickers
@@ -35,6 +36,11 @@ class BacktestExecutor:
         self.slippage = slippage
         # Legacy constant slippage stays available as a fallback (when cost_model is None).
         self.cost_model: CostModel | None = cost_model
+        # VISUALIZER: explicit per-share commission is a cash fee, not a
+        # price adjustment. Zero keeps the legacy sizing/settlement amounts.
+        self.commission_per_share = float(commission_per_share)
+        if not math.isfinite(self.commission_per_share) or self.commission_per_share < 0:
+            raise ValueError("commission_per_share must be finite and nonnegative.")
         self.adv_lookup: Dict[str, float] = dict(adv_lookup or {})
         self.sigma_lookup: Dict[str, float] = dict(sigma_lookup or {})
 
@@ -45,11 +51,12 @@ class BacktestExecutor:
         self.trade_log: List[Dict] = []
 
         self.logger.info(
-            "BacktestExecutor initialized with %.2f capital, leverage=%.2f, slippage=%.2f, "
-            "cost_model=%s, for tickers: %s",
+            "BacktestExecutor initialized with %.2f capital, leverage=%.2f, slippage=%.6f, "
+            "commission_per_share=%.6f, cost_model=%s, for tickers: %s",
             initial_capital,
             leverage,
             slippage,
+            self.commission_per_share,
             "on" if self.cost_model is not None else "off",
             tickers,
         )
@@ -136,6 +143,8 @@ class BacktestExecutor:
         positions,
         port_notional,
         ticker_weight,
+        *,
+        target_weight=None,
     ):
         """Size a trade with the default target-weight model, without filling.
 
@@ -147,12 +156,22 @@ class BacktestExecutor:
         ``.exec_price`` for the fill). Returns a ``Sizing`` with ``quantity == 0``
         on any no-trade. ``cash``/``positions`` are accepted for signature parity
         with the live executor; backtest sizes against its own ``self`` state.
+        ``target_weight`` explicitly selects signed final exposure (zero means
+        flat). When omitted, the legacy signal/ticker_weight model is retained.
         """
         try:
             port_notional = float(port_notional)
             arrival_price = float(arrival_price)
+            if target_weight is not None and not math.isfinite(float(confidence)):
+                raise ValueError("Explicit target confidence must be finite")
             confidence = max(0.0, min(1.0, float(confidence)))
             ticker_weight = float(ticker_weight)
+            if target_weight is not None:
+                target_weight = float(target_weight)
+                if not all(math.isfinite(value) for value in (
+                    target_weight, port_notional, arrival_price, float(confidence)
+                )):
+                    raise ValueError("Explicit target inputs must be finite")
         except (ValueError, TypeError) as e:
             self.logger.error(f"Numeric conversion failed in default_trade_size: {e}")
             return Sizing(0, 0.0, 0.0)
@@ -170,18 +189,32 @@ class BacktestExecutor:
             return Sizing(0, 0.0, 0.0)
 
         # If ticker_weight is 0 (no current position), default to equal-weight.
-        if ticker_weight == 0.0:
+        if target_weight is None and ticker_weight == 0.0:
             if not self.tickers:
                 self.logger.error("No tickers list available for fallback allocation.")
                 return Sizing(0, 0.0, 0.0)
             ticker_weight = 1.0 / len(self.tickers)
 
+        current_quantity = self.positions.get(ticker, 0.0)
+        target_notional = port_notional * (
+            ticker_weight if target_weight is None else target_weight
+        )
+        # The strategy still chooses its signed target. An overweight long
+        # can need a SELL even after a BUY signal (and vice versa for shorts).
+        if target_weight is None and signal_type == "SELL":
+            target_notional *= -1
+        execution_side = (
+            "BUY" if target_notional > current_quantity * arrival_price else "SELL"
+        )
+
         # First-pass approximation of trade notional so the cost model can size impact.
         approx_notional = abs(port_notional * ticker_weight * confidence)
+        if target_weight is not None:
+            approx_notional = abs(target_notional - current_quantity * arrival_price) * confidence
         exec_price = self._apply_slippage(
-            arrival_price, signal_type, ticker=ticker, trade_notional=approx_notional
+            arrival_price, execution_side, ticker=ticker, trade_notional=approx_notional
         )
-        if exec_price <= 0:
+        if not math.isfinite(exec_price) or exec_price <= 0:
             self.logger.warning(
                 f"Cannot size trade for {ticker}: invalid exec price {exec_price} after slippage."
             )
@@ -189,24 +222,34 @@ class BacktestExecutor:
 
         buying_power = self._calculate_buying_power(port_notional)
 
-        current_quantity = self.positions.get(ticker, 0.0)
         current_notional_value = current_quantity * exec_price
-
-        target_notional = port_notional * ticker_weight
-        # A SELL signal targets a negative (short) position
-        if signal_type == "SELL":
-            target_notional *= -1
-
         desired_trade_notional = (target_notional - current_notional_value) * confidence
+        if (desired_trade_notional > 0) != (execution_side == "BUY"):
+            # The target is inside the execution spread: do not fill in the
+            # opposite direction at a price calculated for this side.
+            return Sizing(0, desired_trade_notional, exec_price)
 
-        # Ignore trades smaller than $1.00 notional.
-        if abs(desired_trade_notional) < 1.0:
+        # Keep the legacy minimum; an explicit flatten may close a cheap share.
+        if abs(desired_trade_notional) < 1.0 and target_weight != 0.0:
             self.logger.debug(
                 "Skip trade: desired_notional too small (%.2f) for %s",
                 desired_trade_notional,
                 ticker,
             )
             return Sizing(0, desired_trade_notional, exec_price)
+
+        if target_weight is not None:
+            # Work in shares so an exact zero target closes every whole share,
+            # without a notional division rounding a full exit down by one.
+            desired_quantity = abs(target_notional / exec_price - current_quantity) * confidence
+            quantity_to_trade = math.floor(min(
+                desired_quantity,
+                self._commission_quantity_limit(
+                    exec_price, execution_side, port_notional,
+                    current_quantity=current_quantity,
+                ),
+            ))
+            return Sizing(max(0, quantity_to_trade), desired_trade_notional, exec_price)
 
         # For buys, we are also constrained by the actual cash available.
         if desired_trade_notional > 0:  # This is a BUY operation
@@ -220,10 +263,45 @@ class BacktestExecutor:
             return Sizing(0, desired_trade_notional, exec_price)
 
         quantity_to_trade = math.floor(tradable_notional / exec_price)
+        if self.commission_per_share:
+            quantity_to_trade = min(
+                quantity_to_trade,
+                math.floor(self._commission_quantity_limit(exec_price, execution_side, port_notional)),
+            )
         if quantity_to_trade <= 0:
             return Sizing(0, desired_trade_notional, exec_price)
 
         return Sizing(quantity_to_trade, desired_trade_notional, exec_price)
+
+    def _commission_quantity_limit(
+        self, exec_price, side, portfolio_equity, *, current_quantity=0.0
+    ):
+        """Reserve fees within the existing cash and gross-buying-power limits.
+
+        One dollar of cash commission reduces margin buying power by leverage
+        dollars. Keep the target-weight calculation unchanged, and only cap
+        shares when paying their fees would exceed these existing limits.
+        """
+        fee = self.commission_per_share
+        buying_power = self._calculate_buying_power(portfolio_equity)
+        closing_quantity = max(0.0, -current_quantity if side == "BUY" else current_quantity)
+        # Closing exposure releases margin; only shares beyond flat consume new
+        # exposure. Legacy sizing leaves current_quantity at zero and keeps its
+        # original cap. Explicit targets and OMS fills supply the actual holding.
+        closing_margin_cost = self.leverage * fee - exec_price
+        if closing_margin_cost > 0 and closing_quantity * closing_margin_cost > buying_power:
+            limit = buying_power / closing_margin_cost
+        else:
+            limit = (buying_power + 2 * closing_quantity * exec_price) / (
+                exec_price + self.leverage * fee
+            )
+        if side == "BUY":
+            limit = min(limit, max(0.0, self.cash) / (exec_price + fee))
+        elif fee > exec_price:
+            # Short-sale proceeds normally fund the fee. If a configured fee
+            # exceeds proceeds, the difference must be affordable in cash.
+            limit = min(limit, max(0.0, self.cash) / (fee - exec_price))
+        return max(0.0, limit)
 
     def execute_trade(
         self,
@@ -237,6 +315,8 @@ class BacktestExecutor:
         port_notional,
         ticker_weight,
         timestamp,
+        *,
+        target_weight=None,
     ):
         # Size with the shared default model (handles coercion, signal/price
         # validation, equal-weight fallback, and buying-power/cash constraints).
@@ -250,18 +330,22 @@ class BacktestExecutor:
             positions=positions,
             port_notional=port_notional,
             ticker_weight=ticker_weight,
+            target_weight=target_weight,
         )
         if sizing.quantity <= 0:
             return
 
         quantity_to_trade = sizing.quantity
         exec_price = sizing.exec_price
-        signal_type = signal_type.upper()
+        # Record the settled side, which can differ from the target signal.
+        # FIFO pairing must see the same direction as cash and positions.
+        signal_type = "BUY" if sizing.desired_notional > 0 else "SELL"
 
         # --- Execute the Trade (settle the fill into the executor's own
         # unified portfolio state; the ``cash``/``positions`` params are kept
         # only for signature parity with the live executor). ---
         trade_value = quantity_to_trade * exec_price
+        fees = quantity_to_trade * self.commission_per_share
         current_quantity = self.positions.get(ticker, 0.0)
         if sizing.desired_notional > 0:  # Finalizing a BUY
             self.cash -= trade_value
@@ -269,6 +353,7 @@ class BacktestExecutor:
         else:  # Finalizing a SELL
             self.cash += trade_value
             self.positions[ticker] = current_quantity - quantity_to_trade
+        self.cash -= fees
 
         self.trade_log.append(
             {
@@ -279,6 +364,7 @@ class BacktestExecutor:
                 "confidence": max(0.0, min(1.0, float(confidence))),
                 "shares": quantity_to_trade,
                 "fill_price": exec_price,
+                "fees": fees,
                 "cash_after": self.cash,
                 "position_size": self.positions.get(ticker, 0.0),
             }
@@ -289,6 +375,8 @@ class BacktestExecutor:
             "quantity": quantity_to_trade,
             "updated_cash": self.cash,
             "updated_quantity": self.positions.get(ticker, 0.0),
+            "fees": fees,
+            "fill_price": exec_price,
         }
 
     def execute_child_order(self, child_order, timestamp=None):
@@ -300,8 +388,9 @@ class BacktestExecutor:
         RBP-blended confidence) when it was created; this method only fills
         the slice's fixed ``target_quantity`` at the *current* simulated
         price. Margin drift between parent sizing and slice fill is accepted
-        v1 behavior — mirroring live, where a worked order can also drift
-        from its decision-time constraints.
+        v1 behavior when commission is zero. With per-share commission enabled,
+        cash/margin affordability is checked again at the current fill price;
+        an unaffordable fixed slice is rejected, never silently resized.
 
         Args:
             child_order: ``src.oms.order_structs.ChildOrder`` (duck-typed:
@@ -318,8 +407,10 @@ class BacktestExecutor:
         ticker = child_order.ticker
         signal_type = child_order.signal_type.value
         quantity = float(child_order.target_quantity)
-        if quantity <= 0:
+        if not math.isfinite(quantity) or quantity <= 0:
             return {"status": "error", "message": f"invalid quantity {quantity}"}
+        if signal_type not in {"BUY", "SELL"}:
+            return {"status": "error", "message": "child signal must be BUY or SELL"}
 
         price = self.latest_prices.get(ticker, 0.0)
         if price <= 0:
@@ -339,8 +430,16 @@ class BacktestExecutor:
         exec_price = self._apply_slippage(
             price, signal_type, ticker=ticker, trade_notional=quantity * price
         )
+        if not math.isfinite(exec_price) or exec_price <= 0:
+            return {"status": "error", "message": "invalid price after slippage"}
+        if self.commission_per_share and quantity > self._commission_quantity_limit(
+            exec_price, signal_type, self.get_port_notional(),
+            current_quantity=self.positions.get(ticker, 0.0),
+        ):
+            return {"status": "error", "message": "insufficient cash or buying power including commission"}
 
         trade_value = quantity * exec_price
+        fees = quantity * self.commission_per_share
         current_quantity = self.positions.get(ticker, 0.0)
         if signal_type == "BUY":
             self.cash -= trade_value
@@ -348,6 +447,7 @@ class BacktestExecutor:
         else:  # SELL
             self.cash += trade_value
             self.positions[ticker] = current_quantity - quantity
+        self.cash -= fees
 
         # Same record shape as execute_trade so reporting treats OMS fills
         # identically; confidence is the parent's registered value.
@@ -360,6 +460,7 @@ class BacktestExecutor:
                 "confidence": float(child_order.confidence),
                 "shares": quantity,
                 "fill_price": exec_price,
+                "fees": fees,
                 "cash_after": self.cash,
                 "position_size": self.positions.get(ticker, 0.0),
             }
@@ -369,6 +470,7 @@ class BacktestExecutor:
             "status": "success",
             "filled_quantity": quantity,
             "fill_price": exec_price,
+            "fees": fees,
         }
 
     def dump_trade_log(self) -> list[str]:

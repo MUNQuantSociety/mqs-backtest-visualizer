@@ -1,31 +1,44 @@
-"""Storage for user-uploaded strategy source, shaped like S3 from day one.
+"""Storage for user-uploaded strategy source: an S3 bucket, or local disk shaped like one.
 
-The product owner wants uploaded strategies to live in an S3 bucket. That
-bucket does not exist yet and must not block the upload feature, so every call
-site is written against S3 vocabulary — opaque keys, whole-object put/get, no
-seeking, no partial writes — and backed by local disk today. When the bucket is
-provisioned, the swap is a new class behind :class:`StrategyStore`, not a
-refactor of the callers.
+Every call site is written against S3 vocabulary — opaque keys, whole-object
+put/get, no seeking, no partial writes — so the two backends behind
+:class:`StrategyStore` are interchangeable: :class:`S3StrategyStore` for a
+deploy (``STRATEGY_STORE_BACKEND=s3``) and :class:`LocalStrategyStore` for a
+laptop or a test. Callers never learn which one they hold.
 
-The local layout is deliberately identical to ``engine/strategies/<portfolio>``::
+Objects are laid out identically in both, mirroring ``engine/strategies/<portfolio>``::
 
-    <root>/strategies/<strategy_key>/strategy.py
-    <root>/strategies/<strategy_key>/config.json
+    <root or s3://bucket/prefix>/strategies/<strategy_key>/strategy.py
+    <root or s3://bucket/prefix>/strategies/<strategy_key>/config.json
 
 That is load-bearing, not cosmetic: the engine's ``BasePortfolio`` discovers a
 strategy's ``config.json`` by looking next to the file that defines the class
 (``inspect.getfile`` sibling lookup). :meth:`StrategyStore.materialize` writes a
 key's objects into a directory in exactly that shape, so a materialized user
 strategy loads through the unmodified engine.
+
+Layering (BACKEND_PLAN rule 11): this is the only module that imports boto3,
+and no botocore type crosses its boundary. A missing object is a ``KeyError``,
+an unsafe key is a ``ValueError``, and everything else the bucket can do wrong
+is a :class:`StrategyStoreError` — the same three outcomes the local backend
+produces, so a caller that handles one backend handles both.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
+import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from src.core.config import settings
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; boto3 is never imported at module scope
+    from mypy_boto3_s3 import S3Client  # type: ignore[import-not-found]
 
 # Keys are S3 keys, so the separator is always "/" regardless of platform.
 KEY_SEPARATOR = "/"
@@ -35,6 +48,15 @@ KEY_SEPARATOR = "/"
 # kinds without colliding with strategies).
 STRATEGY_KEY_PREFIX = "strategies"
 
+# S3's ``DeleteObjects`` accepts at most 1000 keys per request. A module
+# constant rather than a literal so a test can shrink it and exercise the
+# chunking without creating a thousand objects.
+_DELETE_BATCH = 1000
+
+_WINDOWS_DEVICES = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {
+    f"{prefix}{digit}" for prefix in ("COM", "LPT") for digit in "123456789¹²³"
+}
+
 
 def strategy_key(strategy_id: str) -> str:
     """Build the store key for a strategy id, e.g. ``strategies/my-strat-a1b2/``.
@@ -43,6 +65,19 @@ def strategy_key(strategy_id: str) -> str:
     exists in exactly one place when the bucket layout is reviewed.
     """
     return f"{STRATEGY_KEY_PREFIX}{KEY_SEPARATOR}{strategy_id.strip(KEY_SEPARATOR)}{KEY_SEPARATOR}"
+
+
+class StrategyStoreError(RuntimeError):
+    """The store could not do what it was asked, and it was not a missing object.
+
+    Raised for the bucket-level failures S3 can produce (no such bucket, access
+    denied, endpoint unreachable, a partial batch delete). It exists so that
+    ``botocore`` exceptions never leave ``src/integrations``: the packaging
+    service already treats any exception from ``delete`` as "log and move on",
+    and the worker turns any non-``KeyError`` from ``materialize`` into a
+    failed run with the exception's message, so this type slots into both
+    without either learning about AWS.
+    """
 
 
 @runtime_checkable
@@ -70,6 +105,81 @@ class StrategyStore(Protocol):
         ...
 
 
+# ---------------------------------------------------------------------------
+# Key and filename validation, shared by every backend
+# ---------------------------------------------------------------------------
+
+
+def _key_segments(key: str) -> list[str]:
+    """Split a key on ``"/"`` and reject anything that could walk a filesystem.
+
+    A key arriving from an HTTP request must never escape the store, so
+    traversal segments are rejected outright rather than normalised away —
+    S3 has no parent directory, and neither does this.
+
+    The backslash check is what makes the guard hold on Windows. A key is
+    split on ``"/"`` only (S3's separator), so ``"..\\..\\pwned"`` is one
+    segment to this code and three path components to ``pathlib``. It applies
+    to the S3 backend too: an object key is only ever turned back into a local
+    path by :meth:`S3StrategyStore.materialize`, and that path must land inside
+    the destination on whatever platform the worker runs.
+    """
+    parts = [part for part in key.strip(KEY_SEPARATOR).split(KEY_SEPARATOR) if part]
+    if not parts:
+        raise ValueError("strategy store key must not be empty")
+    for part in parts:
+        _object_name(part)
+    return parts
+
+
+def _object_name(filename: str) -> str:
+    """A filename is one path component: no separators, no dot-names, not blank."""
+    name = filename
+    # Apply Windows rules even on Linux: these objects may later be loaded by
+    # a Windows worker. Colons include drive-relative paths and NTFS streams;
+    # trailing dots/spaces and device names alias paths or bypass normal files.
+    device = name.split(".", 1)[0].rstrip(" ").upper()
+    if (
+        not name
+        or name != name.strip()
+        or name.endswith(".")
+        or any(char in '/\\<>:"|?*' or ord(char) < 32 for char in name)
+        or device in _WINDOWS_DEVICES
+    ):
+        raise ValueError(f"invalid strategy store filename: {filename!r}")
+    return name
+
+
+def _materialize_target(destination: Path, relative: str) -> Path:
+    """Validate without normalizing S3 names into colliding local paths."""
+    segments = [_object_name(part) for part in relative.split(KEY_SEPARATOR)]
+    target = destination.joinpath(*segments)
+    root = destination.resolve()
+    resolved = target.resolve()
+    if root not in resolved.parents:
+        raise ValueError(f"path escapes materialize destination: {relative!r}")
+    current = destination
+    for segment in segments:
+        current = current / segment
+        if current.is_symlink() or (hasattr(current, "is_junction") and current.is_junction()):
+            raise ValueError(f"linked materialize path: {relative!r}")
+    return target
+
+
+def _write_materialized_file(target: Path, body: Any) -> None:
+    """A failed stream must not truncate an existing file or leave half a file."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".strategy-", delete=False) as handle:
+            temporary = Path(handle.name)
+            shutil.copyfileobj(body, handle)
+        temporary.replace(target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 class LocalStrategyStore:
     """Disk-backed store rooted at a single gitignored directory.
 
@@ -89,34 +199,20 @@ class LocalStrategyStore:
     def _key_dir(self, key: str) -> Path:
         """Resolve a key to a directory inside ``root``.
 
-        A key arriving from an HTTP request must never escape the store, so
-        traversal segments are rejected outright rather than normalised away —
-        S3 has no parent directory, and neither does this.
-
-        Two checks, because the first one alone is not enough on Windows. A key
-        is split on ``"/"`` only (S3's separator), so ``"..\\..\\pwned"`` is one
-        segment to this code and three path components to ``pathlib`` — a
-        backslash inside a segment therefore has to be rejected explicitly. The
-        containment check behind it is what makes the guarantee hold whatever
-        else a platform decides a separator is: drive letters, alternate data
-        streams, or a segment type nobody has thought of yet.
+        Two checks. :func:`_key_segments` rejects traversal segments and
+        backslashes; the containment check behind it is what makes the
+        guarantee hold whatever else a platform decides a separator is: drive
+        letters, alternate data streams, or a segment type nobody has thought
+        of yet.
         """
-        parts = [part for part in key.strip(KEY_SEPARATOR).split(KEY_SEPARATOR) if part]
-        if not parts:
-            raise ValueError("strategy store key must not be empty")
-        if any(part in {".", ".."} or "\\" in part for part in parts):
-            raise ValueError(f"invalid strategy store key: {key!r}")
-
+        parts = _key_segments(key)
         directory = self.root.joinpath(*parts).resolve()
         if directory != self.root and self.root not in directory.parents:
             raise ValueError(f"invalid strategy store key: {key!r}")
         return directory
 
     def _object_path(self, key: str, filename: str) -> Path:
-        name = filename.strip()
-        if not name or KEY_SEPARATOR in name or "\\" in name or name in {".", ".."}:
-            raise ValueError(f"invalid strategy store filename: {filename!r}")
-        return self._key_dir(key) / name
+        return _materialize_target(self._key_dir(key), _object_name(filename))
 
     # ------------------------------------------------------------------
     # StrategyStore protocol
@@ -125,13 +221,14 @@ class LocalStrategyStore:
         path = self._object_path(key, filename)
         path.parent.mkdir(parents=True, exist_ok=True)
         # UTF-8 and "\n" explicitly: the same bytes must come back on Windows
-        # and Linux, because the S3 backend will not translate line endings.
+        # and Linux, because the S3 backend does not translate line endings.
         path.write_text(content, encoding="utf-8", newline="\n")
 
     def get(self, key: str, filename: str) -> str:
         path = self._object_path(key, filename)
         try:
-            return path.read_text(encoding="utf-8")
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                return handle.read()
         except (FileNotFoundError, NotADirectoryError) as exc:
             raise KeyError(f"{key}{filename}") from exc
 
@@ -140,7 +237,13 @@ class LocalStrategyStore:
         return directory.is_dir() and any(directory.iterdir())
 
     def delete(self, key: str) -> None:
-        shutil.rmtree(self._key_dir(key), ignore_errors=True)
+        directory = self._key_dir(key)
+        try:
+            shutil.rmtree(directory)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise StrategyStoreError(f"could not delete strategy key {key!r}: {type(exc).__name__}") from exc
 
     def materialize(self, key: str, dest_dir: Path) -> Path:
         """Copy every object under ``key`` into ``dest_dir``.
@@ -161,9 +264,14 @@ class LocalStrategyStore:
         for item in sorted(source.rglob("*")):
             if not item.is_file():
                 continue
-            target = destination / item.relative_to(source)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(item, target)
+            relative = item.relative_to(source).as_posix()
+            try:
+                _materialize_target(source, relative)
+                target = _materialize_target(destination, relative)
+            except ValueError as exc:
+                raise StrategyStoreError(f"refusing to materialize unsafe object key {relative!r}") from exc
+            with item.open("rb") as body:
+                _write_materialized_file(target, body)
             copied = True
 
         if not copied:
@@ -172,41 +280,341 @@ class LocalStrategyStore:
 
 
 class S3StrategyStore:
-    """Stub for the eventual bucket-backed store.
+    """Bucket-backed store: one object per file, under ``<prefix>strategies/<id>/``.
 
-    It exists so the selection seam and the call sites are real today. There is
-    no boto3 dependency and no bucket; every method raises. Implementing this
-    class against the :class:`StrategyStore` protocol is the entire migration.
+    Same semantics as :class:`LocalStrategyStore`, deliberately — the tests
+    run the shared contract against both. Whole-object puts overwrite, a
+    missing object is a ``KeyError``, ``exists`` is a prefix probe, ``delete``
+    is an idempotent prefix sweep, and ``materialize`` streams every object
+    under the key into a directory in the layout the engine imports from.
+
+    A boto3 client is created per thread on first use, not in ``__init__``, for three
+    reasons that all bite in practice. The worker pool spawns its processes
+    (``src/workers/job_manager.py``), so the child rebuilds the store from
+    scratch and must not inherit a socket-holding client through pickling;
+    :meth:`__getstate__` drops the client for the same reason. The API process
+    builds the store at import time through :func:`get_strategy_store` and a
+    client that opens connections there would fail boot on a box with no AWS
+    reachability (a laptop running the local backend still imports this
+    module). And moto only intercepts clients created while its mock is
+    active, so eager creation would make the backend untestable.
+
+    Credentials are never taken from settings: the SDK's default chain supplies
+    them (the ECS task role in a deploy, the developer's CLI profile locally).
+    Region and endpoint are passed explicitly because ``src/core/config.py``
+    is the one module allowed to read the environment.
     """
 
-    _UNAVAILABLE = "S3 backend arrives with infrastructure"
-
-    def __init__(self, bucket: str) -> None:
+    def __init__(
+        self,
+        bucket: str,
+        prefix: str = "",
+        region: str | None = None,
+        endpoint_url: str | None = None,
+    ) -> None:
+        bucket = (bucket or "").strip()
+        if not bucket:
+            raise ValueError("S3StrategyStore needs a bucket name")
         self.bucket = bucket
+        # Normalised to either "" or "segment/segment/": the object-key
+        # builders below concatenate it blindly, so exactly one slash at the
+        # end is the whole contract.
+        cleaned = (prefix or "").strip().strip(KEY_SEPARATOR)
+        self.prefix = f"{cleaned}{KEY_SEPARATOR}" if cleaned else ""
+        self.region = (region or "").strip() or None
+        self.endpoint_url = (endpoint_url or "").strip() or None
+        self._thread_state = threading.local()
 
+    # ------------------------------------------------------------------
+    # Client lifecycle
+    # ------------------------------------------------------------------
+    @property
+    def _client(self) -> Any:
+        """The calling thread's client; retain the existing inspection seam."""
+        return getattr(self._thread_state, "client", None)
+
+    @_client.setter
+    def _client(self, value: Any) -> None:
+        self._thread_state.client = value
+
+    @property
+    def _client_pid(self) -> int | None:
+        return getattr(self._thread_state, "pid", None)
+
+    @_client_pid.setter
+    def _client_pid(self, value: int | None) -> None:
+        self._thread_state.pid = value
+
+    @property
+    def _s3(self) -> S3Client:
+        """The boto3 client, built on first access (see the class docstring).
+
+        Catalogue checks fan out across threads. Each thread owns its session,
+        client and HTTPS connection pool, avoiding concurrent TLS handshakes
+        against one client's certificate store. Repeated calls in that thread
+        reuse connections. A fork must also rebuild the inherited client.
+        """
+        pid = os.getpid()
+        if self._client is not None and self._client_pid == pid:
+            return self._client
+        import boto3
+        from botocore.config import Config
+
+        # Path-style addressing only when an endpoint is set: LocalStack
+        # and MinIO resolve ``http://host:port/bucket``, while real S3
+        # should keep the SDK's default virtual-hosted style.
+        config = Config(
+            connect_timeout=5,
+            read_timeout=10,
+            retries={"mode": "standard", "total_max_attempts": 3},
+            s3={"addressing_style": "path"} if self.endpoint_url else {},
+        )
+        # boto3.client() uses a shared default Session. Keep that mutable SDK
+        # state thread-local too; certificate verification remains enabled.
+        self._client = boto3.session.Session().client(
+            "s3",
+            region_name=self.region,
+            endpoint_url=self.endpoint_url,
+            config=config,
+        )
+        self._client_pid = pid
+        return self._client
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_thread_state", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._thread_state = threading.local()
+
+    # ------------------------------------------------------------------
+    # Key translation
+    # ------------------------------------------------------------------
+    def _prefix_for(self, key: str) -> str:
+        """``<prefix>strategies/<id>/`` — the trailing slash is the boundary.
+
+        Without it ``strategies/ab/`` would match every object under
+        ``strategies/abc/``; with it, S3's prefix listing is exactly "inside
+        this directory".
+        """
+        return f"{self.prefix}{KEY_SEPARATOR.join(_key_segments(key))}{KEY_SEPARATOR}"
+
+    def _object_key(self, key: str, filename: str) -> str:
+        # Validation runs before any network call, so a bad key creates
+        # nothing — the S3 twin of "nothing written above the root".
+        return f"{self._prefix_for(key)}{_object_name(filename)}"
+
+    def _list_keys(self, key: str, *, include_markers: bool = False) -> Iterator[str]:
+        """Every real object key under ``key``, across however many pages S3 returns.
+
+        Keys ending in ``/`` are skipped for reads: the console creates them
+        as "folders" and the engine cannot load them. Deletes include them.
+        """
+        prefix = self._prefix_for(key)
+        try:
+            paginator = self._s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+                for item in page.get("Contents", []):
+                    object_key = item["Key"]
+                    if not object_key.startswith(prefix):
+                        raise StrategyStoreError(f"S3 returned a key outside requested prefix {prefix!r}")
+                    if not include_markers and object_key.endswith(KEY_SEPARATOR):
+                        continue
+                    yield object_key
+        except Exception as exc:  # noqa: BLE001 - translated below, never re-raised raw
+            raise self._translate(exc, prefix) from exc
+
+    # ------------------------------------------------------------------
+    # StrategyStore protocol
+    # ------------------------------------------------------------------
     def put(self, key: str, filename: str, content: str) -> None:
-        raise NotImplementedError(self._UNAVAILABLE)
+        object_key = self._object_key(key, filename)
+        try:
+            self._s3.put_object(
+                Bucket=self.bucket,
+                Key=object_key,
+                # Bytes stored verbatim: no newline translation on either
+                # backend, so an upload reads back identically everywhere.
+                Body=content.encode("utf-8"),
+                ContentType=_content_type_for(object_key),
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise self._translate(exc, object_key) from exc
 
     def get(self, key: str, filename: str) -> str:
-        raise NotImplementedError(self._UNAVAILABLE)
+        object_key = self._object_key(key, filename)
+        try:
+            response = self._s3.get_object(Bucket=self.bucket, Key=object_key)
+            with closing(response["Body"]) as body:
+                return body.read().decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            translated = self._translate(exc, object_key, missing_object=True)
+            if isinstance(translated, KeyError):
+                raise KeyError(f"{key}{filename}") from exc
+            raise translated from exc
 
     def exists(self, key: str) -> bool:
-        raise NotImplementedError(self._UNAVAILABLE)
+        for _ in self._list_keys(key):
+            return True
+        return False
 
     def delete(self, key: str) -> None:
-        raise NotImplementedError(self._UNAVAILABLE)
+        """Sweep the prefix. Absent keys are a no-op, as S3 itself treats them.
+
+        On a versioned bucket this leaves delete markers rather than freeing
+        storage; ``exists``/``materialize`` stop seeing the objects either
+        way, which is the contract.
+        """
+        keys = list(self._list_keys(key, include_markers=True))
+        failures: list[dict[str, Any]] = []
+        for start in range(0, len(keys), _DELETE_BATCH):
+            chunk = keys[start : start + _DELETE_BATCH]
+            try:
+                response = self._s3.delete_objects(
+                    Bucket=self.bucket,
+                    Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True},
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise self._translate(exc, self._prefix_for(key)) from exc
+            failures.extend(response.get("Errors") or [])
+        if failures:
+            # Try every batch, but never report success for HTTP-200 partial
+            # failures. A caller can retry the idempotent sweep after repair.
+            detail = "; ".join(
+                f"{e.get('Key', '?')}: {e.get('Code', '?')}" for e in failures[:5]
+            )
+            raise StrategyStoreError(
+                f"S3 could not delete {len(failures)} object(s) under "
+                f"s3://{self.bucket}/{self._prefix_for(key)}: {detail}"
+            )
 
     def materialize(self, key: str, dest_dir: Path) -> Path:
-        raise NotImplementedError(self._UNAVAILABLE)
+        """Stream every object under ``key`` into ``dest_dir``.
+
+        Plain ``get_object`` per file rather than the transfer manager: a
+        strategy is two small files, and the transfer manager's thread pool is
+        unwelcome inside a worker process that is about to import user code.
+
+        A key's relative path is validated with the same guard the writers
+        use before it becomes a filesystem path. The store only ever writes
+        safe names, but the bucket is shared infrastructure and an object
+        somebody else put at ``strategies/x/../evil.py`` must not be written
+        outside ``dest_dir`` — S3 has no traversal, the worker's disk does.
+        """
+        prefix = self._prefix_for(key)
+        destination = Path(dest_dir)
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise self._translate(exc, prefix) from exc
+
+        targets: list[tuple[str, Path]] = []
+        paths: set[str] = set()
+        directories: set[str] = set()
+        for object_key in self._list_keys(key):
+            relative = object_key[len(prefix):]
+            try:
+                target = _materialize_target(destination, relative)
+                # On Windows two distinct S3 keys can address the same file.
+                # Reject such packages on every platform before writing any.
+                folded = relative.casefold()
+                parents = {
+                    parent.as_posix().casefold()
+                    for parent in Path(relative).parents if parent != Path(".")
+                }
+                if folded in paths or folded in directories or parents & paths:
+                    raise ValueError("colliding materialize paths")
+                paths.add(folded)
+                directories.update(parents)
+            except ValueError as exc:
+                raise StrategyStoreError(
+                    f"refusing to materialize unsafe object key "
+                    f"s3://{self.bucket}/{object_key}"
+                ) from exc
+            except OSError as exc:
+                raise self._translate(exc, object_key) from exc
+            targets.append((object_key, target))
+
+        if not targets:
+            raise KeyError(key)
+        for object_key, target in targets:
+            try:
+                with closing(self._s3.get_object(Bucket=self.bucket, Key=object_key)["Body"]) as body:
+                    _write_materialized_file(target, body)
+            except Exception as exc:  # noqa: BLE001
+                raise self._translate(exc, object_key, missing_object=True) from exc
+        return destination
+
+    # ------------------------------------------------------------------
+    # Error translation — the one place botocore vocabulary is understood
+    # ------------------------------------------------------------------
+    def _translate(self, exc: Exception, object_key: str, *, missing_object: bool = False) -> Exception:
+        """Map an SDK failure to the store's contract; the caller raises it.
+
+        Returned rather than raised so ``get`` can rewrite the ``KeyError``
+        message into the same ``key + filename`` shape the local backend uses.
+        Filesystem and decoding failures also become store errors. Programming
+        errors pass through unchanged so they are not mislabeled as S3 failures.
+        """
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        if isinstance(exc, ClientError):
+            error = exc.response.get("Error", {})
+            code = str(error.get("Code", "")) or type(exc).__name__
+            # Bare 404/NotFound can mean a missing bucket or bad endpoint.
+            # Only an explicit missing-object response to a read is absence.
+            if missing_object and code == "NoSuchKey":
+                return KeyError(object_key)
+            return StrategyStoreError(
+                f"S3 {code} on s3://{self.bucket}/{object_key}"
+            )
+        if isinstance(exc, BotoCoreError):
+            # SDK messages may include endpoint URLs with credentials/query
+            # parameters; report the type and object, never the raw message.
+            return StrategyStoreError(
+                f"S3 {type(exc).__name__} on s3://{self.bucket}/{object_key}"
+            )
+        if isinstance(exc, (OSError, UnicodeError)):
+            return StrategyStoreError(
+                f"{type(exc).__name__} accessing stored object s3://{self.bucket}/{object_key}"
+            )
+        return exc
+
+
+def _content_type_for(object_key: str) -> str:
+    """A truthful Content-Type, so the console and any presigned download behave."""
+    lowered = object_key.lower()
+    if lowered.endswith(".py"):
+        return "text/x-python; charset=utf-8"
+    if lowered.endswith(".json"):
+        return "application/json"
+    return "text/plain; charset=utf-8"
 
 
 def build_strategy_store() -> StrategyStore:
-    """Construct the store the environment selects (``STRATEGY_STORE_BACKEND``)."""
+    """Construct the store the environment selects (``STRATEGY_STORE_BACKEND``).
+
+    A misconfigured S3 selection fails here, with one sentence, rather than at
+    the first upload: call this (through :func:`get_strategy_store`) at boot
+    and a deploy missing its bucket name never comes up half-working.
+    """
     backend = settings.strategy_store_backend
     if backend == "local":
         return LocalStrategyStore(settings.strategy_store_root)
     if backend == "s3":
-        return S3StrategyStore(settings.strategy_store_s3_bucket)
+        if not settings.strategy_store_s3_bucket.strip():
+            raise ValueError(
+                "STRATEGY_STORE_BACKEND=s3 requires STRATEGY_STORE_S3_BUCKET to "
+                "name the bucket that holds uploaded strategies"
+            )
+        return S3StrategyStore(
+            settings.strategy_store_s3_bucket,
+            prefix=settings.strategy_store_s3_prefix,
+            region=settings.aws_region or None,
+            endpoint_url=settings.strategy_store_s3_endpoint_url or None,
+        )
     raise ValueError(
         f"unknown STRATEGY_STORE_BACKEND {backend!r}; expected 'local' or 's3'"
     )
@@ -219,8 +627,9 @@ def get_strategy_store() -> StrategyStore:
     """Process-wide store instance.
 
     Cached because worker processes call it per run and the local backend's
-    constructor touches the filesystem; the object itself is stateless, so
-    sharing it is safe.
+    constructor touches the filesystem; the object itself is stateless apart
+    from the S3 client, which is created lazily and per process, so sharing
+    it is safe. A spawned worker starts with ``_store`` unset and rebuilds it.
     """
     global _store
     if _store is None:

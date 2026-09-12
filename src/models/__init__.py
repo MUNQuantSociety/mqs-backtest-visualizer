@@ -6,6 +6,7 @@ imported is a table that never gets created.
 """
 
 from src.models.base import APP_SCHEMA, Base
+from src.models.reports import BacktestReport
 from src.models.runs import (
     RUN_PURPOSES,
     RUN_STATUSES,
@@ -19,6 +20,7 @@ from src.models.strategies import STRATEGY_KINDS, STRATEGY_STATUSES, Strategy
 __all__ = [
     "APP_SCHEMA",
     "Base",
+    "BacktestReport",
     "BacktestRun",
     "RunEquityPoint",
     "RunMetrics",

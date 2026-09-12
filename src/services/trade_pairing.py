@@ -78,6 +78,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Literal, Mapping, Sequence, TypedDict
 
 __all__ = ["Fill", "TradeRow", "pair_fills"]
@@ -168,7 +169,7 @@ class _Fill:
     sort_key: tuple[datetime, int]
 
 
-def pair_fills(fills: Sequence[Mapping[str, Any]]) -> list[TradeRow]:
+def pair_fills(fills: Sequence[Mapping[str, Any]], *, market_timezone: str | None = None) -> list[TradeRow]:
     """Pair one-leg fills into round-trip trades, FIFO per ticker.
 
     Raises:
@@ -178,7 +179,7 @@ def pair_fills(fills: Sequence[Mapping[str, Any]]) -> list[TradeRow]:
             later pairing for that ticker, and the damage would only show up
             as a slightly wrong P&L column.
     """
-    normalised = _normalise(fills)
+    normalised = _normalise(fills, market_timezone=market_timezone)
 
     open_lots: defaultdict[str, deque[_Lot]] = defaultdict(deque)
     closed: list[dict[str, Any]] = []
@@ -266,9 +267,10 @@ def _open_row(lot: _Lot, ticker: str) -> dict[str, Any]:
     }
 
 
-def _normalise(fills: Sequence[Mapping[str, Any]]) -> list[_Fill]:
+def _normalise(fills: Sequence[Mapping[str, Any]], *, market_timezone: str | None = None) -> list[_Fill]:
     """Validate every fill and stable-sort them chronologically."""
     normalised: list[_Fill] = []
+    market_zone = ZoneInfo(market_timezone) if market_timezone else None
 
     for index, raw in enumerate(fills):
         quantity = _number(raw, "shares", index)
@@ -278,6 +280,8 @@ def _normalise(fills: Sequence[Mapping[str, Any]]) -> list[_Fill]:
             continue
 
         moment = _timestamp(raw, index)
+        if market_zone is not None:
+            moment = moment.astimezone(market_zone) if moment.tzinfo else moment.replace(tzinfo=market_zone)
         # An absent or explicitly null fee column means "no fees recorded",
         # which is what the engine's own log looks like today.
         fees = 0.0 if raw.get("fees") is None else _number(raw, "fees", index)

@@ -1,87 +1,26 @@
-"""Upload guardrails and validation-by-backtest for user strategies.
+"""Reading an uploaded strategy without running it.
 
-A student uploads a ``.py`` file. Nothing about that file is trusted, and the
-only way to know whether it works is to run it — so this module does two jobs:
-it scans the source before storing it, and it starts a *normal* backtest run
-against it once stored.
+Two jobs on the same AST pass. :func:`scan_source` refuses source that must not
+be stored, raising on the first problem. :func:`check_compatibility` reads the
+same rules plus the engine's contract and reports every problem at once, which
+is what ``POST /strategies/check`` answers with.
 
-The second job is the important design point. A validation run is not a
-separate code path: it is a row in ``app.backtest_runs`` with
-``purpose='validation'``, submitted to the same job manager, executed by the
-same worker, reporting the same progress into the same columns. The student can
-open it like any other run, and when it finishes the worker flips the strategy
-to ``active``. Anything else would mean maintaining two run pipelines and
-having the wrong one break silently.
-
-SECURITY — READ THIS BEFORE CHANGING ANY OF IT
-==============================================
-Validating a strategy means **executing user-supplied Python** inside a worker
-process that holds admin credentials to the production trading database. That
-is a deliberate product decision (functional first, small trusted audience),
-and it is the only reason the guardrails below are considered sufficient.
-
-The guardrails are:
-
-1. :func:`scan_source` — an AST scan that rejects imports outside an allowlist
-   and the obvious escape hatches (``exec``, ``eval``, ``__import__``,
-   ``open``, ``os``/``subprocess`` usage). :func:`check_compatibility` is the
-   same reading plus the engine's own contract, reported as a list instead of
-   raised on the first problem. It is what ``POST /strategies/check`` answers
-   with, and it changes nothing about what is or is not accepted.
-2. :func:`start_validation` — a wall-clock timeout that asks the run to cancel
-   through the ordinary cancellation flag.
-3. A short validation window, so a validation run is a minute of CPU rather
-   than an hour of it.
-
-**None of these is a security boundary.** The scan reads source that the
-interpreter is about to execute anyway; any author who wants to get past it
-can, with a string, a dunder, or a decorator — this is a speed bump against
-accidents and casual mischief, nothing more. The timeout is cooperative: it
-sets a flag the engine polls, and code that never returns to the engine loop
-never sees it. Real isolation is deferred work and is required before this is
-exposed beyond the club: a container per run, no network egress, and a database
-role scoped to ``public.market_data`` instead of the admin credentials the
-worker holds today.
+SECURITY: none of this is a sandbox. The scan reads source the interpreter is
+about to execute anyway, and any author who wants past it can get past it with
+a string, a dunder or a decorator. It stops accidents, not intent. Real
+isolation (a container per run, no network egress, a database role scoped to
+``public.market_data`` instead of the admin credentials the worker holds) is
+required before this is exposed beyond the club.
 """
 
 from __future__ import annotations
 
 import ast
-import asyncio
-import json
-import logging
+import importlib.util
+import re
 from dataclasses import dataclass
-from datetime import date, timedelta
-from typing import Any
-
-from engine import ENGINE_VERSION
-from src.core.config import settings
-from src.db.engine import session_scope
-from src.db.init import ensure_schema
-from src.integrations.strategy_store import get_strategy_store, strategy_key
-from src.repositories import runs as runs_repo
-from src.repositories import strategies as strategies_repo
-from src.repositories.runs import TERMINAL_STATUSES
-from src.schemas.backtests import BacktestStatus, BacktestSummary
-from src.services.backtests import (
-    MODE_KEY,
-    _dispatch,
-    _symbol_for,
-    create_backtest_run,
-)
-
-logger = logging.getLogger(__name__)
-
-# The two objects that make up a stored strategy. They match
-# ``engine/strategies/user_loader.py`` — spelled again rather than imported
-# because importing the loader would drag pandas into every process that only
-# wants to write a file.
-SOURCE_FILENAME = "strategy.py"
-CONFIG_FILENAME = "config.json"
-
-# ---------------------------------------------------------------------------
-# The source scan — a speed bump, not a sandbox (see the module docstring)
-# ---------------------------------------------------------------------------
+from functools import lru_cache
+from pathlib import Path
 
 # Top-level packages an uploaded strategy may import. Everything a strategy
 # legitimately needs is here: the engine's own API, the two numeric libraries
@@ -145,7 +84,7 @@ BANNED_ATTRIBUTES = frozenset(
     }
 )
 
-# The base class an uploaded strategy must extend, by name — an AST scan reads
+# The base class an uploaded strategy must extend, by name. An AST scan reads
 # names, not objects.
 BASE_CLASS_NAME = "BasePortfolio"
 
@@ -156,16 +95,6 @@ class StrategyValidationError(ValueError):
     The route turns this into a 422 whose ``detail`` is ``str(exc)`` verbatim,
     so every message here names the offending line and says what would be
     accepted instead.
-    """
-
-
-class ValidationStartError(RuntimeError):
-    """Validation could not be *started* — a server-side problem, not a bad upload.
-
-    Kept apart from :class:`StrategyValidationError` because the upload itself
-    was fine: the source is stored and the registry row exists, and the student
-    is told the strategy could not be validated yet rather than that their code
-    is wrong.
     """
 
 
@@ -212,7 +141,7 @@ def _violation(node: ast.AST) -> str | None:
             # A relative import has nothing to be relative to: an upload is a
             # single file, materialized on its own into a temporary directory.
             return (
-                "relative imports are not allowed — an uploaded strategy is a "
+                "relative imports are not allowed. An uploaded strategy is a "
                 "single file with no package around it."
             )
         root = (node.module or "").split(".")[0]
@@ -233,7 +162,7 @@ def _violation(node: ast.AST) -> str | None:
         value = node.value
         if isinstance(value, ast.Name) and value.id in BANNED_MODULE_ROOTS:
             return (
-                f"{value.id}.{node.attr} is not allowed — an uploaded strategy "
+                f"{value.id}.{node.attr} is not allowed. An uploaded strategy "
                 "may not reach the operating system, the filesystem, or the "
                 "network."
             )
@@ -276,7 +205,7 @@ def _extends_base_portfolio(node: ast.ClassDef) -> bool:
     for base in node.bases:
         if isinstance(base, ast.Name) and base.id == BASE_CLASS_NAME:
             return True
-        # ``portfolio_BASE.strategy.BasePortfolio`` — the dotted spelling.
+        # ``portfolio_BASE.strategy.BasePortfolio``, the dotted spelling.
         if isinstance(base, ast.Attribute) and base.attr == BASE_CLASS_NAME:
             return True
     return False
@@ -391,6 +320,7 @@ def check_compatibility(source: str) -> CompatibilityReport:
         strategy = classes[0]
         class_name = strategy.name
         issues.extend(_contract_issues(strategy))
+        issues.extend(_indicator_issues(strategy))
         warnings.extend(_contract_warnings(strategy))
 
     issues = _deduplicated(issues)
@@ -422,6 +352,136 @@ def _deduplicated(issues: list[CompatibilityIssue]) -> list[CompatibilityIssue]:
         unique.append(issue)
     unique.sort(key=lambda issue: issue.line)
     return unique
+
+
+# ---------------------------------------------------------------------------
+# Indicators
+# ---------------------------------------------------------------------------
+#
+# A strategy naming an indicator the engine does not have passes every other
+# check here and then dies at construction with a ModuleNotFoundError. That is
+# the last common way to get "compatible" from this file and a failed run from
+# the worker, so the names are checked.
+#
+# The available set is discovered, not listed. Dropping a new file into
+# engine/indicators makes it valid here with no edit, which is the only way a
+# hardcoded list stays correct.
+
+
+def _camel_to_snake(name: str) -> str:
+    """The engine's own transform, copied so the two cannot disagree.
+
+    ``AddIndicator`` turns the class name into a module name this way and then
+    imports ``engine.indicators.<module>``. See ``portfolio_BASE/strategy.py``.
+    """
+    first = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub("([a-z0-9])([A-Z])", r"\1_\2", first).lower()
+
+
+@lru_cache(maxsize=1)
+def _indicator_directory() -> Path | None:
+    """Where the engine keeps its indicators, without importing any of them.
+
+    ``find_spec`` resolves the package without executing its modules, so this
+    stays as cheap as the rest of the scan.
+    """
+    try:
+        spec = importlib.util.find_spec("engine.indicators")
+    except (ImportError, ValueError):  # pragma: no cover - engine is vendored
+        return None
+    locations = list(getattr(spec, "submodule_search_locations", None) or [])
+    return Path(locations[0]) if locations else None
+
+
+@lru_cache(maxsize=1)
+def known_indicators() -> frozenset[str]:
+    """Every indicator class the engine can load, read from source.
+
+    Parsed rather than imported: these files pull in pandas, and this runs on a
+    request. The base class is excluded, since a strategy cannot use it.
+    """
+    directory = _indicator_directory()
+    if directory is None:
+        return frozenset()
+
+    names: set[str] = set()
+    for path in directory.glob("*.py"):
+        if path.name in {"__init__.py", "base.py"}:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):  # pragma: no cover - vendored source
+            continue
+        names.update(
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name != "Indicator"
+        )
+    return frozenset(names)
+
+
+def _indicator_issues(strategy: ast.ClassDef) -> list[CompatibilityIssue]:
+    """Names passed to AddIndicator or RegisterIndicatorSet that do not exist.
+
+    Only string literals are checked. A name built at run time cannot be read
+    here, and guessing at one would refuse working code.
+    """
+    available = known_indicators()
+    if not available:  # pragma: no cover - only if the engine is missing
+        return []
+
+    issues: list[CompatibilityIssue] = []
+    for node in ast.walk(strategy):
+        for name_node in _indicator_name_nodes(node):
+            name = name_node.value
+            if name in available:
+                continue
+            module = _camel_to_snake(name)
+            issues.append(
+                CompatibilityIssue(
+                    name_node.lineno,
+                    f"there is no indicator called {name!r}. The engine looks for "
+                    f"engine/indicators/{module}.py and finds nothing. Available: "
+                    f"{', '.join(sorted(available))}.",
+                )
+            )
+    return issues
+
+
+def _indicator_name_nodes(node: ast.AST) -> list[ast.Constant]:
+    """The string literals naming an indicator in one call, if it is one.
+
+    Two shapes, both used by the vendored strategies:
+    ``AddIndicator("SimpleMovingAverage", ticker)`` and
+    ``RegisterIndicatorSet({"fast": ("SimpleMovingAverage", {...})})``.
+    """
+    if not isinstance(node, ast.Call):
+        return []
+
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else None
+
+    if name == "AddIndicator":
+        first = node.args[0] if node.args else None
+        return [first] if _is_str(first) else []
+
+    if name == "RegisterIndicatorSet":
+        found: list[ast.Constant] = []
+        for arg in node.args:
+            if not isinstance(arg, ast.Dict):
+                continue
+            for value in arg.values:
+                if isinstance(value, ast.Tuple) and value.elts:
+                    head = value.elts[0]
+                    if _is_str(head):
+                        found.append(head)
+        return found
+
+    return []
+
+
+def _is_str(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
 
 
 def _strategy_class_nodes(tree: ast.AST) -> list[ast.ClassDef]:
@@ -608,263 +668,3 @@ def _calls_super_init(initializer: ast.FunctionDef | ast.AsyncFunctionDef) -> bo
     return False
 
 
-# ---------------------------------------------------------------------------
-# The generated config
-# ---------------------------------------------------------------------------
-
-# The frontend's upload form sends name, description, source and filename and
-# nothing else, so the configuration a strategy needs is generated. Two liquid
-# large caps keep a validation run short; a student who wants a different
-# universe re-runs the strategy from the catalogue once it is active.
-DEFAULT_TICKERS = ("AAPL", "MSFT")
-DEFAULT_INTERVAL_SECONDS = 60
-DEFAULT_LOOKBACK_DAYS = 30
-# Uppercase because that is the engine's vocabulary: the runner keys its data
-# dictionary with "MARKET_DATA", and a lower-case spelling reaches no feed.
-DEFAULT_DATA_FEEDS = ("MARKET_DATA",)
-
-# The one parameter an upload advertises to the run form. Deliberately not
-# TICKERS: overriding the ticker list without also overriding WEIGHTS produces
-# a run whose benchmark and risk outputs are misaligned with what it traded.
-LOOKBACK_PARAM_SPEC: dict[str, Any] = {
-    "key": "LOOKBACK_DAYS",
-    "label": "Lookback (days)",
-    "type": "integer",
-    "default": DEFAULT_LOOKBACK_DAYS,
-    "min": 5,
-    "max": 365,
-}
-
-
-def build_config(strategy_key_value: str) -> dict[str, Any]:
-    """The ``config.json`` stored beside an upload's source.
-
-    Same shape as a built-in portfolio's config, because the engine reads it
-    with the same code: ``BasePortfolio`` pulls PORTFOLIO_ID, TICKERS, WEIGHTS,
-    INTERVAL, LOOKBACK_DAYS and DATA_FEEDS straight out of this dictionary.
-    """
-    weight = round(1.0 / len(DEFAULT_TICKERS), 6)
-    return {
-        "PORTFOLIO_ID": strategy_key_value,
-        "TICKERS": list(DEFAULT_TICKERS),
-        "WEIGHTS": {ticker: weight for ticker in DEFAULT_TICKERS},
-        "INTERVAL": DEFAULT_INTERVAL_SECONDS,
-        "LOOKBACK_DAYS": DEFAULT_LOOKBACK_DAYS,
-        "DATA_FEEDS": list(DEFAULT_DATA_FEEDS),
-    }
-
-
-def parameter_specs() -> list[dict[str, Any]]:
-    """The catalogue's parameter form for an upload."""
-    return [dict(LOOKBACK_PARAM_SPEC)]
-
-
-def store_strategy_source(key: str, source: str, config: dict[str, Any]) -> str:
-    """Write an upload into the strategy store and return its storage key.
-
-    Source and config go in together because the engine needs them together:
-    ``BasePortfolio`` finds its config by looking beside the file its class was
-    defined in, so a key holding only ``strategy.py`` materializes into a
-    directory the engine cannot configure.
-    """
-    storage = strategy_key(key)
-    store = get_strategy_store()
-    store.put(storage, SOURCE_FILENAME, source)
-    store.put(storage, CONFIG_FILENAME, json.dumps(config, indent=2) + "\n")
-    return storage
-
-
-def discard_stored_source(key: str) -> None:
-    """Remove everything stored for a strategy. Missing is not an error."""
-    try:
-        get_strategy_store().delete(strategy_key(key))
-    except Exception:
-        # Deleting the registry row is what the caller asked for and it has
-        # already happened; an object left in the store is unreachable, not
-        # broken.
-        logger.exception("Stored source for strategy %s could not be removed", key)
-
-
-# ---------------------------------------------------------------------------
-# The validation run
-# ---------------------------------------------------------------------------
-
-
-async def validation_window(tickers: list[str]) -> tuple[date, date]:
-    """The short window a validation run executes over.
-
-    Anchored on the last bar the universe actually has, never on today: market
-    data ends weeks behind the calendar, so a window computed from ``now()``
-    returns zero rows and would fail every upload for a reason that has nothing
-    to do with the uploaded code.
-    """
-    async with session_scope() as session:
-        latest = await strategies_repo.latest_market_data_date(session, tickers)
-
-    if latest is None:
-        raise ValidationStartError(
-            "there is no market data for "
-            f"{', '.join(tickers)}, so there is no window to validate over"
-        )
-
-    span = max(int(settings.validation_window_days), 1)
-    return latest - timedelta(days=span), latest
-
-
-async def start_validation(
-    *, strategy_key_value: str, strategy_name: str, tickers: list[str]
-) -> BacktestSummary:
-    """Queue the backtest that proves an upload works.
-
-    An ordinary run in every respect except ``purpose='validation'``, which is
-    what tells the worker to write the outcome back onto the strategy row and
-    keeps it out of the catalogue's run aggregates.
-
-    ``submit_backtest_run`` is not reused because it hardcodes
-    ``purpose='user'`` and validates a client-supplied request; there is no
-    client request here. The dispatch half *is* reused, because a refused
-    worker pool has to be handled identically either way.
-    """
-    start, end = await validation_window(tickers)
-
-    summary = await create_backtest_run(
-        name=f"Validation — {strategy_name}"[:120],
-        strategy_key=strategy_key_value,
-        start_date=start,
-        end_date=end,
-        initial_capital=float(settings.validation_initial_capital),
-        symbol=_symbol_for(tickers),
-        engine_version=ENGINE_VERSION,
-        # Event mode only: it is the dependable path, and a vectorized
-        # approximation would prove nothing about the code the student wrote.
-        params={MODE_KEY: "event"},
-        purpose="validation",
-    )
-
-    dispatched = await _dispatch(summary)
-    if dispatched.status is BacktestStatus.FAILED:
-        raise ValidationStartError(
-            "the worker pool would not accept the validation run; "
-            "see the run for the reason"
-        )
-
-    _schedule_timeout(dispatched.id)
-    return dispatched
-
-
-# Strong references to the watchdogs in flight. ``asyncio`` keeps only weak
-# references to tasks, so a timer nobody holds can be garbage collected
-# mid-sleep and silently never fire.
-_watchdogs: set[asyncio.Task] = set()
-
-
-def _schedule_timeout(run_id: str) -> None:
-    """Arm the wall-clock backstop for one validation run.
-
-    Honest about what this is: a timer in the API process that sets the same
-    ``cancel_requested`` flag a student's Cancel button sets. If the API
-    restarts, the timer is gone and the run keeps going until the worker
-    finishes with it — the startup reconciler is what cleans up after that. It
-    is not a resource limit, and it cannot stop code that never returns to the
-    engine's loop; only process isolation can do either.
-    """
-    timeout = float(settings.validation_timeout_seconds)
-    if timeout <= 0:
-        return
-
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:  # pragma: no cover - only outside the API process
-        logger.warning(
-            "No event loop to arm the validation timeout for run %s on", run_id
-        )
-        return
-
-    task = loop.create_task(_cancel_when_overdue(run_id, timeout))
-    _watchdogs.add(task)
-    task.add_done_callback(_watchdogs.discard)
-
-
-async def _cancel_when_overdue(run_id: str, timeout: float) -> None:
-    """Sleep out the timeout, then ask an unfinished validation run to stop."""
-    try:
-        await asyncio.sleep(timeout)
-        parsed = runs_repo.parse_run_id(run_id)
-        if parsed is None:  # pragma: no cover - the id came from a created row
-            return
-
-        async with session_scope() as session:
-            row = await runs_repo.get_run(session, parsed)
-            if row is None or row.run.status in TERMINAL_STATUSES:
-                return
-            await runs_repo.request_cancel(session, parsed)
-
-        logger.warning(
-            "Validation run %s passed its %.0fs limit; cancellation requested",
-            run_id,
-            timeout,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        # The run is still going and will still finish; losing the backstop is
-        # not worth an unhandled exception in a background task.
-        logger.exception("Validation timeout for run %s could not be applied", run_id)
-
-
-async def mark_validation_unstarted(key: str, reason: str) -> None:
-    """Park an upload whose validation never got off the ground.
-
-    Without this the strategy sits in ``validating`` forever, which reads to a
-    student as "still working" for a run that does not exist.
-    """
-    try:
-        async with session_scope() as session:
-            await strategies_repo.set_validation_state(
-                session, key, status="failed_validation", enabled=False
-            )
-    except Exception:
-        logger.exception("Strategy %s could not be marked unvalidated (%s)", key, reason)
-
-
-# ---------------------------------------------------------------------------
-# Migration off the staging column
-# ---------------------------------------------------------------------------
-
-
-async def migrate_staged_sources() -> int:
-    """Move any pre-store upload into the store. Returns how many moved.
-
-    Before this pipeline existed, ``POST /strategies`` parked source in
-    ``app.strategies.source_staging`` and did nothing with it. Such a row can
-    never run: the worker loads uploads from the store and from nowhere else.
-    This sweep copies the staged source into the store, points the row at it,
-    and empties the column — after which the column stays empty forever,
-    because nothing writes it any more.
-
-    A validation run is *not* started for the migrated rows. They were uploaded
-    before validation existed and their authors are not waiting on a result;
-    starting a run each would mean an unbounded burst of backtests on the first
-    upload after a deploy.
-    """
-    await ensure_schema()
-    async with session_scope() as session:
-        staged = await strategies_repo.strategies_with_staged_source(session)
-        pending = [(row.key, row.source_staging or "") for row in staged]
-
-    migrated = 0
-    for key, source in pending:
-        try:
-            storage = store_strategy_source(key, source, build_config(key))
-            async with session_scope() as session:
-                await strategies_repo.adopt_staged_source(
-                    session, key, storage_key=storage
-                )
-        except Exception:
-            logger.exception("Staged source for strategy %s could not be migrated", key)
-            continue
-        migrated += 1
-
-    if migrated:
-        logger.info("Migrated %d staged strategy source(s) into the store", migrated)
-    return migrated

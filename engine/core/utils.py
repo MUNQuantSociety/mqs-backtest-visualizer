@@ -6,6 +6,7 @@ import pandas as pd
 
 from engine.contracts.errors import MarketDataUnavailable
 from engine.data import cache as _cache
+from engine.data.fmp import FMPDataAdapter, fetch_daily_history, market_data_source
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 
@@ -164,6 +165,11 @@ def fetch_historical_data(
         # If portfolio config has no tickers, return empty df
         logger.warning("No tickers specified in the portfolio; returning empty DataFrame.")
         return pd.DataFrame()
+
+    if market_data_source() == "fmp":
+        if isinstance(portfolio.db, FMPDataAdapter):
+            return portfolio.db.get_daily_history(tickers, start_date, end_date)
+        return fetch_daily_history(tickers, start_date, end_date)
 
     # Initialize start and end dates
     start = pd.to_datetime(start_date, utc=True)

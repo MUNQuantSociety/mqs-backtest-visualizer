@@ -3,6 +3,10 @@
 #
 # For more help, visit the .dockerignore file reference guide at
 # https://docs.docker.com/go/build-context-dockerignore/
+#
+# Unlike .gitignore, a bare `name/` here is anchored to the context root, so
+# `data/` excludes the parquet cache without touching the vendored
+# `engine/data/` package. Use `**/` only where every depth is meant.
 
 **/.DS_Store
 **/__pycache__
@@ -10,7 +14,6 @@
 **/venv
 **/.pytest_cache
 **/.coverage
-**/__pycache__
 **/.classpath
 **/.dockerignore
 **/.env
@@ -37,5 +40,34 @@
 **/secrets.dev.yaml
 **/values.dev.yaml
 **/.artifacts
+**/.aws
+**/.ssh
+**/*.pem
+**/*.key
+**/*.tfstate*
+**/.terraform
+**/*.pyc
+**/htmlcov
+
+# Runtime state that must never ride along in an image: the parquet market-data
+# cache is hundreds of MB and is rebuilt from the database, the local strategy
+# store holds uploads that belong to a running instance, and .artifacts is
+# backtest output written at runtime.
+data/
+.strategy_store/
+.artifacts/
+
+# Development-only trees. Nothing under src/, engine/ or server.py imports
+# from them, and CI runs the tests from a checkout, not from the image.
+tests/
+docs/
+.github/
+scripts/
+frontend/
+dist/
+build/
 LICENSE
 README.md
+README.Docker.md
+BACKEND_PLAN.md
+mermaid-diagram.svg

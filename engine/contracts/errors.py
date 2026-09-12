@@ -42,7 +42,7 @@ class NoMarketData(EngineError):
         detail = reason or "no market data"
         super().__init__(
             f"{detail} for [{ticker_list}] between {start} and {end}. "
-            "Check the ticker coverage of public.market_data for this window."
+            "Check the ticker coverage from the configured market-data source for this window."
         )
 
 

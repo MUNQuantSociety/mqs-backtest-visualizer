@@ -1,0 +1,345 @@
+name: deploy
+
+# Only main deploys the existing ECS service. No development deployment exists.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize all production rollouts, including manual runs. Never cancel midway.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  branch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require this repository and main
+        shell: python {0}
+        run: |
+          import os
+          import re
+          if not (
+              os.environ["GITHUB_REPOSITORY"] == "MUNQuantSociety/mqs-backtest-visualizer"
+              and os.environ["GITHUB_REF"] == "refs/heads/main"
+              and os.environ["GITHUB_EVENT_NAME"] in {"push", "workflow_dispatch"}
+              and re.fullmatch(r"[0-9a-f]{40}", os.environ["GITHUB_SHA"])
+          ):
+              raise SystemExit("Deployment is restricted to this repository's main branch")
+
+  test:
+    name: CI (pre-deploy)
+    needs: branch
+    uses: ./.github/workflows/ci.yml
+    # No secrets or OIDC permission are passed into CI.
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.repository == 'MUNQuantSociety/mqs-backtest-visualizer'
+    environment: production
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECS_CONTAINER_NAME: ${{ vars.ECS_CONTAINER_NAME }}
+      PRODUCTION_DEPLOY_ENABLED: ${{ vars.PRODUCTION_DEPLOY_ENABLED }}
+      ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
+      STRATEGY_STORE_S3_BUCKET: ${{ vars.STRATEGY_STORE_S3_BUCKET }}
+      STRATEGY_STORE_S3_PREFIX: ${{ vars.STRATEGY_STORE_S3_PREFIX }}
+      AWS_PAGER: ""
+    steps:
+      - name: Check deploy configuration
+        id: guard
+        shell: python {0}
+        env:
+          ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          import os
+          required = {
+              "ROLE_ARN": "AWS_DEPLOY_ROLE_ARN",
+              "AWS_REGION": "AWS_REGION",
+              "ECR_REPOSITORY": "ECR_REPOSITORY",
+              "ECS_CLUSTER": "ECS_CLUSTER",
+              "ECS_SERVICE": "ECS_SERVICE",
+              "ECS_CONTAINER_NAME": "ECS_CONTAINER_NAME",
+          }
+          missing = [label for key, label in required.items() if not os.environ.get(key, "").strip()]
+          if missing:
+              raise SystemExit("Deployment not configured: " + ", ".join(missing))
+          if os.environ.get("PRODUCTION_DEPLOY_ENABLED") != "true":
+              raise SystemExit("Production release gate is closed: PRODUCTION_DEPLOY_ENABLED must be true")
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Validate service and preserve task configuration
+        id: baseline
+        shell: python {0}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          def aws(*args):
+              return json.loads(subprocess.check_output(["aws", *args, "--output", "json"], text=True))
+
+          response = aws("ecs", "describe-services", "--cluster", os.environ["ECS_CLUSTER"],
+                         "--services", os.environ["ECS_SERVICE"])
+          if response.get("failures") or len(response.get("services", [])) != 1:
+              raise SystemExit("Configured ECS service was not found")
+          service = response["services"][0]
+          deployments = service.get("deployments", [])
+          breaker = service.get("deploymentConfiguration", {}).get("deploymentCircuitBreaker", {})
+          if not (
+              service.get("status") == "ACTIVE"
+              and service.get("deploymentController", {}).get("type", "ECS") == "ECS"
+              and service.get("schedulingStrategy", "REPLICA") == "REPLICA"
+              and service.get("desiredCount", 0) > 0
+              and service.get("runningCount") == service["desiredCount"]
+              and service.get("pendingCount") == 0
+              and breaker.get("enable") is True and breaker.get("rollback") is True
+              and len(deployments) == 1
+              and deployments[0].get("status") == "PRIMARY"
+              and deployments[0].get("rolloutState") == "COMPLETED"
+              and deployments[0].get("taskDefinition") == service.get("taskDefinition")
+          ):
+              raise SystemExit("ECS requires a stable, nonzero rolling service with circuit-breaker rollback")
+          previous = service["taskDefinition"]
+          response = aws("ecs", "describe-task-definition", "--task-definition", previous, "--include", "TAGS")
+          definition = response["taskDefinition"]
+          platform = definition.get("runtimePlatform", {})
+          containers = [c for c in definition["containerDefinitions"]
+                        if c["name"] == os.environ["ECS_CONTAINER_NAME"]]
+          if not (
+              definition.get("status") == "ACTIVE"
+              and definition.get("networkMode") == "awsvpc"
+              and "FARGATE" in definition.get("requiresCompatibilities", [])
+              and platform.get("cpuArchitecture", "X86_64") == "X86_64"
+              and platform.get("operatingSystemFamily", "LINUX") == "LINUX"
+              and len(containers) == 1 and containers[0].get("essential", True)
+              and any(p.get("containerPort") == 8000 for p in containers[0].get("portMappings", []))
+          ):
+              raise SystemExit("Task definition must contain the configured essential API on Linux/amd64 port 8000")
+          container = containers[0]
+          environment = {entry["name"]: entry["value"] for entry in (container.get("environment") or [])}
+          references = {entry["name"]: entry["valueFrom"] for entry in (container.get("secrets") or [])}
+          # Only check presence; never resolve or print database credentials.
+          missing = [suffix for suffix in ("HOST", "DB", "USER", "PASSWORD")
+                     if not any(environment.get(f"{prefix}_{suffix}", "").strip()
+                                or references.get(f"{prefix}_{suffix}", "").strip()
+                                for prefix in ("POSTGRES", "MARKET_DATA"))]
+          if missing:
+              raise SystemExit("Task lacks database configuration/secrets for: " + ", ".join(missing))
+          sslmode = (environment.get("POSTGRES_SSLMODE", "").strip()
+                     or environment.get("MARKET_DATA_SSLMODE", "").strip())
+          if sslmode not in {"require", "verify-ca", "verify-full"} or any(
+              references.get(key) for key in ("POSTGRES_SSLMODE", "MARKET_DATA_SSLMODE")
+          ):
+              raise SystemExit("Production task requires an explicit secure database SSL mode in environment")
+          # The parent provisions these resources; rendering references creates none.
+          role = os.environ.get("ECS_TASK_ROLE_ARN", "").strip()
+          if role:
+              if not re.fullmatch(r"arn:aws:iam::[0-9]{12}:role/[\w+=,.@/-]+", role):
+                  raise SystemExit("ECS_TASK_ROLE_ARN must identify an IAM role")
+              definition["taskRoleArn"] = role
+          bucket = os.environ.get("STRATEGY_STORE_S3_BUCKET", "").strip()
+          if bucket:
+              overrides = {
+                  "STRATEGY_STORE_BACKEND": "s3",
+                  "STRATEGY_STORE_S3_BUCKET": bucket,
+                  "STRATEGY_STORE_S3_PREFIX": os.environ.get("STRATEGY_STORE_S3_PREFIX", "").strip(),
+              }
+              if references.keys() & overrides.keys():
+                  raise SystemExit("S3 environment overrides conflict with inherited secret references")
+              environment.update(overrides)
+              container["environment"] = [{"name": key, "value": value} for key, value in environment.items()]
+          if references.get("STRATEGY_STORE_BACKEND"):
+              raise SystemExit("STRATEGY_STORE_BACKEND must be explicit non-secret configuration")
+          if environment.get("STRATEGY_STORE_BACKEND", "local").lower() == "s3":
+              if not definition.get("taskRoleArn"):
+                  raise SystemExit("S3 strategy storage requires a taskRoleArn")
+              if not (environment.get("STRATEGY_STORE_S3_BUCKET", "").strip()
+                      or references.get("STRATEGY_STORE_S3_BUCKET", "").strip()):
+                  raise SystemExit("S3 strategy storage requires a bucket")
+          # Retain roles, secrets references, env, health checks, sidecars, volumes and limits.
+          # Remove only DescribeTaskDefinition response metadata; AWS validates all inputs.
+          for key in ("taskDefinitionArn", "revision", "status", "requiresAttributes",
+                      "compatibilities", "registeredAt", "registeredBy", "deregisteredAt"):
+              definition.pop(key, None)
+          tags = [tag for tag in response.get("tags", []) if not tag["key"].startswith("aws:")]
+          if tags:
+              definition["tags"] = tags
+          Path(os.environ["RUNNER_TEMP"], "task-definition.json").write_text(json.dumps(definition))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"previous={previous}", file=output)
+              print(f"deployment={deployments[0]['id']}", file=output)
+
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push commit image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Register explicit revision and deploy
+        id: revision
+        shell: python {0}
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          PREVIOUS_TASK_DEFINITION: ${{ steps.baseline.outputs.previous }}
+          BASELINE_DEPLOYMENT: ${{ steps.baseline.outputs.deployment }}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          def aws(*args):
+              return json.loads(subprocess.check_output(["aws", *args, "--output", "json"], text=True))
+
+          digest = os.environ["IMAGE_DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("Build did not return an image manifest digest")
+          image = f"{os.environ['REGISTRY']}/{os.environ['ECR_REPOSITORY']}@{digest}"
+          path = Path(os.environ["RUNNER_TEMP"], "task-definition.json")
+          definition = json.loads(path.read_text())
+          containers = [c for c in definition["containerDefinitions"]
+                        if c["name"] == os.environ["ECS_CONTAINER_NAME"]]
+          if len(containers) != 1:
+              raise SystemExit("Expected exactly one API container")
+          containers[0]["image"] = image
+          path.write_text(json.dumps(definition))
+          # Refuse to overwrite a rollout/configuration change made while the image built.
+          response = aws("ecs", "describe-services", "--cluster", os.environ["ECS_CLUSTER"],
+                         "--services", os.environ["ECS_SERVICE"])
+          services = response.get("services", [])
+          if response.get("failures") or len(services) != 1:
+              raise SystemExit("Service disappeared during build")
+          service = services[0]
+          deployments = service.get("deployments", [])
+          if not (
+              service.get("taskDefinition") == os.environ["PREVIOUS_TASK_DEFINITION"]
+              and len(deployments) == 1
+              and deployments[0].get("id") == os.environ["BASELINE_DEPLOYMENT"]
+              and deployments[0].get("rolloutState") == "COMPLETED"
+              and service.get("desiredCount", 0) > 0
+          ):
+              raise SystemExit("Service changed during build; inspect it before retrying")
+          registered = aws("ecs", "register-task-definition", "--cli-input-json", f"file://{path}")
+          revision = registered["taskDefinition"]["taskDefinitionArn"]
+          if not re.fullmatch(r"arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[\w-]+:[0-9]+", revision):
+              raise SystemExit("ECS did not return an explicit task revision ARN")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"task-definition={revision}", file=output)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              print(f"Commit: {os.environ['GITHUB_SHA']}\n\nImage: {image}\n", file=summary)
+              print(f"Previous revision: {os.environ['PREVIOUS_TASK_DEFINITION']}\n", file=summary)
+              print(f"Intended revision: {revision}\n", file=summary)
+          updated = aws("ecs", "update-service", "--cluster", os.environ["ECS_CLUSTER"],
+                        "--service", os.environ["ECS_SERVICE"], "--task-definition", revision)
+          primary = [d for d in updated["service"].get("deployments", [])
+                     if d.get("status") == "PRIMARY" and d.get("taskDefinition") == revision]
+          if updated["service"].get("taskDefinition") != revision or len(primary) != 1:
+              raise SystemExit("ECS did not accept the intended revision as PRIMARY")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"deployment={primary[0]['id']}", file=output)
+
+      - name: Verify intended revision and running digest
+        shell: python {0}
+        env:
+          TASK_DEFINITION: ${{ steps.revision.outputs.task-definition }}
+          DEPLOYMENT_ID: ${{ steps.revision.outputs.deployment }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          import json
+          import os
+          import subprocess
+
+          def aws(*args):
+              return json.loads(subprocess.check_output(["aws", *args, "--output", "json"], text=True))
+
+          cluster, service_name = os.environ["ECS_CLUSTER"], os.environ["ECS_SERVICE"]
+          revision, digest = os.environ["TASK_DEFINITION"], os.environ["IMAGE_DIGEST"]
+          # This waiter alone can succeed after a circuit-breaker rollback.
+          subprocess.run(["aws", "ecs", "wait", "services-stable", "--cluster", cluster,
+                          "--services", service_name], check=True)
+          response = aws("ecs", "describe-services", "--cluster", cluster, "--services", service_name)
+          if response.get("failures") or len(response.get("services", [])) != 1:
+              raise SystemExit("Cannot verify the deployed service")
+          service = response["services"][0]
+          deployments = service.get("deployments", [])
+          desired = service.get("desiredCount", 0)
+          if not (
+              service.get("status") == "ACTIVE"
+              and service.get("taskDefinition") == revision
+              and desired > 0 and service.get("runningCount") == desired
+              and service.get("pendingCount") == 0
+              and len(deployments) == 1
+              and deployments[0].get("id") == os.environ["DEPLOYMENT_ID"]
+              and deployments[0].get("taskDefinition") == revision
+              and deployments[0].get("status") == "PRIMARY"
+              and deployments[0].get("rolloutState") == "COMPLETED"
+          ):
+              raise SystemExit("Intended ECS deployment did not complete (rollback or different revision)")
+          arns = aws("ecs", "list-tasks", "--cluster", cluster, "--service-name", service_name,
+                     "--desired-status", "RUNNING")["taskArns"]
+          if len(arns) != desired or len(set(arns)) != desired:
+              raise SystemExit("Running task count does not match the intended service")
+          tasks = []
+          for offset in range(0, len(arns), 100):
+              response = aws("ecs", "describe-tasks", "--cluster", cluster,
+                             "--tasks", *arns[offset:offset + 100])
+              if response.get("failures"):
+                  raise SystemExit("ECS could not describe every running task")
+              tasks.extend(response.get("tasks", []))
+          if len(tasks) != desired or {t["taskArn"] for t in tasks} != set(arns):
+              raise SystemExit("ECS returned incomplete task details")
+          for task in tasks:
+              containers = [c for c in task.get("containers", [])
+                            if c.get("name") == os.environ["ECS_CONTAINER_NAME"]]
+              if not (
+                  task.get("taskDefinitionArn") == revision
+                  and task.get("lastStatus") == "RUNNING"
+                  and task.get("desiredStatus") == "RUNNING"
+                  and task.get("group") == f"service:{service_name}"
+                  and task.get("startedBy") == os.environ["DEPLOYMENT_ID"]
+                  and task.get("healthStatus") != "UNHEALTHY"
+                  and len(containers) == 1
+                  and containers[0].get("lastStatus") == "RUNNING"
+                  and containers[0].get("healthStatus") != "UNHEALTHY"
+                  and containers[0].get("imageDigest") == digest
+              ):
+                  raise SystemExit("A running task does not match the intended revision, deployment and digest")
+          print(f"Verified {desired} running tasks at {revision}, image {digest}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              print(f"Verified deployment: {desired} running tasks at the intended revision and digest.", file=summary)

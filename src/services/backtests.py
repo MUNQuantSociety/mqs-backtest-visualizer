@@ -1,26 +1,14 @@
-"""Backtest business logic — ORM rows in, frontend contract out, runs queued.
-
-Reading is the smaller half. The other half is ``submit_backtest_run``, which
-is where a student's Run Backtest click becomes a row and a queued job: it
-validates the submission against the strategy registry, inserts the run, and
-hands the id to the worker pool.
-
-The interesting decision on the read side is how a run that has not finished
-serialises. The client's Zod schema declares ``finalEquity``, ``totalReturn``,
-``sharpe`` and ``maxDrawdown`` as plain numbers, but a queued run has none of
-them yet. Rather than break the contract (or make the client handle nulls it
-did not ask for), an unfinished run reports zeros. The status field is what
-tells the UI whether those numbers mean anything.
-"""
+"""Backtest submission, transient polling, and completed JSON report retrieval."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -28,13 +16,17 @@ from typing import Any
 # A constant, not the engine: ``engine/__init__.py`` imports nothing, so
 # stamping a run with the code that will execute it costs no pandas import.
 from engine import ENGINE_VERSION
+from engine.data.fmp import FMPUnavailable
 from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
 from src.models import BacktestRun, RunEquityPoint, RunMetrics, RunTrade
+from src.repositories import reports as reports_repo
 from src.repositories import runs as runs_repo
 from src.repositories import strategies as strategies_repo
-from src.repositories.runs import TERMINAL_STATUSES, RunFilters, RunListRow
+from src.repositories.runs import RunListRow
+from src.services import market_data as market_data_service
+from src.services.run_controls import split_controls
 from src.schemas.backtests import (
     BacktestDetail,
     BacktestListResponse,
@@ -78,10 +70,8 @@ _NUMERIC_SPEC_TYPES = frozenset({"number", "integer", "percent"})
 class DeleteOutcome(str, Enum):
     """What ``DELETE /backtests/{id}`` actually did.
 
-    A terminal run is removed, and so is a queued one no worker has claimed
-    yet. Only a *running* run survives the request as a cancellation, because
-    the worker owns that row and needs it to record why it stopped. Both answer
-    204; the route needs the distinction only for its 404 case.
+    Saved reports are deleted; unfinished jobs receive a cancellation flag.
+    Both answer 204; the route needs the distinction only for its 404 case.
     """
 
     DELETED = "deleted"
@@ -150,6 +140,7 @@ def _to_metrics(metrics: RunMetrics | None) -> PerformanceMetrics:
             win_rate=0.0,
             profit_factor=0.0,
             total_trades=0,
+            unavailable=_metric_availability(None),
         )
     return PerformanceMetrics(
         total_return=_float(metrics.total_return),
@@ -161,7 +152,25 @@ def _to_metrics(metrics: RunMetrics | None) -> PerformanceMetrics:
         win_rate=_float(metrics.win_rate),
         profit_factor=_float(metrics.profit_factor),
         total_trades=int(metrics.total_trades or 0),
+        unavailable=_metric_availability(metrics),
     )
+
+
+def _metric_availability(metrics: RunMetrics | None) -> dict[str, str]:
+    unavailable = {}
+    for column, field in PerformanceMetrics.model_fields.items():
+        if column in {"total_trades", "unavailable"}:
+            continue
+        if metrics is None or getattr(metrics, column) is None:
+            reason = "Undefined for this run's observations or closed trades."
+            if metrics is None:
+                reason = "Run has no completed metrics yet."
+            elif column == "profit_factor":
+                reason = "No losing closed trades; profit factor is undefined."
+            elif column == "win_rate":
+                reason = "No closed trades."
+            unavailable[field.alias or column] = reason
+    return unavailable
 
 
 def _to_equity_point(point: RunEquityPoint) -> EquityPoint:
@@ -194,6 +203,8 @@ def to_detail(row: RunListRow) -> BacktestDetail:
     """Full run payload: summary fields plus metrics, curve, and trades."""
     run = row.run
     summary = _to_summary(row)
+    extra = dict(run.metrics.extra or {}) if run.metrics else {}
+    positions = extra.pop("openPositions", [])
     return BacktestDetail(
         **summary.model_dump(),
         metrics=_to_metrics(run.metrics),
@@ -202,125 +213,107 @@ def to_detail(row: RunListRow) -> BacktestDetail:
         parameters=dict(run.params or {}),
         progress_pct=run.progress_pct,
         error_message=run.error_message,
+        report_metadata=extra,
+        open_positions=list(positions),
     )
 
 
 async def list_backtests(
-    *,
-    search: str | None = None,
-    status: BacktestStatus | None = None,
-    strategy_id: str | None = None,
-    page: int = 1,
-    page_size: int = 25,
+    *, owner_id: uuid.UUID, search: str | None = None,
+    status: BacktestStatus | None = None, strategy_id: str | None = None,
+    page: int = 1, page_size: int = 25,
 ) -> BacktestListResponse:
-    """One page of runs. Empty until the run pipeline writes its first row."""
+    """Saved successful reports only. Live jobs never enter history."""
+    if status is not None and status != BacktestStatus.COMPLETED:
+        return BacktestListResponse(items=[], total=0, page=page, page_size=page_size)
     await ensure_schema()
-    filters = RunFilters(
-        search=search,
-        status=status.value if status is not None else None,
-        strategy_key=strategy_id,
-    )
     async with session_scope() as session:
-        rows, total = await runs_repo.list_runs(session, filters, page, page_size)
-        items = [_to_summary(row) for row in rows]
-    return BacktestListResponse(
-        items=items, total=total, page=page, page_size=page_size
-    )
+        items, total = await reports_repo.list_reports(
+            session, owner_id, search=search, strategy_key=strategy_id,
+            page=page, page_size=page_size,
+        )
+    return BacktestListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
-async def get_backtest(run_id: str) -> BacktestDetail | None:
-    """One run in full, or None when the id is unknown or not a UUID."""
+async def get_backtest(run_id: str, *, owner_id: uuid.UUID | None = None) -> BacktestDetail | None:
+    """Poll transient execution or retrieve this owner's completed JSON report."""
+    from src.workers.job_manager import get_job_manager
+
     parsed = runs_repo.parse_run_id(run_id)
     if parsed is None:
         return None
-
+    try:
+        manager = get_job_manager()
+    except RuntimeError:
+        manager = None
+    if manager is not None:
+        detail = await asyncio.to_thread(manager.get_detail, parsed, owner_id)
+        if detail is not None:
+            return detail
+    if owner_id is None:
+        return None
     await ensure_schema()
     async with session_scope() as session:
-        row = await runs_repo.get_run(session, parsed)
-        if row is None:
-            return None
-        return to_detail(row)
+        report = await reports_repo.get(session, parsed, owner_id)
+        return reports_repo.to_detail(report) if report is not None else None
 
 
 def _remove_artifacts(run_id: uuid.UUID) -> None:
-    """Delete the engine's CSV output for a run. Missing is fine, failure is not fatal.
-
-    Artifacts are derived data — the database row is the record — so a
-    directory that will not delete (a file open in Excel, an OneDrive sync
-    lock) must not turn a successful delete into a 500.
-    """
     shutil.rmtree(settings.artifact_dir / str(run_id), ignore_errors=True)
 
 
-async def delete_backtest(run_id: str) -> DeleteOutcome:
-    """Delete a finished or unclaimed run; ask a running one to cancel."""
+async def delete_backtest(run_id: str, *, owner_id: uuid.UUID | None = None) -> DeleteOutcome:
+    from src.workers.job_manager import get_job_manager
+
     parsed = runs_repo.parse_run_id(run_id)
     if parsed is None:
         return DeleteOutcome.NOT_FOUND
-
+    try:
+        manager = get_job_manager()
+    except RuntimeError:
+        manager = None
+    if manager is not None:
+        outcome = await asyncio.to_thread(manager.cancel, parsed, owner_id)
+        if outcome == "cancel_requested":
+            return DeleteOutcome.CANCEL_REQUESTED
+        if outcome == "deleted":
+            return DeleteOutcome.DELETED
+    if owner_id is None:
+        return DeleteOutcome.NOT_FOUND
     await ensure_schema()
     async with session_scope() as session:
-        row = await runs_repo.get_run(session, parsed)
-        if row is None:
-            return DeleteOutcome.NOT_FOUND
-
-        if row.run.status in TERMINAL_STATUSES:
-            await runs_repo.delete_run(session, parsed)
-            _remove_artifacts(parsed)
-            return DeleteOutcome.DELETED
-
-        # A queued run is deleted outright rather than cancelled. Nothing has
-        # claimed it, so nothing would ever act on the cancel flag or move it
-        # to a terminal status — the row would sit in `queued` forever while
-        # the client, which dropped it from its cache the moment it asked for
-        # the delete, watches it reappear on the next list refetch. The
-        # repository's predicate makes losing the race to a worker safe.
-        if row.run.status == "queued" and await runs_repo.delete_unclaimed_run(
-            session, parsed
-        ):
-            _remove_artifacts(parsed)
-            return DeleteOutcome.DELETED
-
-        await runs_repo.request_cancel(session, parsed)
-        return DeleteOutcome.CANCEL_REQUESTED
+        removed = await reports_repo.remove(session, parsed, owner_id)
+    if removed:
+        _remove_artifacts(parsed)
+        return DeleteOutcome.DELETED
+    return DeleteOutcome.NOT_FOUND
 
 
 async def create_backtest_run(
-    *,
-    name: str,
-    strategy_key: str,
-    start_date: date,
-    end_date: date,
-    initial_capital: float,
-    symbol: str,
-    engine_version: str,
-    params: dict | None = None,
-    purpose: str = "user",
+    *, name: str, strategy_key: str, start_date: date, end_date: date,
+    initial_capital: float, symbol: str, engine_version: str,
+    params: dict | None = None, purpose: str = "user",
     owner_id: uuid.UUID | None = None,
 ) -> BacktestSummary:
-    """Insert a queued run and return the row the client can list immediately.
+    """Prepare a job in memory. No run/report database row is inserted."""
+    from src.workers.job_manager import get_job_manager
+    from src.workers.report_job import RunSpec
 
-    Submitting it to the worker pool is the run-endpoint's job, not this one's:
-    persisting the row and dispatching it are separate failures, and a dispatch
-    that fails must still leave a run the student can see.
-    """
     await ensure_schema()
     async with session_scope() as session:
-        run = await runs_repo.create_run(
-            session,
-            name=name,
-            strategy_key=strategy_key,
-            start_date=start_date,
-            end_date=end_date,
-            initial_capital=initial_capital,
-            symbol=symbol,
-            engine_version=engine_version,
-            params=params,
-            purpose=purpose,
-            owner_id=owner_id,
+        strategy = await strategies_repo.get_strategy(session, strategy_key)
+        if strategy is None:
+            raise RunSubmissionError("The selected strategy no longer exists.")
+        spec = RunSpec(
+            id=uuid.uuid4(), owner_id=owner_id, name=name, strategy_key=strategy_key,
+            strategy_name=strategy.name, kind=strategy.kind,
+            class_path=strategy.class_path, storage_key=strategy.storage_key,
+            start_date=start_date, end_date=end_date, initial_capital=initial_capital,
+            symbol=symbol, engine_version=engine_version, params=dict(params or {}),
+            created_at=datetime.now(timezone.utc), purpose=purpose,
         )
-        row = await runs_repo.get_run(session, run.id)
-        return _to_summary(row)
+    await asyncio.to_thread(get_job_manager().register, spec)
+    return BacktestSummary.model_validate(spec.empty_detail().model_dump())
 
 
 # ---------------------------------------------------------------------------
@@ -358,11 +351,21 @@ async def _load_runnable_strategy(strategy_key: str) -> _RunnableStrategy:
             )
         if not strategy.enabled:
             raise RunSubmissionError(_unavailable_reason(strategy.status, key))
-        return _RunnableStrategy(
+        snapshot = _RunnableStrategy(
             key=strategy.key,
             universe=list(strategy.universe or []),
             param_specs=list(strategy.param_specs or []),
         )
+        storage_key = strategy.storage_key
+    if settings.strategy_store_backend == "s3":
+        from src.services.strategy_availability import package_available
+
+        if not await package_available(storage_key):
+            raise RunSubmissionError(
+                f"Strategy {key!r} has no complete package in the configured "
+                "S3 store. Publish or restore it before running a backtest."
+            )
+    return snapshot
 
 
 def _unavailable_reason(status: str, key: str) -> str:
@@ -428,11 +431,48 @@ def _validated_window(request: BacktestRunRequest) -> tuple[date, date]:
     return start, end
 
 
+async def _validated_coverage(universe: list[str], start: date, end: date) -> None:
+    """Refuse a window the universe has no prices for.
+
+    Market data ends weeks behind the calendar, so a window that looks
+    reasonable can contain no bars at all. Without this the run is accepted,
+    queued, executed, and fails deep in the engine with an error about empty
+    data, which reads as a broken strategy rather than a bad date.
+
+    Reuses the coverage service so there is one definition of a valid window,
+    shared with ``GET /market-data/coverage`` and therefore with the run form's
+    date picker. A universe with no tickers is skipped rather than guessed at.
+    """
+    if not universe:
+        return
+
+    coverage = await market_data_service.coverage_for(universe)
+
+    if coverage.missing:
+        raise RunSubmissionError(
+            f"There is no market data for {', '.join(coverage.missing)}, so this "
+            "strategy cannot be backtested over any window."
+        )
+    if coverage.start is None or coverage.end is None:
+        raise RunSubmissionError(
+            f"There is no shared market-data window for {', '.join(universe)}. "
+            "Choose tickers with overlapping history."
+        )
+
+    if start.isoformat() < coverage.start or end.isoformat() > coverage.end:
+        raise RunSubmissionError(
+            f"There is only data from {coverage.start} to {coverage.end} for "
+            f"{', '.join(universe)}. Pick a window inside that range."
+        )
+
+
 def _validated_capital(raw: float) -> float:
     """Capital has to be positive and finite — it divides every return."""
     capital = float(raw)
     if not math.isfinite(capital):
-        raise RunSubmissionError(f"initialCapital must be a finite number; got {raw!r}.")
+        raise RunSubmissionError(
+            f"initialCapital must be a finite number; got {raw!r}."
+        )
     if capital <= 0:
         raise RunSubmissionError(
             f"initialCapital must be greater than zero; got {capital:g}."
@@ -567,24 +607,34 @@ def _symbol_for(universe: list[str]) -> str:
     return tickers[0] if len(tickers) == 1 else "MULTI"
 
 
-async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
-    """Validate a submission, queue the run, and return the row to show for it.
+async def submit_backtest_run(
+    request: BacktestRunRequest, *, owner_id: uuid.UUID | None = None
+) -> BacktestSummary:
+    """Validate a submission, register a transient job, and dispatch it.
 
-    Persisting and dispatching are two different failures and are handled
-    separately on purpose. The row is inserted and committed first; only then
-    is the job offered to the worker pool. If the pool refuses it — shut down,
-    or broken by a worker that died — the run is marked ``failed`` with the
-    reason rather than left ``queued`` forever, which is the one state a
-    student cannot tell apart from a busy queue.
-
+    No run or report is inserted here. The completion callback saves only a
+    successful report; dispatch failure is returned immediately to the caller.
     Raises :class:`RunSubmissionError` for anything the student can fix.
     """
+    logger.info(
+        "SUBMIT | Backtest request received; strategy=%r window=%s..%s capital=%s mode=%s",
+        request.strategy_key, request.start_date, request.end_date, request.initial_capital, request.mode,
+    )
     name = _validated_name(request.name)
     strategy = await _load_runnable_strategy(request.strategy_key)
     start_date, end_date = _validated_window(request)
     initial_capital = _validated_capital(request.initial_capital)
     mode = _validated_mode(request.mode)
-    params = _validated_params(strategy, request.params)
+    try:
+        strategy_params, controls, universe = split_controls(
+            request.params, strategy.universe, mode
+        )
+    except ValueError as exc:
+        raise RunSubmissionError(str(exc)) from None
+    params = _validated_params(strategy, strategy_params)
+    logger.info("SUBMIT | Settings validated; strategy=%s tickers=%s slippage_bps=%s commission_per_share=%s", strategy.key, universe, controls.get("slippageBps", 0), controls.get("commissionPerShare", 0))
+    # Check the selected universe, not the registry's defaults.
+    await _validated_coverage(universe, start_date, end_date)
 
     summary = await create_backtest_run(
         name=name,
@@ -592,51 +642,19 @@ async def submit_backtest_run(request: BacktestRunRequest) -> BacktestSummary:
         start_date=start_date,
         end_date=end_date,
         initial_capital=initial_capital,
-        symbol=_symbol_for(strategy.universe),
+        symbol=_symbol_for(universe),
         engine_version=ENGINE_VERSION,
         # The overlay the worker hands the engine, plus the reserved mode key
         # it pops back off first — there is no mode column to put it in.
-        params={**params, MODE_KEY: mode},
+        params={**params, **controls, "universe": universe, MODE_KEY: mode},
+        owner_id=owner_id,
     )
+    logger.info("QUEUED | Transient job registered; run=%s strategy=%s; dispatching to worker", summary.id, strategy.key)
     return await _dispatch(summary)
 
 
 async def _dispatch(summary: BacktestSummary) -> BacktestSummary:
-    """Hand a queued run to the worker pool, or fail it with the reason.
-
-    The job manager is imported here rather than at module scope so importing
-    this service does not drag in the engine — and pandas, and numpy — through
-    the worker module. The API process loads them anyway through its lifespan;
-    a script or a test that only wants to read runs does not.
-    """
+    """Hand an in-memory job to the worker pool; failed dispatch saves no report."""
     from src.workers.job_manager import get_job_manager
-
-    try:
-        get_job_manager().submit(summary.id)
-    except Exception as exc:
-        logger.error("Run %s could not be queued: %s", summary.id, exc)
-        await _fail_undispatched(summary.id, f"Could not be queued to run: {exc}")
-        # Reported as failed rather than queued: this response is what the
-        # client inserts into its list cache, and a row claiming to be queued
-        # when nothing will ever run it is worse than an error it can show.
-        return summary.model_copy(update={"status": BacktestStatus.FAILED})
+    await asyncio.to_thread(get_job_manager().submit, summary.id)
     return summary
-
-
-async def _fail_undispatched(run_id: str, message: str) -> None:
-    """Mark a run failed after its dispatch was refused. Best effort.
-
-    If even this write fails the row is still there and still ``queued``, which
-    the startup reconciler and the operator can both see. Raising instead would
-    lose the response describing a run that does exist.
-    """
-    parsed = runs_repo.parse_run_id(run_id)
-    if parsed is None:  # pragma: no cover - the id came from the row just created
-        return
-    try:
-        async with session_scope() as session:
-            await runs_repo.fail_unclaimed_run(session, parsed, message)
-    except Exception:
-        logger.exception(
-            "Run %s could not be marked failed after a refused dispatch", run_id
-        )

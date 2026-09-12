@@ -1368,12 +1368,28 @@ worker:
   the error, so the only symptom is that every run re-queries a remote
   database. It is in `requirements.txt` for this reason. (B2, X1)
 
+## 6.5 Closed after the plan (2026-09-01)
+
+Removed from the deferred tables below, with what closed them.
+
+| Item | Ref | Closed by |
+|---|---|---|
+| Strategy raising inside `OnData` passes validation | H2 | Already fixed in the engine: `runner.py` re-raises under `strict`, which `run_single` sets. The row was stale. |
+| Coverage-aware date validation | G5 | `GET /market-data/coverage`, plus a 422 at `POST /backtests` for a window outside it. Both halves share one definition. |
+| `src/repositories/market_data.py` | H8 | Done. `latest_market_data_date` and `ticker_coverage` moved there. |
+| `conftest.py` fixture-ordering trap | B9 | `require_database` fixture; module-scoped fixtures depend on it instead of hand-rolling the skip. |
+| Sample/template `.py` endpoint for the FE editor | n/a | `GET /strategies/template`, with a test asserting the template passes our own compatibility check. |
+
+Also split `src/services/strategy_validation.py` (870 lines) into a package:
+`scanning`, `packaging`, `runs`, with the public surface unchanged. Added
+indicator-name validation to the compatibility check, discovered from
+`engine/indicators` rather than hardcoded.
+
 ## 7. Deferred — explicitly not this plan, do not build early
 
 | Item | Arrives when |
 |---|---|
 | Real `S3StrategyStore` (bucket, IAM, presigned URLs) | Infrastructure repo provisions the bucket; swap = implement the task-8 protocol |
-| Sample/template `.py` endpoint for the FE editor | After tasks 8–9 prove the upload loop |
 | Real sandboxing for user code (container isolation, no-egress network, scoped DB role instead of admin creds) | Before the app is exposed beyond the club |
 | Portfolios 4–8 as built-ins (RBP/screener/NLP dependency chains) | After the v1 pipeline is stable |
 | `/live/*` backed by real trading tables | Separate product decision — read-only queries exist in this DB but live trading is not this app's scope |
@@ -1388,12 +1404,8 @@ traces back to a deviation in section 4.5.
 
 | Item | Why it is deferred | Ref |
 |---|---|---|
-| Make a strategy that raises inside `OnData` fail its validation run — `runner._run_event_loop` re-raising when `strict` is set | Needs an engine edit; `run_single` already passes `strict=True`, so it is a small change with a broad blast radius on vendored behaviour | H2 |
 | A real `mode` column on `app.backtest_runs`, replacing the reserved `params['mode']` key | Works correctly today; it is a schema-tidiness change that wants the first Alembic migration | F2 |
 | Benchmark series on the equity curve | The engine computes buy-and-hold on a minute grid that does not align with event-loop samples; needs the benchmark recomputed on the sample grid | B6 |
 | Vectorised (`fast`) mode as a supported option | Adapters exist for only four strategies and the module is self-described as incomplete; the API accepts the mode and the engine refuses it per run with a readable message | B10, G4 |
 | Vendoring the OMS, or a documented statement that fills differ from MQSMaster | Requires deciding whether child-order slicing belongs in a simulator at all | B1 |
-| `src/repositories/market_data.py` as the home for `latest_market_data_date` | Currently sits in the strategies repo for ownership reasons; a pure move | H8 |
-| Coverage-aware date validation (or a `GET /market-data/coverage` endpoint the FE can build presets from) | Would turn "last 30 days" from a failed run into a 422 or a disabled control | G5 |
 | `config` dict on `POST /strategies` (per-upload tickers/interval/lookback) | The FE does not send it; additive when it does | H5 |
-| Fixing the `conftest.py` fixture-ordering trap so module-scoped DB fixtures skip correctly without boilerplate | Every test file works around it locally today | B9 |

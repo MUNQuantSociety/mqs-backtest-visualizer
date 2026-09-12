@@ -53,6 +53,11 @@ def _load_env_file() -> None:
     load_dotenv(_ENV_FILE, override=False)
 
 
+def _database_env(suffix: str, default: str = "") -> str:
+    """Deployment aliases match the application; a nonempty POSTGRES value wins."""
+    return os.environ.get(f"POSTGRES_{suffix}") or os.environ.get(f"MARKET_DATA_{suffix}") or default
+
+
 class EngineDBAdapter:
     """Minimal psycopg2 adapter with ``MQSDBConnector``'s return contract.
 
@@ -63,20 +68,22 @@ class EngineDBAdapter:
     def __init__(self, **overrides: Any) -> None:
         _load_env_file()
         self._conn_kwargs: dict[str, Any] = {
-            "host": os.environ.get("POSTGRES_HOST", ""),
-            "port": int(os.environ.get("POSTGRES_PORT", "25060")),
-            "dbname": os.environ.get("POSTGRES_DB", "mqsdb"),
-            "user": os.environ.get("POSTGRES_USER", ""),
-            "password": os.environ.get("POSTGRES_PASSWORD", ""),
-            # This server rejects sslmode=require; prefer negotiates TLS and
-            # connects. Verified against the live instance — see BACKEND_PLAN
-            # section 2 before "hardening" it.
-            "sslmode": os.environ.get("POSTGRES_SSLMODE", "prefer"),
-            "connect_timeout": int(
-                os.environ.get("DB_CONNECT_TIMEOUT_SECONDS", "10")
-            ),
+            "host": _database_env("HOST"),
+            "port": _database_env("PORT", "25060"),
+            "dbname": _database_env("DB", "mqsdb"),
+            "user": _database_env("USER"),
+            "password": _database_env("PASSWORD"),
+            # Preserve explicit TLS policy. Connection failures never retry
+            # with weaker SSL settings. The legacy default remains unchanged.
+            "sslmode": _database_env("SSLMODE", "prefer"),
+            "connect_timeout": os.environ.get("DB_CONNECT_TIMEOUT_SECONDS") or "10",
         }
         self._conn_kwargs.update(overrides)
+        for key in ("port", "connect_timeout"):
+            try:
+                self._conn_kwargs[key] = int(self._conn_kwargs[key])
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid database {key}: expected an integer.") from None
         self._connection: Any = None
 
     def _connect(self) -> Any:
@@ -118,8 +125,13 @@ class EngineDBAdapter:
             # Drop the connection so the next call reconnects instead of
             # reusing a socket that may be in an unknown state.
             self.close()
-            logger.error("Engine query failed: %s", exc)
-            return {"status": "error", "message": str(exc), "data": []}
+            # Driver text can contain DSNs, SQL parameters or credentials.
+            # Return only the error class and SQLSTATE, never raw exception text.
+            code = getattr(exc, "pgcode", None)
+            sqlstate = f" (SQLSTATE {code})" if isinstance(code, str) and len(code) == 5 and code.isalnum() else ""
+            message = f"Database query failed: {type(exc).__name__}{sqlstate}. Check database connectivity, credentials and query configuration."
+            logger.error("%s", message)
+            return {"status": "error", "message": message, "data": []}
 
     def close(self) -> None:
         """Close the connection if one is open. Safe to call repeatedly."""

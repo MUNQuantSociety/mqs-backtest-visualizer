@@ -20,13 +20,19 @@ import importlib
 import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from engine.analytics.reporting import compute_metrics_dict
+from engine.analytics.reporting import (
+    _generate_buy_and_hold_benchmark,
+    benchmark_weights,
+    compute_metrics_dict,
+    market_timestamps,
+)
 from engine.analytics.vector_strategy_adapters import ADAPTERS_BY_CLASSNAME
 from engine.contracts import (
     EngineError,
@@ -38,6 +44,7 @@ from engine.contracts import (
 )
 from engine.core.backtest_engine import BacktestEngine
 from engine.data.db_adapter import EngineDBAdapter
+from engine.data.fmp import FMPDataAdapter, market_data_source
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 logger = logging.getLogger(__name__)
@@ -90,37 +97,71 @@ def _resolve_artifact_dir(request: RunRequest) -> str:
     return str(path)
 
 
-def _equity_curve(perf_df: pd.DataFrame) -> list[EquityPoint]:
-    """Turn the runner's performance frame into ``(date, equity, benchmark)``.
+class _ReportBacktestEngine(BacktestEngine):
+    """Capture report inputs through existing hooks without changing execution."""
 
-    Timestamps are converted to New York calendar dates because that is the
-    exchange day every bar in this engine belongs to, and the frontend charts
-    trading days. Multiple samples can share a date — event mode records once
-    per poll interval — and downsampling to one row per day is the caller's
-    decision, not the engine's.
+    def _build_fast_portfolio_stub(self, portfolio_class, config_data):
+        stub = super()._build_fast_portfolio_stub(portfolio_class, config_data)
+        self.fast_benchmark_weights = benchmark_weights(
+            config_data.get("WEIGHTS"), stub.tickers
+        )
+        return stub
 
-    ``benchmark`` is ``None``: the buy-and-hold comparison is written to
-    ``benchmark_buy_and_hold.csv`` in the artifact directory but is computed on
-    a minute grid that does not line up with these samples, so pretending
-    otherwise here would produce a chart that lies.
+    def _fetch_fast_daily_close_data(self, portfolio_instance, start_date, end_date, tickers=None):
+        prices = super()._fetch_fast_daily_close_data(
+            portfolio_instance, start_date, end_date, tickers
+        )
+        self.fast_benchmark_prices = prices
+        return prices
+
+
+def _ny_dates(timestamps: pd.Series) -> pd.Series:
+    """Exchange dates; naive daily labels are New York dates, never UTC."""
+    return market_timestamps(timestamps).dt.date
+
+
+def _equity_curve(
+    perf_df: pd.DataFrame,
+    benchmark_df: pd.DataFrame | None = None,
+    initial_capital: float | None = None,
+) -> list[EquityPoint]:
+    """Align benchmark marks as of each sample, then label with New York dates.
+
+    The optional first point is an explicit pre-trading capital baseline on
+    the first observed date. It is not a market bar or an engine return sample;
+    report_metadata identifies it so daily persistence can keep it separately.
     """
     if perf_df is None or perf_df.empty:
         return []
-    if "timestamp" not in perf_df or "portfolio_value" not in perf_df:
-        return []
-
-    frame = perf_df[["timestamp", "portfolio_value"]].copy()
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-    frame["portfolio_value"] = pd.to_numeric(
-        frame["portfolio_value"], errors="coerce"
-    )
-    frame = frame.dropna().sort_values("timestamp")
-
-    local_dates = frame["timestamp"].dt.tz_convert("America/New_York").dt.date
-    return [
-        EquityPoint(date=day, equity=float(value), benchmark=None)
-        for day, value in zip(local_dates, frame["portfolio_value"])
+    frame = pd.DataFrame({
+        "timestamp": market_timestamps(perf_df["timestamp"]),
+        "equity": pd.to_numeric(perf_df["portfolio_value"], errors="coerce"),
+    })
+    if frame.isna().any().any() or not frame["equity"].map(math.isfinite).all():
+        raise EngineError("The engine produced invalid performance timestamps or equity.")
+    frame = frame.sort_values("timestamp", kind="stable")
+    frame["benchmark"] = float("nan")
+    if benchmark_df is not None and not benchmark_df.empty:
+        marks = benchmark_df[["timestamp", "buy_and_hold_value"]].copy()
+        marks["timestamp"] = market_timestamps(marks["timestamp"])
+        marks = marks.sort_values("timestamp", kind="stable").drop_duplicates("timestamp", keep="last")
+        frame = pd.merge_asof(
+            frame.drop(columns="benchmark"), marks.rename(columns={"buy_and_hold_value": "benchmark"}),
+            on="timestamp", direction="backward",
+        )
+    points = [
+        EquityPoint(
+            date=row.timestamp.date(), equity=float(row.equity),
+            benchmark=float(row.benchmark) if pd.notna(row.benchmark) else None,
+        )
+        for row in frame.itertuples(index=False)
     ]
+    if initial_capital is not None and points:
+        points.insert(0, EquityPoint(
+            date=points[0].date, equity=float(initial_capital),
+            benchmark=float(initial_capital) if points[0].benchmark is not None else None,
+        ))
+    return points
 
 
 def strategy_tickers(strategy_class: type[BasePortfolio], params: dict) -> list[str]:
@@ -166,11 +207,51 @@ def _reject_unsupported_fast_mode(strategy_class: type[BasePortfolio]) -> None:
 
 
 def _fast_mode_perf(engine: BacktestEngine) -> pd.DataFrame | None:
-    """Normalize the fast path's frame to the event path's column names."""
+    """Attach each daily fast result to the last observed quote on that NY date."""
     perf_df = engine.last_fast_perf_df
     if perf_df is None or perf_df.empty:
         return None
-    return perf_df[["timestamp", "portfolio_value"]].copy()
+    prices = getattr(engine, "fast_benchmark_prices", None)
+    if prices is None or prices.empty:
+        raise EngineError("Fast mode did not expose observed prices for its report.")
+    moments = market_timestamps(prices["timestamp"])
+    last_quotes = moments.groupby(moments.dt.date).max()
+    frame = perf_df[["timestamp", "portfolio_value"]].copy()
+    frame["timestamp"] = _ny_dates(frame["timestamp"]).map(last_quotes)
+    if frame["timestamp"].isna().any():
+        raise EngineError("Fast mode produced a daily result without an observed market bar.")
+    return frame
+
+
+def _execution_summary(mode: str, fills: list, diagnostics: dict | None) -> dict:
+    """Explain recorded fills without treating vector positions as no trades."""
+    if mode == "fast":
+        message = (
+            "Fast mode models positions without individual order fills; an empty "
+            "trade table does not mean the strategy made no trades."
+        )
+    elif fills:
+        message = None
+    else:
+        message = "No trades were filled during the selected period."
+        if diagnostics:
+            requests = diagnostics.get("buyRequestCount", 0) + diagnostics.get("sellRequestCount", 0)
+            if not diagnostics.get("evaluationCount", 0) and diagnostics.get("warmupSkipCount", 0):
+                message = (
+                    "No trades were placed: the strategy never had enough ready "
+                    "market and indicator history to evaluate a signal."
+                )
+            elif requests:
+                message = "The strategy requested trades, but none produced a fill during the selected period."
+            elif diagnostics.get("evaluationCount", 0):
+                message = (
+                    "No trades were placed: no buy or sell requests were generated "
+                    "during the selected period."
+                )
+                if not diagnostics.get("bullishSignalCount", 0):
+                    message += " No ticker exceeded the strategy's bullish entry threshold."
+        message += " Trade metrics that require executed or closed trades are unavailable."
+    return {"fillCount": len(fills), "message": message}
 
 
 def run_single(request: RunRequest) -> RunResult:
@@ -182,9 +263,22 @@ def run_single(request: RunRequest) -> RunResult:
     """
     artifact_dir = _resolve_artifact_dir(request)
     mode = (request.mode or "event").lower().strip()
-    adapter = EngineDBAdapter()
+    adapter = None
 
     try:
+        if mode not in {"event", "fast"}:
+            raise EngineError(f"Unsupported backtest mode {mode!r}; use event or fast.")
+        slippage = float(request.slippage)
+        commission_per_share = float(request.commission_per_share)
+        if not math.isfinite(slippage) or not 0 <= slippage < 1:
+            raise EngineError("slippage must be a finite fraction between 0 (inclusive) and 1 (exclusive).")
+        if not math.isfinite(commission_per_share) or commission_per_share < 0:
+            raise EngineError("commission_per_share must be finite and nonnegative.")
+        if mode == "fast" and commission_per_share:
+            raise EngineError(
+                "Fast mode does not support per-share commission; use event mode "
+                "or explicitly set commission_per_share to zero."
+            )
         strategy_class = load_strategy_class(request.class_path)
         if mode == "fast":
             # Checked here, before the engine loads a single bar: a student who
@@ -192,7 +286,8 @@ def run_single(request: RunRequest) -> RunResult:
             # the run has occupied a worker slot for the length of a data load.
             _reject_unsupported_fast_mode(strategy_class)
 
-        engine = BacktestEngine(
+        adapter = FMPDataAdapter() if market_data_source() == "fmp" else EngineDBAdapter()
+        engine = _ReportBacktestEngine(
             db_connector=adapter,
             backtest_output_root=artifact_dir,
             strict=True,
@@ -205,31 +300,55 @@ def run_single(request: RunRequest) -> RunResult:
             start_date=str(request.start_date),
             end_date=str(request.end_date),
             initial_capital=float(request.initial_capital),
-            slippage=float(request.slippage),
+            slippage=slippage,
+            # RunRequest exposes explicit price slippage and cash commission.
+            # A legacy CostModel would replace that slippage inside the executor.
+            cost_model=None,
+            commission_per_share=commission_per_share,
             backtest_mode=mode,
         )
 
         request.on_progress(0, "starting")
         engine.run()
 
+        benchmark_df = None
+        strategy_diagnostics = None
+        final_prices: dict[str, float] = {}
         if mode == "fast":
             perf_df = _fast_mode_perf(engine)
             # Fast mode is vectorized: there is no order book, so there are no
-            # fills to report — the trade table stays empty by construction.
+            # fills to report — the trade table stays empty by construction,
+            # and with nothing to mark there are no final prices either.
             fills: list[dict[str, Any]] = []
             if perf_df is None:
-                # The commonest cause by far, and the engine only logs it.
+                prices = getattr(engine, "fast_benchmark_prices", None)
+                if prices is None or prices.empty:
+                    raise NoMarketData(
+                        tickers=strategy_tickers(strategy_class, request.params),
+                        start=request.start_date, end=request.end_date,
+                        reason="fast mode returned no observed daily prices",
+                    )
                 raise EngineError(
-                    f"Fast mode produced no results for {request.strategy_key}. "
-                    "It needs a vectorized adapter registered for "
-                    f"{strategy_class.__name__} in "
-                    "engine/analytics/vector_strategy_adapters.py; run this "
-                    "strategy in event mode instead."
+                    f"Fast mode produced no performance records for {request.strategy_key}. "
+                    "Check the requested date window and vectorized strategy output."
                 )
+            prices = engine.fast_benchmark_prices
+            weights = engine.fast_benchmark_weights
+            benchmark_start = request.start_date
         else:
             runner = engine.last_runner
             perf_df = runner.perf_df if runner is not None else None
             fills = list(runner.executor.trade_log) if runner and runner.executor else []
+            if runner is not None:
+                strategy_diagnostics = getattr(runner.portfolio, "strategy_diagnostics", None)
+                final_prices = dict(runner.final_prices)
+                benchmark_df = runner.benchmark_df
+                prices = runner.main_data_df
+                weights = benchmark_weights(
+                    getattr(runner.portfolio, "portfolio_weights", None),
+                    getattr(runner.portfolio, "tickers", None),
+                )
+                benchmark_start = runner.backtest_loop_start_date
 
         if perf_df is None or perf_df.empty:
             # The engine got past its own data guard but produced no samples,
@@ -243,7 +362,25 @@ def run_single(request: RunRequest) -> RunResult:
                 reason="the backtest produced no performance records",
             )
 
-        equity_curve = _equity_curve(perf_df)
+        if benchmark_df is None or benchmark_df.empty:
+            benchmark_df = _generate_buy_and_hold_benchmark(
+                prices, float(request.initial_capital), weights,
+                start=benchmark_start, end=market_timestamps(perf_df["timestamp"]).max(),
+            )
+        benchmark_metadata = dict(benchmark_df.attrs.get("report_metadata", {}))
+        if not benchmark_metadata:
+            benchmark_metadata = {
+                "kind": "configured_universe_buy_and_hold",
+                "weights": weights, "universe": list(weights),
+                "coverage": "unavailable",
+                "missing_tickers": [ticker for ticker, weight in weights.items() if weight],
+            }
+        benchmark_metadata["price_sampling"] = "daily_close" if mode == "fast" else "engine_observed_bars"
+        if mode == "fast" and not benchmark_df.empty:
+            # This canonical artifact replaces the draft's reliance on the
+            # vector engine's legacy, rebalanced equal-weight comparison.
+            benchmark_df.to_csv(Path(artifact_dir) / "benchmark_buy_and_hold.csv", index=False)
+        equity_curve = _equity_curve(perf_df, benchmark_df, float(request.initial_capital))
         metrics = compute_metrics_dict(perf_df, float(request.initial_capital))
         final_equity = float(equity_curve[-1].equity) if equity_curve else None
 
@@ -256,6 +393,36 @@ def run_single(request: RunRequest) -> RunResult:
             fills=fills,
             final_equity=final_equity,
             artifact_dir=artifact_dir,
+            final_prices=final_prices,
+            report_metadata={
+                "marketData": {"source": market_data_source(), "resolution": "daily"},
+                "execution": _execution_summary(mode, fills, strategy_diagnostics),
+                **({"strategyDiagnostics": strategy_diagnostics} if strategy_diagnostics is not None else {}),
+                "executionCosts": {
+                    "slippageFraction": slippage,
+                    "commissionPerShare": commission_per_share,
+                    "commissionBasis": "cash_per_filled_share_each_side",
+                    "slippageBasis": "fill_price" if mode == "event" else "daily_weight_turnover",
+                    "legacyCostModel": False,
+                },
+                "benchmark": benchmark_metadata,
+                "equity": {
+                    "mode": mode,
+                    "timezone": "America/New_York",
+                    "baseline": {
+                        "curve_index": 0,
+                        "date": equity_curve[0].date.isoformat(),
+                        "value": float(request.initial_capital),
+                        "kind": "initial_capital_before_trading",
+                    },
+                    "first_observation": market_timestamps(perf_df["timestamp"]).min().isoformat(),
+                    "last_observation": market_timestamps(perf_df["timestamp"]).max().isoformat(),
+                    "fast_strategy_semantics": (
+                        "vectorized_approximation_with_warmup_positions_and_first_day_return"
+                        if mode == "fast" else None
+                    ),
+                },
+            },
         )
 
     except RunCancelled as exc:
@@ -276,4 +443,5 @@ def run_single(request: RunRequest) -> RunResult:
             artifact_dir=artifact_dir,
         )
     finally:
-        adapter.close()
+        if adapter is not None:
+            adapter.close()

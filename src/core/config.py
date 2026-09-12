@@ -34,6 +34,23 @@ def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _env_first(*names: str, default: str = "") -> str:
+    """First non-empty value among several variable names.
+
+    The deploy stack (MQS_AWS_INFRA) injects the database credentials under the
+    names the .env template used before it was rewritten — MARKET_DATA_HOST and
+    friends — while this codebase reads POSTGRES_*. Until the two repositories
+    agree, accepting both means a deploy wired against either naming reaches
+    the database instead of booting with no credentials and failing on the
+    first backtest. POSTGRES_* wins when both are set.
+    """
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if raw:
+            return raw
+    return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -81,6 +98,9 @@ class Settings:
     # route it calls resolves under this. Changing it breaks the client.
     api_prefix: str = os.getenv("API_PREFIX", "/api")
 
+    # Explicit opt-in while sign-in is unfinished. Blank requires X-User-Id.
+    temporary_user_id: str = os.getenv("TEMPORARY_USER_ID", "").strip()
+
     repo_root: Path = REPO_ROOT
 
     # ------------------------------------------------------------------
@@ -88,16 +108,22 @@ class Settings:
     # ------------------------------------------------------------------
     # Read-only on ``public.market_data``; owner of the ``app`` schema. The
     # credentials are admin-level, so the boundary is a rule, not a grant.
-    postgres_host: str = os.getenv("POSTGRES_HOST", "")
-    postgres_port: int = _env_int("POSTGRES_PORT", 25060)
-    postgres_db: str = os.getenv("POSTGRES_DB", "mqsdb")
-    postgres_user: str = os.getenv("POSTGRES_USER", "")
-    postgres_password: str = os.getenv("POSTGRES_PASSWORD", "")
+    postgres_host: str = _env_first("POSTGRES_HOST", "MARKET_DATA_HOST")
+    postgres_port: int = int(_env_first("POSTGRES_PORT", "MARKET_DATA_PORT", default="25060"))
+    postgres_db: str = _env_first("POSTGRES_DB", "MARKET_DATA_DB", default="mqsdb")
+    postgres_user: str = _env_first("POSTGRES_USER", "MARKET_DATA_USER")
+    postgres_password: str = _env_first("POSTGRES_PASSWORD", "MARKET_DATA_PASSWORD")
 
-    # ``require`` is rejected by this server's TLS negotiation; ``prefer``
-    # connects and still encrypts. Verified against the live instance — do not
-    # "harden" this without retesting.
-    postgres_sslmode: str = os.getenv("POSTGRES_SSLMODE", "prefer")
+    # The live server has SSL switched off (``SHOW ssl`` → off, checked
+    # 2026-09-01), so ``require`` fails outright and ``prefer`` connects in
+    # PLAINTEXT — the password crosses the network unencrypted. That is
+    # tolerable on the university network and not across the public internet;
+    # the deploy stack rightly insists on ``require``, which cannot succeed
+    # until SSL is enabled on the CAIR instance. Nothing here should paper
+    # over that: a required-SSL deploy must fail loudly, not downgrade.
+    postgres_sslmode: str = _env_first(
+        "POSTGRES_SSLMODE", "MARKET_DATA_SSLMODE", default="prefer"
+    )
 
     # The API holds a handful of connections; the heavy lifting happens in
     # worker processes with their own short-lived sync connections.
@@ -127,6 +153,19 @@ class Settings:
         "PROGRESS_WRITE_INTERVAL_SECONDS", 1.0
     )
 
+    # Worker liveness, separate from progress. Progress callbacks stop for
+    # minutes while the engine loads bars from the remote database, so they
+    # cannot say whether the worker is alive; a dedicated thread beats on this
+    # cadence instead. A ``running`` row whose last beat is older than the
+    # stale threshold is judged dead by the reconciler at boot. Keep stale >>
+    # interval, with room for a slow database round trip.
+    run_heartbeat_interval_seconds: float = _env_float(
+        "RUN_HEARTBEAT_INTERVAL_SECONDS", 5.0
+    )
+    run_heartbeat_stale_seconds: float = _env_float(
+        "RUN_HEARTBEAT_STALE_SECONDS", 90.0
+    )
+
     # ------------------------------------------------------------------
     # User-strategy validation
     # ------------------------------------------------------------------
@@ -149,9 +188,29 @@ class Settings:
 
     strategy_store_backend: str = os.getenv("STRATEGY_STORE_BACKEND", "local").lower()
     strategy_store_root: Path = _env_path("STRATEGY_STORE_ROOT", ".strategy_store")
-    # Unused until the infrastructure repo provisions a bucket; the S3 backend
-    # is a stub that raises without it.
-    strategy_store_s3_bucket: str = os.getenv("STRATEGY_STORE_S3_BUCKET", "")
+    # Required when the backend is ``s3``; ``build_strategy_store`` refuses to
+    # construct an S3 store without it. The bucket is provisioned by the
+    # infrastructure repo, never created by this code.
+    strategy_store_s3_bucket: str = os.getenv("STRATEGY_STORE_S3_BUCKET", "").strip()
+    # Optional namespace inside the strategy bucket. Local verification uses
+    # development; the production task role is restricted to production.
+    strategy_store_s3_prefix: str = os.getenv("STRATEGY_STORE_S3_PREFIX", "").strip()
+    # A LocalStack/MinIO endpoint for an end-to-end check without AWS. Setting
+    # it also switches the client to path-style addressing, which those
+    # emulators need. ``AWS_ENDPOINT_URL`` is the SDK's own spelling and is
+    # honoured as a fallback so a developer's existing shell setup works.
+    strategy_store_s3_endpoint_url: str = _env_first(
+        "STRATEGY_STORE_S3_ENDPOINT_URL", "AWS_ENDPOINT_URL"
+    )
+    # Read here rather than letting boto3 read the environment, because this
+    # module is the only environment reader. ECS Fargate injects AWS_REGION;
+    # the infra's default is us-east-2. Blank means "let the SDK decide", so a
+    # developer's ``~/.aws/config`` region still applies locally.
+    #
+    # Deliberately no AWS credential settings: the SDK's default chain (task
+    # role on Fargate, CLI profile on a laptop) supplies them, and settings
+    # must never hold access keys.
+    aws_region: str = _env_first("AWS_REGION", "AWS_DEFAULT_REGION")
 
     # ------------------------------------------------------------------
     # Derived connection URLs

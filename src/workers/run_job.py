@@ -22,9 +22,10 @@ Three consequences follow from that, and they explain most of the shape below:
   table means by "workers: sync DB only".
 
 Uploaded strategies travel this same path. The only branch is where the class
-comes from — a built-in is imported from ``engine.strategies``, an upload is
-copied out of the strategy store into a temporary directory and imported from
-there — and the only extra step is at the end, where a run marked
+comes from — published built-ins and uploads are copied out of the strategy
+store into a temporary directory and imported from there. Only legacy built-ins
+in local-storage mode import from ``engine.strategies``. The only extra step
+for an upload is at the end, where a run marked
 ``purpose='validation'`` writes its verdict onto the strategy it validated. A
 validation run is otherwise an ordinary run in every respect. Note that
 importing an upload *executes* it, in this process, with the credentials this
@@ -39,9 +40,11 @@ throttled read of ``cancel_requested``, and a cancelled run lands as
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -59,6 +62,7 @@ from src.db.engine import create_sync_engine
 from src.db.init import init_database
 from src.models import BacktestRun, RunEquityPoint, RunMetrics, RunTrade, Strategy
 from src.services.trade_pairing import TradeRow, pair_fills
+from src.services.reporting import calculation_metadata, daily_metrics, open_positions
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +115,9 @@ class _RunContext:
     initial_capital: float
     mode: str
     params: dict[str, Any]
-    # Where an uploaded strategy was materialised, so it can be deleted when
-    # the run is over. ``None`` for a built-in, which is already on disk.
+    # Temporary copy of a stored package; None for legacy local built-ins.
     workdir: Path | None = None
+    storage_key: str | None = None
 
 
 def run_job(run_id: str) -> str:
@@ -128,6 +132,9 @@ def run_job(run_id: str) -> str:
     a redelivered job finds the row already ``running`` and returns quietly
     instead of running the backtest a second time.
     """
+    from src.core.logging_config import configure_logging
+
+    configure_logging(settings.log_level)
     parsed = _parse_run_id(run_id)
     if parsed is None:
         logger.error("run_job called with %r, which is not a run id", run_id)
@@ -151,12 +158,15 @@ def run_job(run_id: str) -> str:
 def _execute(engine: Engine, parsed: uuid.UUID) -> str:
     """Claim the run, execute it, and leave it terminal. See :func:`run_job`."""
     context: _RunContext | None = None
+    heartbeat: _RunHeartbeat | None = None
     try:
         _ensure_schema(engine)
 
         if not _claim(engine, parsed):
             logger.info("Run %s was already claimed; nothing to do.", parsed)
             return "skipped"
+
+        logger.info("WORKER | Run claimed; run=%s; loading strategy and settings", parsed)
 
         try:
             context = _load_context(engine, parsed)
@@ -166,23 +176,32 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
             return _fail(engine, parsed, _describe(exc))
 
         heartbeat = _RunHeartbeat(engine, parsed)
+        heartbeat.start()
         if heartbeat.should_cancel():
             # Cancelled while it sat in the queue. Answering now saves the
             # minutes of data loading that precede the first cancellation poll.
             return _fail(engine, parsed, CANCELLED_MESSAGE)
 
+        source = _strategy_source(context)
+        started = time.perf_counter()
+        logger.info("ENGINE | Starting; run=%s strategy=%s source=%s capital=%s window=%s..%s mode=%s tickers_override=%s", parsed, context.strategy_key, source["backend"], context.initial_capital, context.start_date, context.end_date, context.mode, context.params.get("TICKERS", "stored config"))
         result = run_single(_build_request(context, heartbeat))
+        result.report_metadata["strategySource"] = source
+        logger.info("ENGINE | Finished; run=%s status=%s elapsed_s=%.2f", parsed, result.status, time.perf_counter() - started)
 
         if result.status == "completed":
             try:
+                logger.info("PERSIST | Writing report; run=%s equity_samples=%d fills=%d", parsed, len(result.equity_curve), len(result.fills))
                 _persist_success(engine, context, result)
             except Exception as exc:
                 # The backtest was fine; storing it was not. Saying "completed"
                 # with no metrics, curve, or trades would be a lie the client
                 # cannot detect, so this is a failure with an honest message.
                 logger.exception("Run %s produced results that would not store", parsed)
-                return _fail(engine, parsed, f"result could not be stored: {_describe(exc)}")
-            logger.info("Run %s completed", parsed)
+                return _fail(
+                    engine, parsed, f"result could not be stored: {_describe(exc)}"
+                )
+            logger.info("COMPLETED | run=%s final_equity=%s; results and exports ready", parsed, result.final_equity)
             return "completed"
 
         if result.status == "cancelled":
@@ -195,6 +214,8 @@ def _execute(engine: Engine, parsed: uuid.UUID) -> str:
         _fail(engine, parsed, _describe(exc))
         return "failed"
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         if context is not None:
             _remove_workdir(context.workdir)
 
@@ -229,6 +250,7 @@ def _claim(engine: Engine, run_id: uuid.UUID) -> bool:
             .values(
                 status="running",
                 started_at=func.now(),
+                heartbeat_at=func.now(),
                 progress_pct=0,
                 # A resubmitted run should not display the previous attempt's
                 # error while it is running.
@@ -261,16 +283,68 @@ class _RunHeartbeat:
         self._interval = max(float(settings.progress_write_interval_seconds), 0.0)
         self._pending_pct = 0
         self._written_pct = -1
+        self._last_logged_progress: tuple[int, str] | None = None
         self._cancelled = False
         # Negative infinity rather than "now": the first poll must not be
         # throttled, because a run cancelled while queued should stop before it
         # loads a single bar.
         self._last_poll = float("-inf")
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # -- liveness ---------------------------------------------------------
+    #
+    # Progress is not liveness. The engine makes no callback at all while it
+    # loads bars — minutes, on a cold cache against the remote database — so a
+    # reconciler that judged "alive" by progress writes would kill healthy
+    # runs during exactly the phase that takes longest. This thread beats on
+    # its own clock, and stops the moment the run leaves the engine.
+
+    def start(self) -> None:
+        """Begin beating on a daemon thread. Idempotent."""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._beat_forever,
+            name=f"heartbeat-{self._run_id}",
+            daemon=True,  # never keeps a worker process alive on its own
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop beating and wait briefly for the thread to notice."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def _beat_forever(self) -> None:
+        interval = max(float(settings.run_heartbeat_interval_seconds), 0.5)
+        while not self._stop.wait(interval):
+            try:
+                with self._engine.begin() as connection:
+                    connection.execute(
+                        update(_RUNS)
+                        .where(_RUNS.c.id == self._run_id)
+                        .values(heartbeat_at=func.now())
+                    )
+            except Exception as exc:
+                # Same policy as progress: a missed beat is a cosmetic problem
+                # with a large grace window; a backtest killed by a transient
+                # database error is not.
+                logger.warning(
+                    "Run %s: heartbeat failed (%s); the run continues",
+                    self._run_id,
+                    _describe(exc),
+                )
 
     def on_progress(self, pct: int, stage: str) -> None:
         """Engine callback: record progress, write it at most once a second."""
         self._pending_pct = max(0, min(100, int(pct)))
-        logger.debug("Run %s: %d%% (%s)", self._run_id, self._pending_pct, stage)
+        progress = (self._pending_pct, stage)
+        if progress != self._last_logged_progress:
+            logger.info("PROGRESS | run=%s progress=%d%% stage=%s", self._run_id, self._pending_pct, stage)
+            self._last_logged_progress = progress
         self._poll()
 
     def should_cancel(self) -> bool:
@@ -370,6 +444,7 @@ def _load_context(engine: Engine, run_id: uuid.UUID) -> _RunContext:
         mode=mode or DEFAULT_MODE,
         params=params,
         workdir=workdir,
+        storage_key=row.storage_key,
     )
 
 
@@ -382,19 +457,38 @@ def _resolve_class_path(
 ) -> tuple[str, Path | None]:
     """Where to import this strategy's class from, and what to clean up after.
 
-    Built-ins carry a dotted path to a vendored class and need nothing else.
-    An upload is a pair of objects in the strategy store, so it is copied into
+    Published built-ins and uploads are pairs of objects in the store, copied into
     a temporary directory and imported from there; the loader registers the
     module under a per-run name, which is why what comes back is still an
     ordinary ``"module:ClassName"`` path that ``run_single`` resolves without
-    knowing an upload was involved. This is the *only* place the pipeline
-    branches on ``kind``.
+    knowing storage was involved. Stored source always wins over a local import.
+    Local built-ins remain available only in local-storage mode.
     """
-    if kind == "user":
+    if storage_key or kind == "user":
         return _materialize_user_strategy(run_id, strategy_key, storage_key)
+    if settings.strategy_store_backend == "s3":
+        raise RuntimeError(
+            f"strategy {strategy_key!r} has not been published to the configured S3 store"
+        )
     if class_path:
         return class_path, None
     raise RuntimeError(f"strategy {strategy_key!r} has no class_path to run")
+
+
+def _strategy_source(context: _RunContext) -> dict[str, Any]:
+    """Record the exact downloaded bytes before the strategy starts trading."""
+    if context.workdir is None:
+        return {"backend": "builtin", "classPath": context.class_path}
+    return {
+        "backend": settings.strategy_store_backend,
+        "storageKey": context.storage_key,
+        "sourceSha256": hashlib.sha256(
+            (context.workdir / "strategy.py").read_bytes()
+        ).hexdigest(),
+        "configSha256": hashlib.sha256(
+            (context.workdir / "config.json").read_bytes()
+        ).hexdigest(),
+    }
 
 
 def _materialize_user_strategy(
@@ -423,6 +517,8 @@ def _materialize_user_strategy(
     from src.integrations.strategy_store import get_strategy_store
 
     workdir = Path(tempfile.mkdtemp(prefix=f"mqs-user-{run_id.hex[:8]}-"))
+    started = time.perf_counter()
+    logger.info("STORAGE FETCH | run=%s strategy=%s backend=%s key=%s; downloading source/config", run_id, strategy_key, settings.strategy_store_backend, storage_key)
     try:
         loaded = load_user_strategy(
             storage_key=storage_key,
@@ -431,8 +527,10 @@ def _materialize_user_strategy(
             token=run_id.hex,
         )
     except BaseException:
+        logger.error("STORAGE FETCH | Failed; run=%s strategy=%s", run_id, strategy_key)
         _remove_workdir(workdir)
         raise
+    logger.info("STORAGE FETCH | Loaded; run=%s strategy=%s class=%s elapsed_ms=%.0f", run_id, strategy_key, loaded.strategy_class.__name__, (time.perf_counter() - started) * 1000)
     return loaded.class_path, workdir
 
 
@@ -453,6 +551,13 @@ def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest
     artifact_dir = Path(settings.artifact_dir) / str(context.run_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    params = dict(context.params)
+    slippage = float(params.pop("slippageBps", 0.0)) / 10_000.0
+    commission = float(params.pop("commissionPerShare", 0.0))
+    # The selected universe is retained for reporting; validated TICKERS and
+    # WEIGHTS overlays are present only when it differs from the strategy.
+    params.pop("universe", None)
+
     return RunRequest(
         run_id=str(context.run_id),
         strategy_key=context.strategy_key,
@@ -461,7 +566,9 @@ def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest
         end_date=context.end_date,
         initial_capital=context.initial_capital,
         mode=context.mode,
-        params=dict(context.params),
+        params=params,
+        slippage=slippage,
+        commission_per_share=commission,
         artifact_dir=str(artifact_dir),
         on_progress=heartbeat.on_progress,
         should_cancel=heartbeat.should_cancel,
@@ -480,14 +587,20 @@ def _persist_success(engine: Engine, context: _RunContext, result: RunResult) ->
     equity curve is half-written renders as a chart with a cliff in it, and
     nothing downstream would ever notice.
     """
-    trades = pair_fills(result.fills)
+    trades = pair_fills(result.fills, market_timezone=settings.market_timezone)
     trade_rows = [_trade_row(context.run_id, trade) for trade in trades]
     equity_rows = _equity_rows(context.run_id, result.equity_curve)
     metrics_row = _metrics_row(context, result, trades, len(equity_rows))
 
-    final_equity = result.final_equity
-    if final_equity is None and result.equity_curve:
-        final_equity = result.equity_curve[-1].equity
+    if not equity_rows:
+        raise ValueError("A completed backtest did not produce an equity curve.")
+    final_equity = equity_rows[-1]["equity"]
+    if result.final_equity is not None:
+        reported_final = _money_required(result.final_equity, "final_equity")
+        if abs(reported_final - final_equity) > Decimal("0.0001"):
+            raise ValueError(
+                "Engine final equity does not match its final daily observation."
+            )
 
     with engine.begin() as connection:
         # Results are keyed by run id with no version, so a re-run of the same
@@ -510,9 +623,9 @@ def _persist_success(engine: Engine, context: _RunContext, result: RunResult) ->
                 # Denormalised onto the run row because the list endpoint sorts
                 # and renders these four and must not join to do it.
                 final_equity=_money(final_equity),
-                total_return=_ratio(result.metrics.get("total_return")),
-                sharpe=_ratio(result.metrics.get("sharpe")),
-                max_drawdown=_ratio(result.metrics.get("max_drawdown")),
+                total_return=metrics_row["total_return"],
+                sharpe=metrics_row["sharpe"],
+                max_drawdown=metrics_row["max_drawdown"],
                 progress_pct=100,
                 error_message=None,
                 finished_at=func.now(),
@@ -546,7 +659,9 @@ def _equity_rows(
                 "run_id": run_id,
                 "seq": seq,
                 "date": day,
-                "equity": _money_required(point.equity, "equity"),
+                "equity": _money_required(point.equity, "equity").quantize(
+                    Decimal("0.000001")
+                ),
                 "benchmark": _money(point.benchmark),
             }
         )
@@ -580,15 +695,38 @@ def _metrics_row(
     """The ``run_metrics`` row: engine numbers plus the round-trip ones."""
     engine_metrics = dict(result.metrics or {})
     round_trip = _round_trip_metrics(trades)
+    # Compute from exactly the daily marks/precision that reach CSV and JSON.
+    daily = _equity_rows(context.run_id, result.equity_curve)
+    application_metrics = daily_metrics(
+        [float(point["equity"]) for point in daily], context.initial_capital
+    )
+    metadata = dict(getattr(result, "report_metadata", {}))
+    if "equity" in metadata:
+        equity_metadata = dict(metadata["equity"])
+        baseline = dict(equity_metadata.get("baseline", {}))
+        # The engine curve includes a same-date pre-trading baseline. Daily
+        # persistence keeps that day's LAST mark, so no curve index survives.
+        baseline.pop("curve_index", None)
+        baseline["includedInDailyCurve"] = False
+        equity_metadata["baseline"] = baseline
+        metadata["equity"] = equity_metadata
 
     row: dict[str, Any] = {"run_id": context.run_id}
     for key in METRIC_KEYS:
         # The engine leaves the three trade-shaped metrics as None: it only
         # ever sees one-leg fills, so pairing them is this side's job.
-        value = round_trip[key] if key in round_trip else engine_metrics.get(key)
+        value = round_trip[key] if key in round_trip else application_metrics.get(key)
         row[key] = int(value or 0) if key == "total_trades" else _ratio(value)
 
     row["extra"] = {
+        **metadata,
+        **calculation_metadata(),
+        "marketTimezone": settings.market_timezone,
+        "engineMetrics": {
+            key: float(value) if _ratio(value) is not None else None
+            for key, value in engine_metrics.items()
+        },
+        "openPositions": open_positions(trades, result.final_prices),
         "fill_count": len(result.fills),
         "closed_trades": row["total_trades"],
         "open_lots": len(trades) - row["total_trades"],
@@ -676,9 +814,7 @@ def apply_validation_outcome(engine: Engine, run_id: uuid.UUID, outcome: str) ->
                     # disabled by one, whatever a hand-edited row says.
                     _STRATEGIES.c.kind == "user",
                 )
-                .values(
-                    status=status, enabled=enabled, validation_run_id=run_id
-                )
+                .values(status=status, enabled=enabled, validation_run_id=run_id)
             )
     except Exception:
         # The run itself is already recorded correctly. Losing the strategy

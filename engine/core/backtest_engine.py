@@ -28,6 +28,7 @@ from engine.analytics.vector_strategy_adapters import (
 from engine.analytics.vectorized_backtest import VectorBacktester
 from engine.core.cost_model import CostModel
 from engine.core.runner import BacktestRunner
+from engine.data.fmp import FMPDataAdapter
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 
@@ -68,6 +69,7 @@ class BacktestEngine:
         self.initial_capital: float = 0.0
         self.slippage: float = 0.0
         self.cost_model: CostModel | None = None
+        self.commission_per_share: float = 0.0
         self.backtest_mode: str = "event"
         # VISUALIZER: task-4 seams. Callables default to no-ops so the
         # engine stays usable from a plain script.
@@ -145,6 +147,7 @@ class BacktestEngine:
         fast_config: dict[str, Any] | None = None,
         fast_years_back: int | None = None,
         fast_benchmark_label: str | None = None,
+        commission_per_share: float = 0.0,
     ):
         """
         Configures the backtest with the necessary parameters.
@@ -156,6 +159,14 @@ class BacktestEngine:
         self.slippage = slippage
         self.cost_model = cost_model
         self.backtest_mode = str(backtest_mode).lower().strip()
+        self.commission_per_share = float(commission_per_share)
+        if not np.isfinite(self.commission_per_share) or self.commission_per_share < 0:
+            raise ValueError("commission_per_share must be finite and nonnegative.")
+        if self.backtest_mode == "fast" and self.commission_per_share:
+            raise ValueError(
+                "Fast mode does not support per-share commission; use event mode "
+                "or explicitly set commission_per_share to zero."
+            )
         self.fast_config = self._normalize_fast_config(
             fast_config,
             fast_years_back=fast_years_back,
@@ -218,6 +229,19 @@ class BacktestEngine:
         if not tickers:
             self.logger.warning("Fast mode skipped: portfolio has no tickers.")
             return pd.DataFrame()
+
+        from engine.data.fmp import fetch_daily_history, market_data_source
+
+        if market_data_source() == "fmp":
+            fetch = (
+                portfolio_instance.db.get_daily_history
+                if isinstance(portfolio_instance.db, FMPDataAdapter)
+                else fetch_daily_history
+            )
+            df = fetch(tickers, start_date, end_date)
+            if not df.empty:
+                df["trade_date"] = df["timestamp"].dt.normalize().dt.tz_localize(None)
+            return df
 
         placeholders = ", ".join(["%s"] * len(tickers))
         sql = f"""
@@ -717,6 +741,18 @@ class BacktestEngine:
                     self._run_fast_vectorized(portfolio_instance)
                 else:
                     # --- Instantiate with the loaded config_dict ---
+                    if isinstance(self.db_connector, FMPDataAdapter):
+                        if self.on_progress is not None:
+                            self.on_progress(0, "loading FMP data")
+                        # Fetch before constructing indicators. The standard
+                        # indicators fit in 90 days; custom longer warmups can
+                        # extend the same in-memory history on demand.
+                        lookback = max(int(config_data.get("LOOKBACK_DAYS", 365)), 90)
+                        self.db_connector.get_daily_history(
+                            config_data.get("TICKERS", []),
+                            pd.Timestamp(self.start_date) - pd.Timedelta(days=lookback),
+                            self.end_date,
+                        )
                     portfolio_instance = portfolio_class(
                         db_connector=self.db_connector,
                         executor=None,  # The runner will set the executor later
@@ -744,6 +780,7 @@ class BacktestEngine:
                         initial_capital=self.initial_capital,
                         slippage=self.slippage,
                         cost_model=self.cost_model,
+                        commission_per_share=self.commission_per_share,
                         order_manager=order_manager,
                         # VISUALIZER: per-run seams (task 4).
                         on_progress=self.on_progress,

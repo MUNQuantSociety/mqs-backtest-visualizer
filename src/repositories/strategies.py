@@ -13,20 +13,10 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import bindparam, func, select, text
+from sqlalchemy import Numeric, bindparam, cast, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models import BacktestRun, Strategy
-
-# One ticker's most recent bar. Deliberately *not* ``max(date)`` over a ticker
-# set: the planner answers this one from the descending date index in under a
-# millisecond, while the aggregate form over several tickers walks the index
-# and takes minutes on a table this size (measured against the live instance).
-_LATEST_BAR_SQL = text(
-    "SELECT date FROM public.market_data "
-    "WHERE ticker = :ticker ORDER BY date DESC LIMIT 1"
-).bindparams(bindparam("ticker"))
-
+from src.models import BacktestReport, Strategy
 
 @dataclass(frozen=True)
 class StrategyRow:
@@ -48,14 +38,18 @@ def _aggregate_subquery():
     """
     return (
         select(
-            BacktestRun.strategy_key.label("strategy_key"),
+            BacktestReport.strategy_key.label("strategy_key"),
             func.count().label("run_count"),
-            func.max(BacktestRun.sharpe).label("best_sharpe"),
-            func.max(BacktestRun.total_return).label("best_return"),
-            func.max(BacktestRun.created_at).label("last_run_at"),
+            func.max(cast(BacktestReport.results["sharpe"].astext, Numeric)).filter(
+                BacktestReport.results["metrics"]["unavailable"]["sharpe"].astext.is_(None)
+            ).label("best_sharpe"),
+            func.max(cast(BacktestReport.results["totalReturn"].astext, Numeric)).filter(
+                BacktestReport.results["metrics"]["unavailable"]["totalReturn"].astext.is_(None)
+            ).label("best_return"),
+            func.max(BacktestReport.created_at).label("last_run_at"),
         )
-        .where(BacktestRun.purpose == "user")
-        .group_by(BacktestRun.strategy_key)
+        .where(func.coalesce(BacktestReport.results["reportMetadata"]["purpose"].astext, "user") == "user")
+        .group_by(BacktestReport.strategy_key)
         .subquery()
     )
 
@@ -77,32 +71,49 @@ async def list_strategies(
     owner_id: uuid.UUID | None = None,
 ) -> list[StrategyRow]:
     """Every strategy the catalogue should show, newest aggregates included."""
-    aggregates = _aggregate_subquery()
-    statement = (
-        select(
-            Strategy,
-            func.coalesce(aggregates.c.run_count, 0),
-            aggregates.c.best_sharpe,
-            aggregates.c.best_return,
-            aggregates.c.last_run_at,
-        )
-        .outerjoin(aggregates, aggregates.c.strategy_key == Strategy.key)
-        .order_by(Strategy.key)
-    )
+    statement = _catalogue_statement().order_by(Strategy.key)
     if not include_disabled:
         statement = statement.where(Strategy.enabled.is_(True))
 
     result = await session.execute(for_user(statement, owner_id))
-    return [
-        StrategyRow(
-            strategy=strategy,
-            run_count=int(run_count),
-            best_sharpe=best_sharpe,
-            best_return=best_return,
-            last_run_at=last_run_at,
-        )
-        for strategy, run_count, best_sharpe, best_return, last_run_at in result.all()
-    ]
+    return [_to_row(record) for record in result.all()]
+
+
+async def get_strategy_row(
+    session: AsyncSession, key: str, *, owner_id: uuid.UUID | None = None
+) -> StrategyRow | None:
+    """One strategy with its aggregates, whatever its lifecycle state.
+
+    Deliberately ignores ``enabled``: this is how a student watches an upload
+    that is still validating, or reads why one failed — both of which the
+    catalogue hides on purpose.
+    """
+    statement = _catalogue_statement().where(Strategy.key == key)
+    record = (await session.execute(for_user(statement, owner_id))).one_or_none()
+    return _to_row(record) if record is not None else None
+
+
+def _catalogue_statement():
+    """Registry rows joined to their run aggregates. Filters are added by callers."""
+    aggregates = _aggregate_subquery()
+    return select(
+        Strategy,
+        func.coalesce(aggregates.c.run_count, 0),
+        aggregates.c.best_sharpe,
+        aggregates.c.best_return,
+        aggregates.c.last_run_at,
+    ).outerjoin(aggregates, aggregates.c.strategy_key == Strategy.key)
+
+
+def _to_row(record) -> StrategyRow:
+    strategy, run_count, best_sharpe, best_return, last_run_at = record
+    return StrategyRow(
+        strategy=strategy,
+        run_count=int(run_count),
+        best_sharpe=best_sharpe,
+        best_return=best_return,
+        last_run_at=last_run_at,
+    )
 
 
 async def get_strategy(session: AsyncSession, key: str) -> Strategy | None:
@@ -199,6 +210,16 @@ async def strategies_with_staged_source(session: AsyncSession) -> list[Strategy]
     return list((await session.execute(statement)).scalars().all())
 
 
+async def attach_validation_run(session: AsyncSession, key: str, run_id: uuid.UUID) -> None:
+    """Attach a run without resetting a verdict a fast worker already wrote."""
+    await session.execute(
+        update(Strategy)
+        .where(Strategy.key == key, Strategy.kind == "user",
+               (Strategy.validation_job_id.is_(None)) | (Strategy.validation_job_id == run_id))
+        .values(validation_job_id=run_id)
+    )
+
+
 async def adopt_staged_source(
     session: AsyncSession, key: str, *, storage_key: str
 ) -> bool:
@@ -214,33 +235,3 @@ async def adopt_staged_source(
     strategy.storage_key = storage_key
     strategy.source_staging = None
     return True
-
-
-async def latest_market_data_date(
-    session: AsyncSession, tickers: list[str]
-) -> date | None:
-    """The last day every one of ``tickers`` has a bar for, or None.
-
-    Read-only against ``public.market_data``, which this application may read
-    and must never write. It lives beside the registry because the only thing
-    that asks is the strategy pipeline: a validation window has to be anchored
-    on the data that exists, not on today's date — market data ends weeks
-    behind the calendar, and a window computed from ``now()`` returns no rows
-    and fails every upload.
-
-    The *earliest* of the per-ticker maxima, because a window that runs past
-    one ticker's coverage is a window the engine has no prices for.
-    """
-    wanted = [str(ticker).strip() for ticker in tickers if str(ticker).strip()]
-    if not wanted:
-        return None
-
-    latest: date | None = None
-    for ticker in wanted:
-        row = (await session.execute(_LATEST_BAR_SQL, {"ticker": ticker})).first()
-        if row is None or row[0] is None:
-            # A ticker with no bars at all: there is no window that covers the
-            # universe, and saying so beats running against a partial one.
-            return None
-        latest = row[0] if latest is None else min(latest, row[0])
-    return latest

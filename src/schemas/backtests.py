@@ -28,6 +28,27 @@ class EquityPoint(CamelModel):
     benchmark: float | None = None
 
 
+LookbackPeriod = Literal["1y", "2y", "5y", "max"]
+
+
+class EquityWindow(CamelModel):
+    period: LookbackPeriod
+    requested_start: str | None
+    requested_end: str
+    available_start: str | None
+    available_end: str | None
+
+
+class BacktestEquity(CamelModel):
+    """Saved observations only; selecting a period never executes a new run."""
+
+    id: str
+    strategy_id: str
+    symbol: str
+    equity_curve: list[EquityPoint]
+    window: EquityWindow
+
+
 class Trade(CamelModel):
     id: str
     symbol: str
@@ -52,6 +73,9 @@ class PerformanceMetrics(CamelModel):
     win_rate: float
     profit_factor: float
     total_trades: int
+    # Existing clients require numbers. Keys here identify undefined values
+    # whose numeric compatibility placeholder must not be displayed as zero.
+    unavailable: dict[str, str] = Field(default_factory=dict)
 
 
 class BacktestSummary(CamelModel):
@@ -89,6 +113,8 @@ class BacktestDetail(BacktestSummary):
     # frontend session: a cancelled run is `status="failed"` with
     # `errorMessage="Cancelled by user"`, which is unreadable without this.
     error_message: str | None = None
+    report_metadata: dict[str, Any] = Field(default_factory=dict)
+    open_positions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class BacktestListResponse(Page):

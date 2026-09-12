@@ -107,6 +107,14 @@ class BacktestRun(Base):
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Last sign of life from the worker executing this run, written by a
+    # dedicated thread every few seconds regardless of engine progress. The
+    # reconciler fails a `running` row only when this goes stale, which is
+    # how one API instance restarting avoids killing another instance's
+    # in-flight work. NULL means claimed before this column existed.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

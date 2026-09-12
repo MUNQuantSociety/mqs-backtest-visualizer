@@ -7,12 +7,15 @@ database and the client disagree about — the status vocabulary.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import time
 import uuid
 from datetime import datetime
 from decimal import Decimal
 
+from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
 from src.repositories import strategies as strategies_repo
@@ -28,8 +31,11 @@ from src.schemas.strategies import (
     StrategyStatus,
     StrategySubmission,
     StrategySubmissionResult,
+    StrategyTemplate,
 )
 from src.services import strategy_validation
+from src.services.strategy_availability import package_available
+from src.services.strategy_validation import template
 
 # The registry tracks four states; the client's Zod enum knows three. Both
 # in-flight states collapse to ``draft`` — the submission message is what tells
@@ -91,6 +97,11 @@ def to_schema(row: StrategyRow) -> Strategy:
         best_sharpe=_float(row.best_sharpe),
         best_return=_float(row.best_return),
         last_run_at=_iso(row.last_run_at),
+        validation_state=strategy.status,
+        validation_run_id=(
+            str(getattr(strategy, "validation_job_id", None) or strategy.validation_run_id)
+            if (getattr(strategy, "validation_job_id", None) or strategy.validation_run_id) else None
+        ),
     )
 
 
@@ -106,14 +117,51 @@ def _generate_key(name: str) -> str:
 
 
 async def list_strategies(include_disabled: bool = False) -> StrategyListResponse:
-    """The catalogue, with per-strategy run aggregates computed in SQL."""
+    """Registered strategies and aggregates, backed by complete S3 packages.
+
+    The registry remains the validation/ownership catalogue: arbitrary S3
+    objects and incomplete uploads must never become executable strategies.
+    Local mode retains the vendored built-ins for offline development.
+    """
+    started = time.perf_counter()
+    logger.info("CATALOGUE | GET strategies received; storage=%s", settings.strategy_store_backend)
     await ensure_schema()
     async with session_scope() as session:
         rows = await strategies_repo.list_strategies(
             session, include_disabled=include_disabled
         )
-        items = [to_schema(row) for row in rows]
+    if settings.strategy_store_backend == "s3":
+        limit = asyncio.Semaphore(4)
+
+        async def available(row: StrategyRow) -> bool:
+            async with limit:
+                return await package_available(row.strategy.storage_key)
+
+        present = await asyncio.gather(*(available(row) for row in rows))
+        rows = [row for row, exists in zip(rows, present) if exists]
+    items = [to_schema(row) for row in rows]
+    logger.info("CATALOGUE | Returning %d strategies: %s; elapsed_ms=%.0f", len(items), [item.id for item in items], (time.perf_counter() - started) * 1000)
     return StrategyListResponse(items=items, total=len(items))
+
+
+async def get_strategy(key: str) -> Strategy | None:
+    """One strategy by key, including ones the catalogue hides.
+
+    This is the endpoint behind "is my upload done yet?": a validating or
+    failed upload is disabled and therefore absent from the list, so a client
+    that only has the list has no way to watch it. None when the key is unknown.
+    """
+    await ensure_schema()
+    async with session_scope() as session:
+        row = await strategies_repo.get_strategy_row(session, key)
+    return to_schema(row) if row is not None else None
+
+
+def strategy_template() -> StrategyTemplate:
+    """The starter source, straight from the module the check tests against."""
+    return StrategyTemplate(
+        filename=template.STARTER_FILENAME, source=template.STARTER_SOURCE
+    )
 
 
 def check_strategy(request: StrategyCheckRequest) -> StrategyCheckResult:
@@ -184,7 +232,7 @@ def _check_message(
     )
 
 
-async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionResult:
+async def submit_strategy(submission: StrategySubmission, *, owner_id: uuid.UUID | None = None) -> StrategySubmissionResult:
     """Store an upload and start the backtest that proves it works.
 
     Four steps, in this order for a reason. The source is scanned first, so a
@@ -203,7 +251,9 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
     Raises :class:`~src.services.strategy_validation.StrategyValidationError`
     for source the student has to fix; the route turns that into a 422.
     """
+    logger.info("UPLOAD | Checking strategy source; name=%r bytes=%d", submission.name, len(submission.source.encode("utf-8")))
     scan = strategy_validation.scan_source(submission.source)
+    logger.info("UPLOAD | Compatibility passed; class=%s", scan.class_name)
 
     await ensure_schema()
     # One-shot catch-up for rows written before the store existed. It finds
@@ -213,53 +263,66 @@ async def submit_strategy(submission: StrategySubmission) -> StrategySubmissionR
 
     key = _generate_key(submission.name)
     config = strategy_validation.build_config(key)
-    storage_key = strategy_validation.store_strategy_source(
-        key, submission.source, config
+    storage_key = await asyncio.to_thread(
+        strategy_validation.store_strategy_source, key, submission.source, config
     )
+    logger.info("UPLOAD | Source/config stored; strategy=%s storage=%s key=%s", key, settings.strategy_store_backend, storage_key)
 
-    async with session_scope() as session:
-        await strategies_repo.create_strategy(
-            session,
-            key=key,
-            name=submission.name,
-            description=submission.description or "",
-            kind="user",
-            status="validating",
-            # Never surfaces in the catalogue until a validation run passes.
-            enabled=False,
-            tags=["user"],
-            universe=list(config["TICKERS"]),
-            param_specs=strategy_validation.parameter_specs(),
-            # An upload has no import path: the worker materializes this key
-            # and imports the file it finds there.
-            storage_key=storage_key,
-            class_path=None,
-        )
+    try:
+        async with session_scope() as session:
+            await strategies_repo.create_strategy(
+                session,
+                key=key,
+                name=submission.name,
+                description=submission.description or "",
+                kind="user",
+                status="validating",
+                # Not selectable until its real validation backtest passes.
+                enabled=False,
+                tags=["user"],
+                universe=list(config["TICKERS"]),
+                param_specs=strategy_validation.parameter_specs(),
+                storage_key=storage_key,
+                class_path=None,
+            )
+    except Exception:
+        await _discard_unregistered_source(key)
+        raise
 
-    message = await _begin_validation(key, submission.name, config, scan.class_name)
+    logger.info("UPLOAD | Draft registered; strategy=%s; queueing validation", key)
+    message, run_id = await _begin_validation(
+        key, submission.name, config, scan.class_name, owner_id=owner_id
+    )
     return StrategySubmissionResult(
         id=key,
         name=submission.name,
         status=StrategyStatus.DRAFT,
         message=message,
+        validation_run_id=run_id,
     )
 
 
 async def _begin_validation(
-    key: str, name: str, config: dict, class_name: str
-) -> str:
-    """Queue the validation run and report what a student should expect.
+    key: str, name: str, config: dict, class_name: str, *, owner_id: uuid.UUID | None = None
+) -> tuple[str, str | None]:
+    """Queue the validation run; return the student-facing message and its id.
 
     A failure to *start* the run is not a failure of the upload, but it must
     not read as "still validating" either: the strategy is parked in
     ``failed_validation`` and the message says the run never started, so the
     student re-uploads instead of waiting for a result that is not coming.
+
+    The run id is written onto the strategy row here, at submit time. The
+    worker also writes it when the run finishes, but a client polling
+    ``GET /strategies/{key}`` *during* validation needs it now — otherwise
+    the only place it exists is inside this sentence.
     """
     try:
         summary = await strategy_validation.start_validation(
             strategy_key_value=key,
             strategy_name=name,
             tickers=list(config["TICKERS"]),
+            owner_id=owner_id,
         )
     except Exception as exc:
         logger.exception("Validation run for strategy %s could not be started", key)
@@ -267,12 +330,32 @@ async def _begin_validation(
         return (
             f"Saved {class_name}, but its validation backtest could not be "
             f"started ({exc}). Try uploading it again."
-        )
+        ), None
+
+    async with session_scope() as session:
+        await strategies_repo.attach_validation_run(session, key, uuid.UUID(summary.id))
 
     return (
         f"Validation backtest started for {class_name} — the strategy "
         f"activates when it passes. Follow run {summary.id} for progress."
-    )
+    ), summary.id
+
+
+async def _discard_unregistered_source(key: str) -> None:
+    """Clean a fresh failed upload only if its registry transaction did not commit.
+
+    An uncertain commit must not leave a live registry entry pointing at deleted
+    source. If the verification read also fails, retain the package for recovery.
+    """
+    try:
+        async with session_scope() as session:
+            registered = await strategies_repo.get_strategy(session, key)
+        if registered is None:
+            await asyncio.to_thread(strategy_validation.discard_stored_source, key)
+    except Exception:
+        logger.exception(
+            "Retaining source for %s after an uncertain registry write", key
+        )
 
 
 async def delete_strategy(key: str) -> bool:
@@ -287,5 +370,5 @@ async def delete_strategy(key: str) -> bool:
         removed = await strategies_repo.delete_strategy(session, key)
 
     if removed:
-        strategy_validation.discard_stored_source(key)
+        await asyncio.to_thread(strategy_validation.discard_stored_source, key)
     return removed
