@@ -1,7 +1,7 @@
 """Regression: the real browser form's reserved params must reach execution."""
 
 import math
-from datetime import date
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -131,4 +131,83 @@ def test_submission_validates_selected_universe_and_dispatches(monkeypatch):
     assert coverage.await_args.args[0] == ["MSFT"]
     assert create.await_args.kwargs["symbol"] == "MSFT"
     assert create.await_args.kwargs["params"]["TICKERS"] == ["MSFT"]
+    assert create.await_args.kwargs["params"]["mode"] == "event"
     dispatch.assert_awaited_once()
+
+
+@pytest.mark.parametrize("mode", ["fast", " FAST "])
+@pytest.mark.parametrize("commission", [0, 0.005])
+def test_new_fast_submission_rejected_before_coverage_or_dispatch(
+    monkeypatch, mode, commission
+):
+    import asyncio
+    from src.schemas.backtests import BacktestRunRequest
+    from src.services import backtests
+
+    monkeypatch.setattr(
+        backtests,
+        "_load_runnable_strategy",
+        AsyncMock(return_value=backtests._RunnableStrategy("sample", ["AAPL"], [])),
+    )
+    coverage = AsyncMock()
+    create = AsyncMock()
+    dispatch = AsyncMock()
+    monkeypatch.setattr(backtests, "_validated_coverage", coverage)
+    monkeypatch.setattr(backtests, "create_backtest_run", create)
+    monkeypatch.setattr(backtests, "_dispatch", dispatch)
+    request = BacktestRunRequest(
+        name="browser",
+        strategy_key="sample",
+        start_date="2026-03-02",
+        end_date="2026-07-15",
+        initial_capital=100_000,
+        mode=mode,
+        params={"commissionPerShare": commission},
+    )
+
+    with pytest.raises(backtests.RunSubmissionError, match="mode must be 'event'"):
+        asyncio.run(backtests.submit_backtest_run(request))
+
+    coverage.assert_not_called()
+    create.assert_not_called()
+    dispatch.assert_not_called()
+
+
+def test_existing_fast_report_remains_readable_and_exportable():
+    import json
+    from src.repositories import reports
+    from src.services import backtests
+    from src.services.report_exports import export_report
+
+    stored = SimpleNamespace(
+        id=uuid4(),
+        name="Historical fast run",
+        strategy_key="sample",
+        created_at=datetime(2026, 3, 5, tzinfo=timezone.utc),
+        version=reports.REPORT_VERSION,
+        results={
+            "strategyName": "Sample",
+            "symbol": "AAPL",
+            "timeframe": "1d",
+            "startDate": "2026-03-02",
+            "endDate": "2026-03-04",
+            "initialCapital": 100,
+            "finalEquity": 100,
+            "totalReturn": 0,
+            "sharpe": 0,
+            "maxDrawdown": 0,
+            "metrics": backtests._to_metrics(None).model_dump(by_alias=True),
+            "equityCurve": [{"date": "2026-03-04", "equity": 100}],
+            "trades": [],
+            "parameters": {"mode": "fast", "universe": ["AAPL"]},
+        },
+    )
+
+    detail = reports.to_detail(stored)
+    assert detail.status == "completed"
+    assert detail.parameters == stored.results["parameters"]
+    exported = json.loads(export_report(detail, "report.json").content)
+    assert exported["parameters"] == stored.results["parameters"]
+    assert exported["equityCurve"] == [
+        {"date": "2026-03-04", "equity": 100.0, "benchmark": None}
+    ]

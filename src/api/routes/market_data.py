@@ -6,13 +6,30 @@ Provider errors are reported separately from tickers with no history.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, status
+import uuid
 
-from src.schemas.market_data import CoverageResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+from src.api.dependencies.current_user import require_current_user
+from src.schemas.market_data import CoverageResponse, TickerValidationResponse
 from src.services import market_data as market_data_service
 from src.services.market_data import FMPUnavailable
 
 router = APIRouter(prefix="/market-data", tags=["market-data"])
+
+
+@router.get("/validate-tickers", response_model=TickerValidationResponse)
+async def validate_tickers(
+    tickers: str = Query(max_length=1100, description="1 to 50 comma-separated FMP ticker symbols."),
+    _owner_id: uuid.UUID = Depends(require_current_user),
+) -> TickerValidationResponse:
+    """Check exact FMP symbols before adding them to a backtest universe."""
+    try:
+        return await market_data_service.validate_tickers(tickers.split(","))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except FMPUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
 
 
 @router.get("/coverage", response_model=CoverageResponse)

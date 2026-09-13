@@ -138,9 +138,7 @@ class BacktestRunRequest(CamelModel):
     start_date: str
     end_date: str
     initial_capital: float
-    # Only the event loop is dependable across every vendored strategy; the
-    # vectorised path exists but not every strategy implements it, and the
-    # engine says so per run.
+    # New submissions accept event only; historical reports retain their mode.
     mode: str = "event"
     # Overlaid on the strategy's ``config.json`` at run time. Validated against
     # the strategy's ``param_specs`` — an unknown key is a typo, not a feature.
