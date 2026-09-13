@@ -449,7 +449,7 @@ Pydantic models in `src/schemas/`.
 | `GET` | `/api/backtests/{id}` | **Postgres** | Detail: metrics and availability, daily equity/benchmark, trades, `openPositions`, `reportMetadata`, parameters and progress/error fields. `404` if unknown. |
 | `GET` | `/api/backtests/{id}/exports/{filename}` | **Postgres** | `equity.csv`, `trades.csv`, `metrics.csv`, or `report.json`. Completed runs only (`409` otherwise); unknown run/filename is `404`. |
 | `DELETE` | `/api/backtests/{id}` | **Postgres** | Delete or cancel — see the table above. `204`, or `404`. |
-| `GET` | `/api/strategies` | **Postgres** | Catalogue of enabled strategies with SQL-computed run aggregates. |
+| `GET` | `/api/strategies` | **Postgres** | Shared catalogue; private report statistics are omitted (0/null). |
 | `POST` | `/api/strategies` | **Postgres + store + worker pool** | Upload source. Scans it, stores it, and queues its validation backtest. `201` + `status: "draft"`; `422` for a rejected source; `413` over 256 KB. |
 | `GET` | `/api/strategies/template` | *nothing* | Starter source for the editor. Served so the contract it teaches cannot drift from the engine; a test asserts it passes the check below. |
 | `POST` | `/api/strategies/check` | *nothing* | Pre-flight: would this source run here? Reads it with `ast`; stores nothing, executes nothing. Always `200` when the check ran, verdict in `ok`/`issues`; `413` over 256 KB. |
@@ -850,10 +850,31 @@ created on demand.
 `.env.example`, and never log a connection URL — the settings module hands out
 SQLAlchemy `URL` objects precisely because their `repr` masks the password.
 
-The `SUPABASE_*` / `JWT_*` keys at the bottom of `.env.example` are commented
-out and read by nothing. Authentication is a parallel work stream; this repo
-only reserves the seams (an `owner_id` column and a `for_user()` filter in the
-repositories that currently no-ops).
+Protected routes require `Authorization: Bearer <Cognito access token>`. Configure
+`AUTH_COGNITO_ISSUER` and `AUTH_COGNITO_CLIENT_ID`; ID tokens are rejected. The
+backend checks the configured pool's RS256 signing keys, issuer, client ID,
+access-token use, expiry and issued-at claims. Trusted JWKS are cached for five
+minutes, with a five-second request timeout and a 30-second rotation cooldown.
+Missing or invalid production auth settings prevent startup; this configuration
+check does not contact Cognito.
+
+`GET /api/auth/me` returns `{id, email, displayName}`. The ID is an app-owned
+UUID mapped uniquely to the verified issuer and opaque subject in `app.users`;
+profile fields may be null. Existing report owners are preserved. Legacy
+`public.user_creds` passwords are never read, and accounts/reports are not linked
+by email. Sign-in creates only the new app identity; it does not claim old reports.
+
+Health and shared strategy metadata remain public. Catalogue report statistics
+are always `0`/`null`; use authenticated backtest history for personal activity.
+All run creation, history, detail, equity, exports, deletion and strategy uploads
+use the verified app UUID. Logout removes browser credentials; already issued
+JWTs remain valid until expiry (no per-request token-revocation lookup).
+
+For local tests only, `AUTH_ALLOW_DEV_IDENTITY=true` can enable `X-User-Id` and
+`TEMPORARY_USER_ID` when `APP_ENV` is `development` or `test` and both Cognito
+settings are blank. It defaults to false and is never honored in production or
+staging. A supplied bearer credential never falls back to this testing path.
+See [production configuration](docs/PRODUCTION_AUTH.md) for the hosted setup.
 
 ---
 
@@ -984,7 +1005,7 @@ Honest list of what is not built, so nobody discovers it the hard way.
 | Item | Status |
 | --- | --- |
 | `/live/*` endpoints | Generated sample data. Backing them with the real trading tables is a separate product decision. |
-| Authentication | Out of scope here. The seams exist (`owner_id` column, a `for_user()` repository filter that no-ops); a parallel session builds Supabase OAuth. Until it lands, **every run is visible to everyone**. |
+| Authentication | Cognito access tokens map to app-owned users; run reads and mutations enforce owner scope. Shared strategy metadata remains public; report aggregates do not. |
 | Real sandboxing for uploaded code | Deferred, and required before this is exposed beyond the club. See [Security](#security-this-executes-user-supplied-python). |
 | `mode: "fast"` (the vectorised path) | Available for registered adapters, including the built-in `VolMomentum`, `MomentumStrategy` and `RegimeAdaptiveStrategy`; `portfolio_dummy` is unsupported. It is an approximation, retains warmup/first-day-return behavior, and emits no fills. Unsupported classes fail clearly in the engine. |
 | Benchmark coverage | Configured-universe buy-and-hold is populated from observed prices. Missing/late entries and stale marks remain possible; inspect metadata. No calendar grid or future-price backfill. |

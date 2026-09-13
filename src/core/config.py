@@ -98,7 +98,10 @@ class Settings:
     # route it calls resolves under this. Changing it breaks the client.
     api_prefix: str = os.getenv("API_PREFIX", "/api")
 
-    # Explicit opt-in while sign-in is unfinished. Blank requires X-User-Id.
+    auth_cognito_issuer: str = os.getenv("AUTH_COGNITO_ISSUER", "").strip()
+    auth_cognito_client_id: str = os.getenv("AUTH_COGNITO_CLIENT_ID", "").strip()
+    # Never honored outside development/test or when Cognito is configured.
+    auth_allow_dev_identity: bool = _env_bool("AUTH_ALLOW_DEV_IDENTITY", False)
     temporary_user_id: str = os.getenv("TEMPORARY_USER_ID", "").strip()
 
     repo_root: Path = REPO_ROOT
