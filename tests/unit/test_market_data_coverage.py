@@ -161,6 +161,7 @@ def test_an_empty_ticker_list_is_422(client: TestClient) -> None:
 @pytest.fixture
 def stub_coverage(monkeypatch: pytest.MonkeyPatch):
     """Answer `coverage_for` directly, since the arithmetic is tested above."""
+    monkeypatch.setenv("MARKET_DATA_SOURCE", "database")
 
     def install(response: CoverageResponse) -> None:
         async def fake(_tickers):

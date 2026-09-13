@@ -11,6 +11,8 @@ cause.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from src.schemas.common import CamelModel
 
 
@@ -42,3 +44,15 @@ class CoverageResponse(CamelModel):
     end: str | None = None
     # Tickers with no bars at all. Empty is the normal case.
     missing: list[str] = []
+
+
+class TickerValidation(CamelModel):
+    ticker: str
+    status: Literal["valid", "unknown"]
+
+
+class TickerValidationResponse(CamelModel):
+    """FMP symbol recognition; 'valid' does not promise historical coverage."""
+
+    tickers: list[TickerValidation]
+    unknown: list[str]
