@@ -6,10 +6,13 @@ Backed by the ``app.strategies`` registry through
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, HTTPException, Response, UploadFile, status
+import uuid
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
+from src.api.dependencies.current_user import require_current_user
 from src.schemas.strategies import (
     MAX_BODY_BYTES,
     MAX_SOURCE_BYTES,

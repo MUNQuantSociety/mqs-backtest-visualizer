@@ -406,7 +406,10 @@ def _check_message(
 
 
 async def submit_strategy(
-    submission: StrategySubmission, *, authoring: dict | None = None
+    submission: StrategySubmission,
+    *,
+    authoring: dict | None = None,
+    owner_id: uuid.UUID | None = None,
 ) -> StrategySubmissionResult:
     """Store an upload and start the backtest that proves it works.
 
