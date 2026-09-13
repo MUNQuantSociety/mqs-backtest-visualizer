@@ -29,8 +29,10 @@ def isolated_fmp(monkeypatch):
     monkeypatch.setenv("FMP_API_KEY", "test-secret-key")
     monkeypatch.setattr(fmp.time, "sleep", lambda _: None)
     coverage_service._fmp_span.cache_clear()
+    coverage_service._symbol_cache.clear()
     yield
     coverage_service._fmp_span.cache_clear()
+    coverage_service._symbol_cache.clear()
 
 
 def bar(ticker="CRWV", day="2025-03-28", price=100):
@@ -140,6 +142,7 @@ def test_coverage_uses_fmp_intersection_and_caches_form_lookups(monkeypatch):
         return [{"date": day} for day in spans[ticker]]
 
     monkeypatch.setattr(fmp.FMPMarketData, "get_historical_data", history)
+    monkeypatch.setattr(fmp.FMPMarketData, "symbol_exists", lambda self, ticker: True)
     monkeypatch.setattr(coverage_service, "session_scope", forbidden)
     response = asyncio.run(coverage_service.coverage_for(["crwv", "NBIS", "CRWV"]))
     assert response.start == "2025-03-28" and response.end == "2026-07-15"
@@ -155,6 +158,7 @@ def test_coverage_missing_and_nonoverlapping_histories(monkeypatch):
     spans = {"CRWV": [date(2025, 3, 28)], "OLD": [date(2024, 1, 1)], "NOPE": []}
     monkeypatch.setattr(fmp.FMPMarketData, "get_historical_data",
                         lambda self, ticker, start, end: [{"date": day} for day in spans[ticker]])
+    monkeypatch.setattr(fmp.FMPMarketData, "symbol_exists", lambda self, ticker: True)
     response = asyncio.run(coverage_service.coverage_for(["CRWV", "NOPE"]))
     assert response.missing == ["NOPE"] and response.start is None
     response = asyncio.run(coverage_service.coverage_for(["CRWV", "OLD"]))

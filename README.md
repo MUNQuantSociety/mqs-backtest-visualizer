@@ -456,7 +456,8 @@ Pydantic models in `src/schemas/`.
 | `POST` | `/api/strategies/upload` | **Postgres** + store | `POST /strategies` for a real file: multipart `file` (`.py`, UTF-8, ≤ 256 KB) plus `name`/`description` form fields. Same scan, same store, same validation backtest, same `201` — with `validationRunId` to poll. |
 | `POST` | `/api/strategies/upload/check` | *nothing* | `POST /strategies/check` for a file. Same verdict semantics: `200` either way, problems listed by line. |
 | `GET` | `/api/strategies/{key}` | **Postgres** | One strategy **including the ones the catalogue hides**. `validationState` is the real lifecycle (`validating` / `active` / `failed_validation`), `validationRunId` the backtest to open for progress or the failure reason. This is how a client watches an upload. `404` if unknown. |
-| `GET` | `/api/market-data/coverage` | **Postgres** | Which dates have prices, by `tickers` or `strategyKey`. `start`/`end` are the window safe for the whole universe, null when a ticker has none. Read-only against `public.market_data`. |
+| `GET` | `/api/market-data/validate-tickers` | **FMP** | Authenticated exact symbol recognition for 1–50 comma-separated `tickers`; returns `valid`/`unknown` per ticker and an `unknown` list. |
+| `GET` | `/api/market-data/coverage` | **FMP by default** | Historical date bounds for `tickers` or `strategyKey`; no-history is separate from symbol recognition. Explicit legacy database mode remains available for isolated tests. |
 | `GET` | `/api/live/portfolios` | *sample data* | Live portfolio list. |
 | `GET` | `/api/live/portfolios/{id}` | *sample data* | Detail — config, positions. |
 | `GET` | `/api/live/portfolios/{id}/equity` | *sample data* | `days`. |
@@ -878,6 +879,26 @@ See [production configuration](docs/PRODUCTION_AUTH.md) for the hosted setup.
 
 ---
 
+### Universe validation and execution mode
+
+Before adding a ticker, the run form calls the authenticated
+`GET /api/market-data/validate-tickers?tickers=AAPL,MSFT` endpoint. Symbols are
+trimmed, uppercased and matched exactly against FMP symbol metadata. A successful
+lookup returns `{tickers: [{ticker, status}], unknown: []}`, where status is
+`valid` or `unknown`. Unknown means FMP does not recognize that exact symbol;
+coverage is a separate check and can still report missing history for a known
+symbol. The backend repeats this validation before registering a new job.
+
+Metadata requests use the server's FMP key, at most four concurrent provider
+calls, a six-second socket timeout and one bounded transient retry. Successful
+recognition is cached for one hour; unknown results for five minutes, up to 512
+symbols. Provider outages, plan errors, malformed responses and truncated
+searches without an exact match return 503 and are not cached as unknown.
+
+New `POST /api/backtests` requests use `mode: "event"` (also the default).
+Explicit `fast` requests are rejected before coverage checks or job creation.
+Existing fast-mode reports and standalone engine support remain available.
+
 ## The database
 
 The application uses PostgreSQL for market-data reads and its own report/registry
@@ -1007,7 +1028,7 @@ Honest list of what is not built, so nobody discovers it the hard way.
 | `/live/*` endpoints | Generated sample data. Backing them with the real trading tables is a separate product decision. |
 | Authentication | Cognito access tokens map to app-owned users; run reads and mutations enforce owner scope. Shared strategy metadata remains public; report aggregates do not. |
 | Real sandboxing for uploaded code | Deferred, and required before this is exposed beyond the club. See [Security](#security-this-executes-user-supplied-python). |
-| `mode: "fast"` (the vectorised path) | Available for registered adapters, including the built-in `VolMomentum`, `MomentumStrategy` and `RegimeAdaptiveStrategy`; `portfolio_dummy` is unsupported. It is an approximation, retains warmup/first-day-return behavior, and emits no fills. Unsupported classes fail clearly in the engine. |
+| `mode: "fast"` (the vectorised path) | Standalone engine and historical reports only; new API submissions require `event`. Available for registered adapters, including the built-in `VolMomentum`, `MomentumStrategy` and `RegimeAdaptiveStrategy`; `portfolio_dummy` is unsupported. It is an approximation, retains warmup/first-day-return behavior, and emits no fills. Unsupported classes fail clearly in the engine. |
 | Benchmark coverage | Configured-universe buy-and-hold is populated from observed prices. Missing/late entries and stale marks remain possible; inspect metadata. No calendar grid or future-price backfill. |
 | Strategy exceptions during validation | The application runs the engine in strict mode: strategy exceptions propagate and fail the run. This is functional validation, not sandboxing. |
 | OMS (TWAP/VWAP child-order slicing) | Not vendored — it is live-trading machinery. The engine always takes upstream's documented direct-execution path, so fills differ from an MQSMaster run of the same portfolio. |

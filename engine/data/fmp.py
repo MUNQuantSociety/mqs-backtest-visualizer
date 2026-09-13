@@ -25,6 +25,8 @@ from engine.contracts.errors import EngineError, NoMarketData
 
 logger = logging.getLogger(__name__)
 ENDPOINT = "https://financialmodelingprep.com/stable/historical-price-eod/full"
+SYMBOL_ENDPOINT = "https://financialmodelingprep.com/stable/search-symbol"
+SYMBOL_SEARCH_LIMIT = 100
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 
@@ -56,16 +58,25 @@ class FMPMarketData:
             raise FMPUnavailable("FMP_API_KEY is missing. Set it in the backend .env and restart the API.")
 
     def _make_request(self, ticker: str, start: date, end: date) -> list[dict]:
-        url = ENDPOINT + "?" + urlencode({
+        return self._request_list(ENDPOINT, {
             "symbol": ticker, "from": start.isoformat(), "to": end.isoformat(),
-            "apikey": self._api_key,
-        })
+        }, label=f"history for {ticker}")
+
+    def _request_list(self, endpoint: str, params: dict, *, label: str,
+                      response_limit: int | None = None) -> list[dict]:
+        url = endpoint + "?" + urlencode({**params, "apikey": self._api_key})
         # Bound transient retries. Never log URLs, provider bodies or raw
         # exceptions: all can contain the query-string API key.
         for attempt in range(2):
             try:
                 with urlopen(url, timeout=6) as response:
-                    payload = json.load(response)
+                    if response_limit is None:
+                        payload = json.load(response)
+                    else:
+                        content = response.read(response_limit + 1)
+                        if len(content) > response_limit:
+                            raise ValueError("Response exceeds the symbol lookup limit")
+                        payload = json.loads(content)
             except HTTPError as exc:
                 code = exc.code
                 exc.close()
@@ -74,24 +85,40 @@ class FMPMarketData:
                     continue
                 advice = {
                     401: "Check FMP_API_KEY in the backend .env.",
-                    402: "Check the FMP plan's historical-data access.",
-                    403: "Check the API key and the FMP plan's historical-data access.",
+                    402: "Check the FMP plan's access to this endpoint.",
+                    403: "Check the API key and the FMP plan's access to this endpoint.",
                     429: "FMP's request limit was reached; retry shortly.",
                 }.get(code, "Retry shortly or check FMP service availability.")
-                raise FMPUnavailable(f"FMP history for {ticker} failed (HTTP {code}). {advice}") from None
+                raise FMPUnavailable(f"FMP {label} failed (HTTP {code}). {advice}") from None
             except (URLError, TimeoutError, OSError):
                 if attempt == 0:
                     time.sleep(0.5)
                     continue
-                raise FMPUnavailable(f"FMP history for {ticker} could not be reached. Retry shortly.") from None
+                raise FMPUnavailable(f"FMP {label} could not be reached. Retry shortly.") from None
             except (ValueError, UnicodeError):
-                raise FMPUnavailable(f"FMP returned invalid history for {ticker}. Retry shortly.") from None
+                raise FMPUnavailable(f"FMP returned invalid {label}. Retry shortly.") from None
             if not isinstance(payload, list) or any(not isinstance(row, dict) for row in payload):
                 raise FMPUnavailable(
-                    f"FMP returned an error or unexpected history for {ticker}. Check the API key and plan access."
+                    f"FMP returned an error or unexpected {label}. Check the API key and plan access."
                 )
             return payload
         raise AssertionError("unreachable")  # pragma: no cover
+
+    def symbol_exists(self, ticker: str) -> bool:
+        """Recognize an exact provider symbol independently of its daily history."""
+        rows = self._request_list(
+            SYMBOL_ENDPOINT, {"query": ticker, "limit": SYMBOL_SEARCH_LIMIT},
+            label=f"symbol lookup for {ticker}", response_limit=512_000,
+        )
+        if any(not isinstance(row.get("symbol"), str) or not row["symbol"].strip() for row in rows):
+            raise FMPUnavailable(f"FMP returned invalid symbol metadata for {ticker}. Retry shortly.")
+        if any(row["symbol"].strip().upper() == ticker for row in rows):
+            return True
+        # A capped prefix-search page cannot prove absence. Never turn an
+        # incomplete provider answer into a cached 'unknown' symbol verdict.
+        if len(rows) >= SYMBOL_SEARCH_LIMIT:
+            raise FMPUnavailable(f"FMP symbol lookup for {ticker} was incomplete. Retry with the exact exchange-qualified symbol.")
+        return False
 
     def get_historical_data(self, tickers, from_date, to_date) -> list[dict]:
         """Daily OHLCV records for each symbol; both exchange dates inclusive."""
