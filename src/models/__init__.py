@@ -16,9 +16,11 @@ from src.models.runs import (
     RunTrade,
 )
 from src.models.strategies import STRATEGY_KINDS, STRATEGY_STATUSES, Strategy
+from src.models.users import AppUser
 
 __all__ = [
     "APP_SCHEMA",
+    "AppUser",
     "Base",
     "BacktestReport",
     "BacktestRun",

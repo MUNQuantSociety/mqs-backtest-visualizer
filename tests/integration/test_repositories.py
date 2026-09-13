@@ -219,9 +219,9 @@ def test_run_round_trips_and_feeds_strategy_aggregates() -> None:
         assert run_id not in {row.run.id for row in filtered_out}
 
         dummy = next(row for row in aggregates if row.strategy.key == "portfolio_dummy")
-        assert dummy.run_count >= 1
-        assert dummy.best_sharpe is not None
-        assert dummy.last_run_at is not None
+        assert dummy.run_count == 0
+        assert dummy.best_sharpe is None and dummy.best_return is None
+        assert dummy.last_run_at is None
 
         # The serialised payload is what the frontend actually parses.
         assert summary is not None

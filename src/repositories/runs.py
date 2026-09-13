@@ -50,13 +50,8 @@ class RunListRow:
 
 
 def for_user(statement, owner_id: uuid.UUID | None):
-    """Owner-scoping seam — a no-op until authentication lands.
-
-    When it does, this becomes ``statement.where(BacktestRun.owner_id ==
-    owner_id)`` and every read path is scoped at once, because they all pass
-    through here.
-    """
-    return statement
+    """Scope API reads; internal validation jobs may intentionally omit owner."""
+    return statement.where(BacktestRun.owner_id == owner_id) if owner_id is not None else statement
 
 
 def parse_run_id(run_id: str) -> uuid.UUID | None:

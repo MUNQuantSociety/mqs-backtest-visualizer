@@ -211,6 +211,10 @@ def test_uploaded_strategy_runs_in_spawned_worker_and_exports_persisted_results(
     environment.update(
         {
             "APP_ENV": "test",
+            "AUTH_ALLOW_DEV_IDENTITY": "true",
+            "AUTH_COGNITO_ISSUER": "",
+            "AUTH_COGNITO_CLIENT_ID": "",
+            "TEMPORARY_USER_ID": "",
             "DEBUG": "false",
             "LOG_LEVEL": "WARNING",
             "API_PREFIX": "/api",
@@ -621,6 +625,43 @@ def _assert_exports(client, detail):
     assert client.get(f"{prefix}/strategy.py").status_code == 404
 
 
+async def _assert_concurrent_app_users():
+    """Real PostgreSQL unique-key arbitration, only inside the guarded CI proof."""
+    import asyncio
+    import uuid
+
+    from sqlalchemy import func, select
+    from src.db.engine import session_scope
+    from src.models import AppUser
+    from src.repositories.users import get_or_create_user
+
+    issuer = "https://disposable.invalid/" + uuid.uuid4().hex
+    subject = "opaque/provider-subject"
+    ready = asyncio.Event()
+
+    async def sign_in(iss=issuer, sub=subject):
+        await ready.wait()
+        async with session_scope() as session:
+            user = await get_or_create_user(session, issuer=iss, subject=sub)
+            assert user.email is None and user.display_name is None
+            return user.id
+
+    requests = [asyncio.create_task(sign_in()) for _ in range(8)]
+    ready.set()
+    identities = await asyncio.gather(*requests)
+    assert len(set(identities)) == 1, "Concurrent first sign-ins created multiple owners"
+    assert await sign_in() == identities[0], "Later requests changed the app identity"
+    other_issuer = await sign_in(iss=issuer + "-other")
+    legacy_subject = "00000000-0000-0000-0000-000000000001"
+    other_subject = await sign_in(sub=legacy_subject)
+    assert len({identities[0], other_issuer, other_subject, uuid.UUID(legacy_subject)}) == 4
+    async with session_scope() as session:
+        count = await session.scalar(select(func.count()).select_from(AppUser).where(
+            AppUser.issuer == issuer, AppUser.subject == subject))
+        assert count == 1
+    print("CI proof: concurrent app-user mapping, idempotence and issuer isolation passed", flush=True)
+
+
 def _run_ci_proof():
     # This guard also protects a direct invocation of the helper script. It is
     # deliberately before imports that load .env or construct database engines.
@@ -660,6 +701,7 @@ def _run_ci_proof():
 
         source = SOURCE_PATH.read_text(encoding="utf-8")
         with TestClient(app) as client:
+            client.portal.call(_assert_concurrent_app_users)
             client.headers["X-User-Id"] = "00000000-0000-0000-0000-000000000001"
             manager = get_job_manager()
             assert manager.running and manager.max_workers == 1
@@ -719,7 +761,9 @@ def _run_ci_proof():
                 assert _get_json(client, f"/api/backtests/{detail['id']}") == detail
                 reruns.append(detail)
             _assert_identical_execution(*reruns)
-            assert _get_json(client, f"/api/strategies/{key}")["runCount"] == 2
+            public_strategy = _get_json(client, f"/api/strategies/{key}")
+            assert public_strategy["runCount"] == 0
+            assert all(public_strategy[name] is None for name in ("bestSharpe", "bestReturn", "lastRunAt"))
             history = _get_json(client, f"/api/backtests?strategyId={key}")
             assert history["total"] == 2
             assert {item["id"] for item in history["items"]} == {run["id"] for run in reruns}

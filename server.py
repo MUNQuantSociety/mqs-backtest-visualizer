@@ -12,6 +12,7 @@ import faulthandler
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 # Native TLS faults bypass Python exception handlers. Keep thread stacks
 # visible in the launching terminal without dumping locals or credentials.
@@ -25,7 +26,16 @@ from fastapi.responses import JSONResponse
 from src.api.router import api_router
 from src.core.config import settings
 from src.integrations.strategy_store import StrategyStoreError
+from src.services import auth as auth_service
 from src.workers.job_manager import application_lifespan
+
+
+@asynccontextmanager
+async def authenticated_lifespan(app):
+    auth_service.validate_configuration(settings)
+    async with application_lifespan(app):
+        yield
+
 
 app = FastAPI(
     title=settings.app_name,
@@ -37,7 +47,7 @@ app = FastAPI(
     # lifespan also builds the worker pool, in that order — the reconciler it
     # runs first has to find the tables it corrects. Without this, POST
     # /backtests would insert rows nothing ever picks up.
-    lifespan=application_lifespan,
+    lifespan=authenticated_lifespan,
 )
 
 # Browsers block :5173 → :8000 unless the API allows the frontend origin.
