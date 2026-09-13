@@ -1,5 +1,6 @@
 # Web layer
 fastapi>=0.115.0
+PyJWT[crypto]==2.14.0
 uvicorn[standard]>=0.32.0
 # Multipart form parsing for POST /strategies/upload (UploadFile).
 python-multipart>=0.0.9

@@ -37,7 +37,8 @@ async def _session_scope():
 
 @pytest.fixture
 def api(monkeypatch):
-    monkeypatch.setattr(current_user, "settings", SimpleNamespace(temporary_user_id=""))
+    monkeypatch.setattr(current_user, "settings", SimpleNamespace(temporary_user_id="", app_env="test", auth_allow_dev_identity=True,
+                                                               auth_cognito_issuer="", auth_cognito_client_id=""))
     monkeypatch.setattr(current_user, "session_scope", _session_scope)
     monkeypatch.setattr(
         current_user.user_creds_repo, "get_user",

@@ -23,8 +23,8 @@ class BacktestReport(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    # Identity is verified against the externally owned public.user_creds table
-    # at the API boundary. Schema creation must never manage that table.
+    # New owners are verified app.users identities. No FK or ID rewrite:
+    # completed reports retain legacy owners until an explicit migration.
     owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     strategy_key: Mapped[str] = mapped_column(Text, ForeignKey(f"{APP_SCHEMA}.strategies.key", ondelete="RESTRICT"), nullable=False)

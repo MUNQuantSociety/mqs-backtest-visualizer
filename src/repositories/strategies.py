@@ -1,22 +1,16 @@
-"""Database access for the strategy registry.
-
-Every SQL statement about strategies lives here. The interesting part is the
-aggregate query: the catalogue shows run count, best Sharpe, best return and
-last-run time per strategy, and computing those by loading runs into Python
-would mean reading every row of ``backtest_runs`` to render one page.
-"""
+"""Database access for the shared strategy registry, without private report activity."""
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Numeric, bindparam, cast, func, select, text, update
+from sqlalchemy import literal, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models import BacktestReport, Strategy
+from src.models import Strategy
 
 @dataclass(frozen=True)
 class StrategyRow:
@@ -29,38 +23,8 @@ class StrategyRow:
     last_run_at: datetime | None
 
 
-def _aggregate_subquery():
-    """Per-strategy run statistics, computed by PostgreSQL in one pass.
-
-    Validation runs are excluded: they are an implementation detail of the
-    upload flow, and counting them would tell a student their strategy has been
-    backtested once when they have never run it.
-    """
-    return (
-        select(
-            BacktestReport.strategy_key.label("strategy_key"),
-            func.count().label("run_count"),
-            func.max(cast(BacktestReport.results["sharpe"].astext, Numeric)).filter(
-                BacktestReport.results["metrics"]["unavailable"]["sharpe"].astext.is_(None)
-            ).label("best_sharpe"),
-            func.max(cast(BacktestReport.results["totalReturn"].astext, Numeric)).filter(
-                BacktestReport.results["metrics"]["unavailable"]["totalReturn"].astext.is_(None)
-            ).label("best_return"),
-            func.max(BacktestReport.created_at).label("last_run_at"),
-        )
-        .where(func.coalesce(BacktestReport.results["reportMetadata"]["purpose"].astext, "user") == "user")
-        .group_by(BacktestReport.strategy_key)
-        .subquery()
-    )
-
-
 def for_user(statement, owner_id: uuid.UUID | None):
-    """Owner-scoping seam.
-
-    The registry is shared — every student sees every strategy — so this is a
-    no-op today. It exists so the auth session has one obvious place to add a
-    filter instead of hunting through call sites.
-    """
+    """Strategy metadata is shared; private report data is never joined here."""
     return statement
 
 
@@ -70,7 +34,7 @@ async def list_strategies(
     include_disabled: bool = False,
     owner_id: uuid.UUID | None = None,
 ) -> list[StrategyRow]:
-    """Every strategy the catalogue should show, newest aggregates included."""
+    """Every shared strategy the catalogue should show."""
     statement = _catalogue_statement().order_by(Strategy.key)
     if not include_disabled:
         statement = statement.where(Strategy.enabled.is_(True))
@@ -94,15 +58,8 @@ async def get_strategy_row(
 
 
 def _catalogue_statement():
-    """Registry rows joined to their run aggregates. Filters are added by callers."""
-    aggregates = _aggregate_subquery()
-    return select(
-        Strategy,
-        func.coalesce(aggregates.c.run_count, 0),
-        aggregates.c.best_sharpe,
-        aggregates.c.best_return,
-        aggregates.c.last_run_at,
-    ).outerjoin(aggregates, aggregates.c.strategy_key == Strategy.key)
+    """Keep the public wire shape without exposing any owner's report activity."""
+    return select(Strategy, literal(0), literal(None), literal(None), literal(None))
 
 
 def _to_row(record) -> StrategyRow:
