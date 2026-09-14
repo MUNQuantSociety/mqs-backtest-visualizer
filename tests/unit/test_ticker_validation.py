@@ -286,3 +286,16 @@ def test_explicit_legacy_database_proof_does_not_contact_fmp(monkeypatch):
     request, coverage, create, dispatch = _submission(monkeypatch)
     assert asyncio.run(backtests.submit_backtest_run(request)) == "queued"
     coverage.assert_awaited_once();create.assert_awaited_once();dispatch.assert_awaited_once()
+
+
+def test_the_status_vocabulary_is_closed():
+    # The run form switches on this enum; a provider failure is a 503, never
+    # a third status the form has no branch for.
+    from pydantic import ValidationError
+
+    from src.schemas.market_data import TickerValidation
+
+    assert TickerValidation(ticker="AAPL", status="valid").status == "valid"
+    with pytest.raises(ValidationError):
+        TickerValidation(ticker="AAPL", status="error")
+    assert TickerValidation.model_json_schema()["properties"]["status"]["enum"] == ["valid", "unknown"]

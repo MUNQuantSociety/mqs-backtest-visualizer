@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+import uuid
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -67,6 +68,13 @@ class Strategy(Base):
     # editor reads the assembled ``strategy.py`` for those, which is exactly
     # what a member wrote.
     authoring: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    # Who uploaded it. NULL for the vendored built-ins, which nobody owns and
+    # nobody may delete through the API; set at upload for user strategies,
+    # and backfilled once from the validation run for rows older than the
+    # column (see ``src/db/init.py``). Not a foreign key: user_creds lives in
+    # ``public``, outside this schema, exactly as ``backtest_runs.owner_id``.
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
     # The run that proved an uploaded strategy works. ``use_alter`` because
     # strategies and backtest_runs reference each other; without it create_all

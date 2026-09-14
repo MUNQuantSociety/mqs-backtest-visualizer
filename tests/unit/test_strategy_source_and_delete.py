@@ -24,17 +24,19 @@ from src.services import strategies as strategies_service
 
 
 KEY = "user-momentum-abc12345"
+OWNER = uuid.UUID(int=1)
+SOMEONE_ELSE = uuid.UUID(int=2)
 
 
 @pytest.fixture
 def api() -> TestClient:
     app = FastAPI()
     app.include_router(router)
-    app.dependency_overrides[require_current_user] = lambda: uuid.UUID(int=1)
+    app.dependency_overrides[require_current_user] = lambda: OWNER
     return TestClient(app)
 
 
-def _row(storage_key: str | None) -> StrategyRow:
+def _row(storage_key: str | None, owner_id: uuid.UUID | None = OWNER) -> StrategyRow:
     return StrategyRow(
         strategy=SimpleNamespace(
             key=KEY,
@@ -49,6 +51,7 @@ def _row(storage_key: str | None) -> StrategyRow:
             validation_run_id=None,
             # NULL is how every uploaded-file strategy reads.
             authoring=None,
+            owner_id=owner_id,
         ),
         run_count=0,
         best_sharpe=None,
@@ -117,6 +120,17 @@ class TestGetSource:
         assert api.get(f"/strategies/{KEY}/source").status_code == 404
         store.get.assert_not_called()
 
+    def test_404_for_another_members_strategy(self, api, store, monkeypatch):
+        # Their source is theirs to edit. Indistinguishable from an unknown key
+        # on purpose, so the endpoint confirms nothing about other uploads.
+        _with_row(monkeypatch, _row("strategies/user-momentum-abc12345/", owner_id=SOMEONE_ELSE))
+
+        response = api.get(f"/strategies/{KEY}/source")
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": f"No stored source for strategy {KEY!r}."}
+        store.get.assert_not_called()
+
     def test_404_when_the_row_outlived_its_package(self, api, store, monkeypatch):
         _with_row(monkeypatch, _row("strategies/gone/"))
         store.get.side_effect = KeyError("strategy.py")
@@ -149,7 +163,9 @@ class TestDelete:
 
         assert response.status_code == 204
         assert response.content == b""
-        remove.assert_awaited_once_with(KEY)
+        # The caller's identity travels with the key: only their own uploads
+        # are theirs to remove.
+        remove.assert_awaited_once_with(KEY, owner_id=OWNER)
 
     def test_404_when_there_was_nothing_to_remove(self, api, monkeypatch):
         monkeypatch.setattr(
@@ -164,7 +180,7 @@ class TestDelete:
 
         key = str(uuid.uuid4())
         assert api.delete(f"/strategies/{key}").status_code == 204
-        remove.assert_awaited_once_with(key)
+        remove.assert_awaited_once_with(key, owner_id=OWNER)
 
     def test_409_when_runs_still_reference_the_strategy(self, api, monkeypatch):
         monkeypatch.setattr(
@@ -197,7 +213,23 @@ class TestDelete:
         )
 
         with pytest.raises(strategies_service.StrategyInUse):
-            asyncio.run(strategies_service.delete_strategy(KEY))
+            asyncio.run(strategies_service.delete_strategy(KEY, owner_id=OWNER))
+        discard.assert_not_called()
+
+    def test_the_service_scopes_the_repository_delete_to_the_owner(self, monkeypatch):
+        repo_delete = AsyncMock(return_value=False)
+        monkeypatch.setattr(strategies_service, "ensure_schema", AsyncMock())
+        monkeypatch.setattr(strategies_service, "session_scope", _NullSession)
+        monkeypatch.setattr(strategies_service.strategies_repo, "delete_strategy", repo_delete)
+        discard = Mock()
+        monkeypatch.setattr(strategies_service.strategy_validation, "discard_stored_source", discard)
+
+        removed = asyncio.run(strategies_service.delete_strategy(KEY, owner_id=OWNER))
+
+        assert removed is False
+        repo_delete.assert_awaited_once()
+        assert repo_delete.await_args.kwargs == {"owner_id": OWNER}
+        # Nothing was removed, so nothing in the store is touched either.
         discard.assert_not_called()
 
 

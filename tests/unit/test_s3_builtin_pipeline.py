@@ -139,9 +139,9 @@ async def fake_session():
     yield None
 
 
-def registry_row(key, storage_key):
+def registry_row(key, storage_key, class_path="example.Strategy"):
     return StrategyRow(SimpleNamespace(
-        key=key, name=key, class_path="example.Strategy", description="", status="active",
+        key=key, name=key, class_path=class_path, description="", status="active",
         tags=[], param_specs=[], universe=["AAPL"], validation_run_id=None,
         storage_key=storage_key, enabled=True,
         # NULL, like every row not authored as a fragment.
@@ -162,6 +162,19 @@ def test_catalogue_is_registered_complete_s3_packages_not_arbitrary_objects(stor
     reply = asyncio.run(strategies.list_strategies())
     assert [item.id for item in reply.items] == ["portfolio_1", "portfolio_2"]
     assert reply.total == 2
+
+
+def test_local_catalogue_offers_vendored_builtins_but_not_packageless_uploads(monkeypatch):
+    monkeypatch.setattr(strategies, "settings", replace(strategies.settings, strategy_store_backend="local"))
+    rows = [
+        registry_row("portfolio_1", None),  # vendored: loads from class_path
+        registry_row("user-lost-package", None, class_path=None),  # nothing to load
+    ]
+    monkeypatch.setattr(strategies, "ensure_schema", AsyncMock())
+    monkeypatch.setattr(strategies, "session_scope", fake_session)
+    monkeypatch.setattr(strategies.strategies_repo, "list_strategies", AsyncMock(return_value=rows))
+    reply = asyncio.run(strategies.list_strategies())
+    assert [item.id for item in reply.items] == ["portfolio_1"]
 
 
 def test_storage_outage_is_not_reported_as_missing(stored, monkeypatch):

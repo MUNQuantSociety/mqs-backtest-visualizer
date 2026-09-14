@@ -373,3 +373,41 @@ class TestSubmitAssemblyIsChecked:
             assemble_checked(
                 StrategyDraft(body="pass", indicators=(IndicatorSpec("a b", "X", {}),))
             )
+
+
+class TestIndicatorParameterDefaults:
+    """``kwargs.get(name, default)`` is the whole signature of an indicator."""
+
+    @staticmethod
+    def _params(body: str):
+        from src.services.strategy_validation.scanning import indicator_parameters
+
+        return indicator_parameters(
+            "class X(Indicator):\n    def __init__(self, **kwargs):\n" + body
+        )
+
+    @pytest.mark.parametrize(
+        "literal, expected",
+        [
+            ("14", 14),
+            ("-1", -1),
+            ("[5, 10]", [5, 10]),
+            ("(1, 2)", (1, 2)),
+            ('{"a": 1}', {"a": 1}),
+            ("None", None),
+        ],
+    )
+    def test_every_literal_default_is_read(self, literal, expected):
+        assert self._params(f"        self.p = kwargs.get('period', {literal})\n") == [
+            ("period", expected)
+        ]
+
+    @pytest.mark.parametrize("expression", ["DEFAULT", "compute()", "a + b"])
+    def test_a_default_that_needs_evaluation_stays_unknown(self, expression):
+        # Unknowable without running the module; the editor asks instead.
+        assert self._params(f"        self.p = kwargs.get('period', {expression})\n") == [
+            ("period", None)
+        ]
+
+    def test_a_parameter_with_no_default_stays_unknown(self):
+        assert self._params("        self.p = kwargs.get('period')\n") == [("period", None)]

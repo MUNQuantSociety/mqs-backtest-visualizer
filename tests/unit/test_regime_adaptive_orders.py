@@ -16,7 +16,7 @@ import pandas as pd
 from engine.strategies.portfolio_3.strategy import RegimeAdaptiveStrategy
 
 
-def decide(*, position: float, price: float, entry_price: float | None = None):
+def decide(*, position: float, price: float, entry_price: float | None = None, momentum: float = -5.0):
     """Drive one OnData bar for AAPL in a calm, low-volatility regime."""
     calls = []
     strategy = RegimeAdaptiveStrategy.__new__(RegimeAdaptiveStrategy)
@@ -33,9 +33,9 @@ def decide(*, position: float, price: float, entry_price: float | None = None):
     strategy.vwap = {"AAPL": ready(100.0)}
     strategy.atr = {"AAPL": ready(1.0)}
     strategy.sma50 = {"AAPL": ready(100.0)}
-    # Momentum well under -MOMENTUM_THRESHOLD: a bearish signal in the
-    # low-volatility (momentum) regime.
-    strategy.momentum_pct = {"AAPL": ready(-5.0)}
+    # Default momentum well under -MOMENTUM_THRESHOLD: a bearish signal in
+    # the low-volatility (momentum) regime; +5 flips it bullish.
+    strategy.momentum_pct = {"AAPL": ready(momentum)}
     strategy.vix_ema = ready(15.0)
 
     context = SimpleNamespace(
@@ -71,3 +71,11 @@ def test_a_stop_loss_exit_also_closes_rather_than_shorting():
     calls = decide(position=100, price=99.0, entry_price=110.0)
 
     assert calls == [("sell", "AAPL")]
+
+
+def test_a_first_entry_is_sized_to_the_configured_weight_not_an_equal_share():
+    # portfolio_weights says AAPL is half the book. With one tradeable name the
+    # equal-share fallback (1/n) would size it to the whole book instead.
+    calls = decide(position=0, price=101.0, momentum=5.0)
+
+    assert calls == [("execute", "BUY", "AAPL", {"ticker_weight": 0.5})]

@@ -47,10 +47,12 @@ class CoverageResponse(CamelModel):
 
 
 class TickerValidation(CamelModel):
-    """Whether a ticker has market data available to the run engine."""
+    """Whether FMP recognizes a ticker as an exact symbol."""
 
     ticker: str
-    status: str
+    # Closed on purpose: the OpenAPI enum is what the run form switches on.
+    # A provider failure is a 503, never a third status.
+    status: Literal["valid", "unknown"]
 
 
 class TickerValidationResponse(CamelModel):

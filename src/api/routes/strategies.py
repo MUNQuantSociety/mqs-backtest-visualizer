@@ -320,7 +320,7 @@ async def list_indicators() -> IndicatorCatalogue:
 
 @router.get("/{key}/source", response_model=StrategySource)
 async def get_strategy_source(
-    key: str, _owner_id: uuid.UUID = Depends(require_current_user)
+    key: str, owner_id: uuid.UUID = Depends(require_current_user)
 ) -> StrategySource:
     """The Python a saved strategy was registered with, for the editor.
 
@@ -331,12 +331,14 @@ async def get_strategy_source(
     ``GET /strategies/template`` so a client can load either into the same
     editor.
 
-    404 when the key is unknown **or** when the row has no stored package —
-    the built-ins that ship with the engine were never uploaded, so there is
-    no source of theirs to hand out. The file is read as text and never
-    imported: a GET must not execute uploaded code.
+    404 when the key is unknown, when the strategy is another member's, **or**
+    when the row has no stored package — the built-ins that ship with the
+    engine were never uploaded, so there is no source of theirs to hand out.
+    One answer for all three, so the endpoint confirms nothing about keys
+    that are not the caller's. The file is read as text and never imported: a
+    GET must not execute uploaded code.
     """
-    source = await strategies_service.get_strategy_source(key)
+    source = await strategies_service.get_strategy_source(key, owner_id=owner_id)
     if source is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -347,7 +349,7 @@ async def get_strategy_source(
 
 @router.delete("/{key}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_strategy(
-    key: str, _owner_id: uuid.UUID = Depends(require_current_user)
+    key: str, owner_id: uuid.UUID = Depends(require_current_user)
 ) -> Response:
     """Remove a strategy from the registry, and its stored source with it.
 
@@ -366,7 +368,7 @@ async def delete_strategy(
     service raises :class:`StrategyInUse` for that case.
     """
     try:
-        removed = await strategies_service.delete_strategy(key)
+        removed = await strategies_service.delete_strategy(key, owner_id=owner_id)
     except StrategyInUse as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -377,9 +379,11 @@ async def delete_strategy(
         ) from exc
 
     if not removed:
+        # Unknown, another member's, or a built-in: one answer for all three.
+        # Only the caller's own uploads are theirs to remove.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No strategy with id {key!r}.",
+            detail=f"No strategy of yours with id {key!r}.",
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
