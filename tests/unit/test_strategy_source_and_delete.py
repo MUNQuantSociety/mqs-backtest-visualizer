@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 
+from src.api.dependencies.current_user import require_current_user
 from src.api.routes.strategies import router
 from src.repositories.strategies import StrategyRow
 from src.schemas.strategies import Strategy
@@ -29,6 +30,7 @@ KEY = "user-momentum-abc12345"
 def api() -> TestClient:
     app = FastAPI()
     app.include_router(router)
+    app.dependency_overrides[require_current_user] = lambda: uuid.UUID(int=1)
     return TestClient(app)
 
 

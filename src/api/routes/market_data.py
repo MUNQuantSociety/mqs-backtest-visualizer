@@ -7,12 +7,11 @@ Provider errors are reported separately from tickers with no history.
 from __future__ import annotations
 
 import uuid
-from fastapi import APIRouter, HTTPException, Query, status
 
-from src.schemas.market_data import (
-    CoverageResponse,
-    TickerValidationResponse,
-)
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+from src.api.dependencies.current_user import require_current_user
+from src.schemas.market_data import CoverageResponse, TickerValidationResponse
 from src.services import market_data as market_data_service
 from src.services.market_data import FMPUnavailable
 
@@ -21,33 +20,16 @@ router = APIRouter(prefix="/market-data", tags=["market-data"])
 
 @router.get("/validate-tickers", response_model=TickerValidationResponse)
 async def validate_tickers(
-    tickers: str = Query(..., description="Comma-separated ticker symbols."),
+    tickers: str = Query(max_length=1100, description="1 to 50 comma-separated FMP ticker symbols."),
+    _owner_id: uuid.UUID = Depends(require_current_user),
 ) -> TickerValidationResponse:
-    """Check explicitly entered tickers before they join a run universe."""
-    requested = list(
-        dict.fromkeys(
-            part.strip().upper() for part in tickers.split(",") if part.strip()
-        )
-    )
-    if not requested:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Pass at least one ticker.",
-        )
-
+    """Check exact FMP symbols before adding them to a backtest universe."""
     try:
-        coverage = await market_data_service.coverage_for(requested)
+        return await market_data_service.validate_tickers(tickers.split(","))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     except FMPUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
-
-    unknown = set(coverage.missing)
-    return TickerValidationResponse(
-        tickers=[
-            {"ticker": ticker, "status": "unknown" if ticker in unknown else "valid"}
-            for ticker in requested
-        ],
-        unknown=[ticker for ticker in requested if ticker in unknown],
-    )
 
 
 @router.get("/coverage", response_model=CoverageResponse)

@@ -294,7 +294,9 @@ def check_draft(request: StrategyDraftRequest) -> StrategyCheckResult:
     )
 
 
-async def submit_draft(submission: StrategyDraftSubmission) -> StrategySubmissionResult:
+async def submit_draft(
+    submission: StrategyDraftSubmission, *, owner_id: uuid.UUID | None = None
+) -> StrategySubmissionResult:
     """Assemble a fragment and submit it exactly as an uploaded file.
 
     The whole point is the delegation: once assembled there is nothing special
@@ -336,6 +338,7 @@ async def submit_draft(submission: StrategyDraftSubmission) -> StrategySubmissio
             "indicators": [spec.model_dump() for spec in submission.indicators],
             "state": dict(submission.state),
         },
+        owner_id=owner_id,
     )
 
 

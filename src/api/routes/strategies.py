@@ -159,6 +159,7 @@ async def check_strategy_draft(request: StrategyDraftRequest) -> StrategyCheckRe
 )
 async def submit_strategy_draft(
     submission: StrategyDraftSubmission,
+    owner_id: uuid.UUID = Depends(require_current_user),
 ) -> StrategySubmissionResult:
     """``POST /strategies`` for a fragment.
 
@@ -174,7 +175,7 @@ async def submit_strategy_draft(
         )
 
     try:
-        return await strategies_service.submit_draft(submission)
+        return await strategies_service.submit_draft(submission, owner_id=owner_id)
     except ScaffoldEscape as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
@@ -318,7 +319,9 @@ async def list_indicators() -> IndicatorCatalogue:
 
 
 @router.get("/{key}/source", response_model=StrategySource)
-async def get_strategy_source(key: str) -> StrategySource:
+async def get_strategy_source(
+    key: str, _owner_id: uuid.UUID = Depends(require_current_user)
+) -> StrategySource:
     """The Python a saved strategy was registered with, for the editor.
 
     Uploads put their source in the store and, until this existed, nothing
@@ -343,7 +346,9 @@ async def get_strategy_source(key: str) -> StrategySource:
 
 
 @router.delete("/{key}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_strategy(key: str) -> Response:
+async def delete_strategy(
+    key: str, _owner_id: uuid.UUID = Depends(require_current_user)
+) -> Response:
     """Remove a strategy from the registry, and its stored source with it.
 
     Exposed for the failed and abandoned uploads a student accumulates while

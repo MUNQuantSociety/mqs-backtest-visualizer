@@ -49,8 +49,9 @@ services:
     ports:
       # 5433 on the host, not 5432: a machine that already runs Postgres for
       # something else would otherwise fail to bind, and the error ("port is
-      # already allocated") sends people debugging the wrong thing.
-      - "5433:5432"
+      # already allocated") sends people debugging the wrong thing. Loopback
+      # only: the password above is public, so the port must not be.
+      - "127.0.0.1:5433:5432"
     volumes:
       - mqs-dev-db:/var/lib/postgresql/data
       # Runs once, and only while the volume above is empty. `docker compose
@@ -59,8 +60,16 @@ services:
     healthcheck:
       # -d/-U matter: bare `pg_isready` checks the server is listening, which
       # is true seconds before the init scripts have finished creating the
-      # table. This form only passes once the named database accepts queries.
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U mqs -d mqsdb"]
+      # tables. Even the named database accepting queries is not enough — the
+      # entrypoint runs the init SQL after that — so the check also asks for
+      # the last table each script creates.
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -h 127.0.0.1 -U mqs -d mqsdb &&
+          psql -h 127.0.0.1 -U mqs -d mqsdb -tAc
+          "SELECT to_regclass('public.market_data') IS NOT NULL
+          AND to_regclass('public.user_creds') IS NOT NULL" | grep -qx t
       interval: 3s
       timeout: 3s
       retries: 20

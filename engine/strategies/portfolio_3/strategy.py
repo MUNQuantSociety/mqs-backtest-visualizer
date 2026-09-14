@@ -273,13 +273,6 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     )
                     continue
 
-                if signal == "SELL" and current_weight <= -(target_weight * 0.9):
-                    self.logger.debug(
-                        f"[{ticker}] SELL suppressed: weight {current_weight:.3f} "
-                        f"<= {-(target_weight * 0.9):.3f} (already at/near target short)"
-                    )
-                    continue
-
                 
                 # Compute is_reversal once so it is available in both confidence and logging.
                 # Confidence calculation:
@@ -355,9 +348,12 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                         self.entry_regime[ticker] = "high_vol" if is_high_vol else "low_vol"
 
                     elif signal == "SELL":
-                        context.execute(
-                            ticker, "SELL", confidence, ticker_weight=sizing_weight
-                        )
+                        # Close toward flat, never through it. ``execute`` keeps
+                        # the executor's signal model, where a SELL targets
+                        # minus ``ticker_weight`` — a short, which the guard
+                        # above ("sell signals only close existing longs")
+                        # promises never to open. ``sell`` targets weight 0.
+                        context.sell(ticker, confidence)
                         # Record completed trade result for history_factor scaling.
                         if ticker in self.entry_price:
                             pnl = latest_price - self.entry_price[ticker]

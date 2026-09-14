@@ -420,6 +420,50 @@ def known_indicators() -> frozenset[str]:
     return frozenset(names)
 
 
+@lru_cache(maxsize=1)
+def reserved_attributes() -> frozenset[str]:
+    """Every name ``BasePortfolio`` already owns on an instance, read from source.
+
+    ``STATE`` and ``INDICATORS`` entries become instance attributes through
+    ``setattr``, after ``__init__`` has bound the executor, the tickers and
+    the rest. A draft naming one of those would silently replace it, and the
+    failure would surface as a broken platform in the validation run rather
+    than as the member's mistake. Parsed, not imported, like the indicators:
+    the class body's own names plus every ``self.<name>`` the class assigns.
+    """
+    try:
+        spec = importlib.util.find_spec("engine.strategies.portfolio_BASE.strategy")
+    except (ImportError, ValueError):  # pragma: no cover - engine is vendored
+        return frozenset()
+    if spec is None or not spec.origin:  # pragma: no cover - engine is vendored
+        return frozenset()
+    try:
+        tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):  # pragma: no cover - vendored source
+        return frozenset()
+
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "BasePortfolio":
+            continue
+        for member in node.body:
+            if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef):
+                names.add(member.name)
+            elif isinstance(member, ast.Assign):
+                names.update(t.id for t in member.targets if isinstance(t, ast.Name))
+            elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+                names.add(member.target.id)
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Attribute)
+                and isinstance(sub.ctx, ast.Store)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id == "self"
+            ):
+                names.add(sub.attr)
+    return frozenset(names)
+
+
 def _indicator_issues(strategy: ast.ClassDef) -> list[CompatibilityIssue]:
     """Indicator names the engine does not have, wherever the class names them.
 

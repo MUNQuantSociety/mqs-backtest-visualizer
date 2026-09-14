@@ -93,9 +93,11 @@ class FMPMarketData:
                 if (code == 429 or code >= 500) and attempt == 0:
                     time.sleep(0.5)
                     continue
-                if code == 404:
+                if code == 404 and endpoint == ENDPOINT:
+                    # Only a history request answers "no such symbol" with a
+                    # 404. A symbol lookup 404 is a provider fault like any other.
                     raise FMPSymbolUnknown(
-                        f"FMP has no history for {ticker} (HTTP 404). Check the symbol."
+                        f"FMP has no {label} (HTTP 404). Check the symbol."
                     ) from None
                 advice = {
                     401: "Check FMP_API_KEY in the backend .env.",

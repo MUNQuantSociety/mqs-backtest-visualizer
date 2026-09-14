@@ -35,10 +35,11 @@ Three details are load-bearing, each learned from a query in this repo:
   whatever days exist rather than asserting a calendar.
 
 Writes are idempotent (``ON CONFLICT (ticker, timestamp) DO NOTHING``), so
-re-running extends coverage rather than duplicating it. An extension picks the
-walk up from the last stored close, so the join is continuous; a run that
-*backfills* days older than everything stored still leaves a seam at the far
-end, because there is no earlier close to anchor to.
+re-running extends coverage rather than duplicating it. Days the table already
+holds are skipped rather than regenerated, and an extension picks the walk up
+from the last stored close, so the join is continuous; a run that *backfills*
+days older than everything stored still leaves a seam at the far end, because
+there is no earlier close to anchor to.
 """
 
 from __future__ import annotations
@@ -107,6 +108,12 @@ def trading_days(end: date, count: int) -> list[date]:
     return sorted(days)
 
 
+STORED_DAYS_SQL = """
+    SELECT DISTINCT (timestamp AT TIME ZONE 'America/New_York')::date
+    FROM public.market_data
+    WHERE ticker = %s
+"""
+
 LAST_CLOSE_SQL = """
     SELECT close_price
     FROM public.market_data
@@ -116,6 +123,12 @@ LAST_CLOSE_SQL = """
 """
 
 
+def stored_days(cursor, ticker: str) -> set[date]:
+    """Every New York calendar date that already has at least one bar."""
+    cursor.execute(STORED_DAYS_SQL, (ticker,))
+    return {row[0] for row in cursor.fetchall()}
+
+
 def last_close_before(cursor, ticker: str, moment: datetime) -> float | None:
     """The close of the newest stored bar before ``moment``, if there is one."""
     cursor.execute(LAST_CLOSE_SQL, (ticker, moment))
@@ -123,6 +136,31 @@ def last_close_before(cursor, ticker: str, moment: datetime) -> float | None:
     if row is None or row[0] is None:
         return None
     return float(row[0])
+
+
+def missing_runs(days: list[date], stored: set[date]) -> list[list[date]]:
+    """The requested days not yet stored, grouped into contiguous runs.
+
+    Contiguous in the requested list, not the calendar: two missing days
+    with a stored one between them are two runs, each of which the caller
+    anchors to the close just before it. Stored days are dropped here rather
+    than regenerated and left to ``ON CONFLICT``: the walk over them would
+    diverge from what the table holds, and the first genuinely new bar would
+    then continue from a discarded price instead of the real last close — a
+    seam exactly where an extension should join. A day with any bar counts
+    as stored; a partial day is left to ``ON CONFLICT``.
+    """
+    runs: list[list[date]] = []
+    open_run = False
+    for day in days:
+        if day in stored:
+            open_run = False
+            continue
+        if not open_run:
+            runs.append([])
+            open_run = True
+        runs[-1].append(day)
+    return runs
 
 
 def bars_for_ticker(
@@ -258,9 +296,6 @@ def main() -> int:
 
     end = args.end or datetime.now(NY).date()
     days = trading_days(end, args.days)
-    # The instant the new range begins; anything stored before it is the
-    # series this run continues.
-    first_stamp = datetime.combine(days[0], BAR_TIMES[0], tzinfo=NY)
 
     print(
         f"Seeding {len(tickers)} tickers x {len(days)} trading days "
@@ -279,14 +314,22 @@ def main() -> int:
                 # then the full universe writes two incompatible AAPL series
                 # that ON CONFLICT DO NOTHING then keeps side by side.
                 rng = random.Random(f"{args.seed}:{ticker}")
-                # Continue the stored series when there is one, so an
-                # extension run does not cliff back to SEED_PRICES.
-                start_price = last_close_before(cursor, ticker, first_stamp)
-                rows = bars_for_ticker(ticker, days, rng, start_price)
+                # Each run of missing days continues from the close stored
+                # just before it; days the table holds are not regenerated at
+                # all. A run with nothing before it (a backfill) has no close
+                # to anchor to and restarts from SEED_PRICES, leaving the seam
+                # the module docstring describes.
+                runs = missing_runs(days, stored_days(cursor, ticker))
+                rows: list[tuple] = []
+                for run in runs:
+                    first_stamp = datetime.combine(run[0], BAR_TIMES[0], tzinfo=NY)
+                    start_price = last_close_before(cursor, ticker, first_stamp)
+                    rows += bars_for_ticker(ticker, run, rng, start_price)
                 # Chunked so one ticker-year is a handful of round trips
                 # rather than one statement with tens of thousands of tuples.
                 execute_values(cursor, INSERT_SQL, rows, page_size=1000)
-                print(f"  {ticker:<6} {len(rows):>6} bars")
+                skipped = len(days) - sum(len(run) for run in runs)
+                print(f"  {ticker:<6} {len(rows):>6} bars" + (f" ({skipped} stored days skipped)" if skipped else ""))
         connection.commit()
 
     print(f"Done. {len(tickers) * len(days) * len(BAR_TIMES)} bars offered to the table.")

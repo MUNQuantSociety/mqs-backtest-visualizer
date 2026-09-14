@@ -117,7 +117,9 @@ def test_an_unknown_symbol_answered_with_404_is_missing_history_not_an_outage(mo
     assert "test-secret-key" not in str(caught.value)
 
 
-def test_validate_tickers_reports_a_404_symbol_as_unknown_and_a_503_as_an_outage(monkeypatch):
+def test_coverage_reports_a_404_symbol_as_missing_and_a_503_as_an_outage(monkeypatch):
+    # validate-tickers recognizes symbols by lookup, never by history; the
+    # 404-from-history distinction is coverage's alone.
     app = FastAPI()
     app.include_router(market_data.router)
     client = TestClient(app)
@@ -131,14 +133,12 @@ def test_validate_tickers_reports_a_404_symbol_as_unknown_and_a_503_as_an_outage
 
     monkeypatch.setattr(fmp.FMPMarketData, "get_historical_data", history)
 
-    response = client.get("/market-data/validate-tickers", params={"tickers": "CRWV,NOPE"})
+    response = client.get("/market-data/coverage", params={"tickers": "CRWV,NOPE"})
     assert response.status_code == 200
-    assert response.json() == {
-        "tickers": [{"ticker": "CRWV", "status": "valid"}, {"ticker": "NOPE", "status": "unknown"}],
-        "unknown": ["NOPE"],
-    }
+    assert response.json()["missing"] == ["NOPE"]
+    assert response.json()["start"] is None
 
-    response = client.get("/market-data/validate-tickers", params={"tickers": "CRWV,DOWN"})
+    response = client.get("/market-data/coverage", params={"tickers": "CRWV,DOWN"})
     assert response.status_code == 503
 
 
