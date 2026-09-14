@@ -73,6 +73,11 @@ class TestCheckDraft:
         )
 
         assert response.status_code in (413, 422)
+        if response.status_code == 413:
+            assert response.json()["detail"] == (
+                f"The body is {MAX_BODY_BYTES * len('x = 1\n')} bytes; "
+                f"the limit is {MAX_BODY_BYTES}."
+            )
 
     def test_a_bad_attribute_name_is_a_field_error(self, api):
         # `self.not an identifier[...]` could not parse, so it is refused as a

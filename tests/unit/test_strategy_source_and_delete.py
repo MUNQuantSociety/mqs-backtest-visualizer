@@ -102,7 +102,9 @@ class TestGetSource:
     def test_404_for_an_unknown_key(self, api, store, monkeypatch):
         _with_row(monkeypatch, None)
 
-        assert api.get(f"/strategies/{KEY}/source").status_code == 404
+        response = api.get(f"/strategies/{KEY}/source")
+        assert response.status_code == 404
+        assert response.json()["detail"] == f"No stored source for strategy {KEY!r}."
         store.get.assert_not_called()
 
     def test_404_for_a_built_in_with_no_stored_package(self, api, store, monkeypatch):
@@ -151,7 +153,9 @@ class TestDelete:
             strategies_service, "delete_strategy", AsyncMock(return_value=False)
         )
 
-        assert api.delete(f"/strategies/{KEY}").status_code == 404
+        response = api.delete(f"/strategies/{KEY}")
+        assert response.status_code == 404
+        assert response.json()["detail"] == f"No strategy with id {KEY!r}."
 
     def test_a_uuid_shaped_key_is_still_just_a_key(self, api, monkeypatch):
         remove = AsyncMock(return_value=True)

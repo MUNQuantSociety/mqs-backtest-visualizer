@@ -7,8 +7,10 @@ Backed by the ``app.strategies`` registry through
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError
 
@@ -34,7 +36,30 @@ from src.services import strategies as strategies_service
 from src.services.strategy_validation import ScaffoldEscape, StrategyValidationError
 from src.services.strategy_validation.scanning import indicator_parameters, indicator_sources
 
-router = APIRouter(prefix="/strategies", tags=["strategies"])
+class StrategyRouteError(Exception):
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(detail)
+
+
+class StrategyErrorRoute(APIRoute):
+    def get_route_handler(self) -> Callable:
+        handler = super().get_route_handler()
+
+        async def strategy_error_route_handler(request):
+            try:
+                return await handler(request)
+            except StrategyRouteError as exc:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.detail,
+                ) from exc
+
+        return strategy_error_route_handler
+
+
+router = APIRouter(prefix="/strategies", tags=["strategies"], route_class=StrategyErrorRoute)
 
 
 @router.get("", response_model=StrategyListResponse)
@@ -69,7 +94,7 @@ async def submit_strategy(submission: StrategySubmission, owner_id: uuid.UUID = 
     """
     size = len(submission.source.encode("utf-8"))
     if size > MAX_SOURCE_BYTES:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"Strategy source is {size} bytes; the limit is {MAX_SOURCE_BYTES}.",
         )
@@ -79,7 +104,7 @@ async def submit_strategy(submission: StrategySubmission, owner_id: uuid.UUID = 
     except StrategyValidationError as exc:
         # ``detail`` is a plain string, not FastAPI's list of error objects:
         # the client shows it verbatim in the editor's error slot.
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
 
@@ -115,7 +140,7 @@ async def check_strategy(request: StrategyCheckRequest) -> StrategyCheckResult:
     """
     size = len(request.source.encode("utf-8"))
     if size > MAX_SOURCE_BYTES:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"Strategy source is {size} bytes; the limit is {MAX_SOURCE_BYTES}.",
         )
@@ -139,7 +164,7 @@ async def check_strategy_draft(request: StrategyDraftRequest) -> StrategyCheckRe
     """
     size = len(request.body.encode("utf-8"))
     if size > MAX_BODY_BYTES:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"The body is {size} bytes; the limit is {MAX_BODY_BYTES}.",
         )
@@ -149,7 +174,7 @@ async def check_strategy_draft(request: StrategyDraftRequest) -> StrategyCheckRe
     except ScaffoldEscape as exc:
         # Not an issue to render beside a line: the fragment broke out of the
         # method it was given, and there is nothing in it to point at.
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
 
@@ -168,7 +193,7 @@ async def submit_strategy_draft(
     """
     size = len(submission.body.encode("utf-8"))
     if size > MAX_BODY_BYTES:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"The body is {size} bytes; the limit is {MAX_BODY_BYTES}.",
         )
@@ -176,11 +201,11 @@ async def submit_strategy_draft(
     try:
         return await strategies_service.submit_draft(submission)
     except ScaffoldEscape as exc:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
     except StrategyValidationError as exc:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
 
@@ -204,7 +229,7 @@ async def _read_source_file(upload: UploadFile) -> tuple[str, str]:
     """
     filename = (upload.filename or "").strip()
     if not filename.lower().endswith(_SOURCE_SUFFIX):
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 f"Expected a Python file ending in {_SOURCE_SUFFIX}, got "
@@ -217,12 +242,12 @@ async def _read_source_file(upload: UploadFile) -> tuple[str, str]:
     raw = await upload.read(MAX_SOURCE_BYTES + 1)
     await upload.close()
     if len(raw) > MAX_SOURCE_BYTES:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"{filename} is over the {MAX_SOURCE_BYTES} byte limit.",
         )
     if not raw.strip():
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"{filename} is empty.",
         )
@@ -230,7 +255,7 @@ async def _read_source_file(upload: UploadFile) -> tuple[str, str]:
     try:
         return raw.decode("utf-8"), filename
     except UnicodeDecodeError as exc:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"{filename} is not UTF-8 text (byte {exc.start}).",
         ) from exc
@@ -276,7 +301,7 @@ async def submit_strategy_file(
     except ValidationError as exc:
         # One sentence, not Pydantic's list: the first problem is enough to act on.
         first = exc.errors()[0]
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"{'.'.join(str(p) for p in first['loc'])}: {first['msg']}",
         ) from exc
@@ -284,7 +309,7 @@ async def submit_strategy_file(
     try:
         return await strategies_service.submit_strategy(submission, owner_id=owner_id)
     except StrategyValidationError as exc:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
 
@@ -335,7 +360,7 @@ async def get_strategy_source(key: str) -> StrategySource:
     """
     source = await strategies_service.get_strategy_source(key)
     if source is None:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No stored source for strategy {key!r}.",
         )
@@ -362,7 +387,7 @@ async def delete_strategy(key: str) -> Response:
     try:
         removed = await strategies_service.delete_strategy(key)
     except IntegrityError as exc:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"{key!r} has backtests recorded against it, so it cannot be "
@@ -371,7 +396,7 @@ async def delete_strategy(key: str) -> Response:
         ) from exc
 
     if not removed:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No strategy with id {key!r}.",
         )
@@ -393,7 +418,7 @@ async def get_strategy(key: str) -> Strategy:
     """
     strategy = await strategies_service.get_strategy(key)
     if strategy is None:
-        raise HTTPException(
+        raise StrategyRouteError(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No strategy with id {key!r}.",
         )
