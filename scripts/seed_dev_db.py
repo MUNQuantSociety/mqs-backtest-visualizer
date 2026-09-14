@@ -36,8 +36,10 @@ Three details are load-bearing, each learned from a query in this repo:
 
 Writes are idempotent (``ON CONFLICT (ticker, timestamp) DO NOTHING``), so
 re-running extends coverage rather than duplicating it. Days the table already
-holds are skipped rather than regenerated, and an extension picks the walk up
-from the last stored close, so the join is continuous; a run that *backfills*
+holds are skipped rather than regenerated — bar by bar, so a day an
+interrupted seed left half-written is completed rather than skipped — and an
+extension picks the walk up from the last stored close, so the join is
+continuous; a run that *backfills*
 days older than everything stored still leaves a seam at the far end, because
 there is no earlier close to anchor to.
 """
@@ -108,8 +110,9 @@ def trading_days(end: date, count: int) -> list[date]:
     return sorted(days)
 
 
-STORED_DAYS_SQL = """
-    SELECT DISTINCT (timestamp AT TIME ZONE 'America/New_York')::date
+STORED_BARS_SQL = """
+    SELECT (timestamp AT TIME ZONE 'America/New_York')::date,
+           (timestamp AT TIME ZONE 'America/New_York')::time
     FROM public.market_data
     WHERE ticker = %s
 """
@@ -122,11 +125,13 @@ LAST_CLOSE_SQL = """
     LIMIT 1
 """
 
+Slot = tuple[date, time]
 
-def stored_days(cursor, ticker: str) -> set[date]:
-    """Every New York calendar date that already has at least one bar."""
-    cursor.execute(STORED_DAYS_SQL, (ticker,))
-    return {row[0] for row in cursor.fetchall()}
+
+def stored_bars(cursor, ticker: str) -> set[Slot]:
+    """Every (New York date, bar time) that already has a row."""
+    cursor.execute(STORED_BARS_SQL, (ticker,))
+    return {(day, moment) for day, moment in cursor.fetchall()}
 
 
 def last_close_before(cursor, ticker: str, moment: datetime) -> float | None:
@@ -138,38 +143,44 @@ def last_close_before(cursor, ticker: str, moment: datetime) -> float | None:
     return float(row[0])
 
 
-def missing_runs(days: list[date], stored: set[date]) -> list[list[date]]:
-    """The requested days not yet stored, grouped into contiguous runs.
+def requested_slots(days: list[date]) -> list[Slot]:
+    """Every bar the run would write, in time order."""
+    return [(day, bar_time) for day in days for bar_time in BAR_TIMES]
 
-    Contiguous in the requested list, not the calendar: two missing days
-    with a stored one between them are two runs, each of which the caller
-    anchors to the close just before it. Stored days are dropped here rather
-    than regenerated and left to ``ON CONFLICT``: the walk over them would
+
+def missing_runs(days: list[date], stored: set[Slot]) -> list[list[Slot]]:
+    """The requested bars not yet stored, grouped into contiguous runs.
+
+    Bars, not days: a day an interrupted seed left half-written is completed
+    from its last stored bar rather than skipped or regenerated. Contiguous
+    in the requested sequence, not the calendar — two missing bars with a
+    stored one between them are two runs, each of which the caller anchors
+    to the close just before it. Stored bars are dropped here rather than
+    regenerated and left to ``ON CONFLICT``: the walk over them would
     diverge from what the table holds, and the first genuinely new bar would
     then continue from a discarded price instead of the real last close — a
-    seam exactly where an extension should join. A day with any bar counts
-    as stored; a partial day is left to ``ON CONFLICT``.
+    seam exactly where an extension should join.
     """
-    runs: list[list[date]] = []
+    runs: list[list[Slot]] = []
     open_run = False
-    for day in days:
-        if day in stored:
+    for slot in requested_slots(days):
+        if slot in stored:
             open_run = False
             continue
         if not open_run:
             runs.append([])
             open_run = True
-        runs[-1].append(day)
+        runs[-1].append(slot)
     return runs
 
 
 def bars_for_ticker(
     ticker: str,
-    days: list[date],
+    slots: list[Slot],
     rng: random.Random,
     start_price: float | None = None,
 ) -> list[tuple]:
-    """A random walk over ``days``, one row per entry in ``BAR_TIMES``.
+    """A random walk over ``slots``, one row per (day, bar time).
 
     ``start_price`` continues an existing series. Without it the walk restarts
     from ``SEED_PRICES``, which is correct for a fresh table and wrong for an
@@ -179,42 +190,41 @@ def bars_for_ticker(
     """
     price = start_price if start_price is not None else SEED_PRICES.get(ticker, 100.0)
     rows: list[tuple] = []
-    for day in days:
-        for bar_time in BAR_TIMES:
-            # A localized datetime, then stored as timestamptz. Constructing
-            # the instant in New York (rather than in UTC and converting) is
-            # what makes the DST boundary a non-event: 09:30 is 09:30 to the
-            # engine's filter in both halves of the year.
-            stamp = datetime.combine(day, bar_time, tzinfo=NY)
+    for day, bar_time in slots:
+        # A localized datetime, then stored as timestamptz. Constructing
+        # the instant in New York (rather than in UTC and converting) is
+        # what makes the DST boundary a non-event: 09:30 is 09:30 to the
+        # engine's filter in both halves of the year.
+        stamp = datetime.combine(day, bar_time, tzinfo=NY)
 
-            open_price = price
-            # ~1% hourly volatility: enough movement for drawdown and Sharpe
-            # to be non-degenerate, not so much that prices go negative.
-            close_price = max(0.01, open_price * (1.0 + rng.gauss(0.0, 0.01)))
-            # High and low must bracket both ends, or candlestick rendering
-            # and any high/low logic in a strategy sees an impossible bar.
-            high_price = max(open_price, close_price) * (1.0 + abs(rng.gauss(0.0, 0.003)))
-            low_price = min(open_price, close_price) * (1.0 - abs(rng.gauss(0.0, 0.003)))
-            volume = rng.randint(100_000, 5_000_000)
+        open_price = price
+        # ~1% hourly volatility: enough movement for drawdown and Sharpe
+        # to be non-degenerate, not so much that prices go negative.
+        close_price = max(0.01, open_price * (1.0 + rng.gauss(0.0, 0.01)))
+        # High and low must bracket both ends, or candlestick rendering
+        # and any high/low logic in a strategy sees an impossible bar.
+        high_price = max(open_price, close_price) * (1.0 + abs(rng.gauss(0.0, 0.003)))
+        low_price = min(open_price, close_price) * (1.0 - abs(rng.gauss(0.0, 0.003)))
+        volume = rng.randint(100_000, 5_000_000)
 
-            rows.append(
-                (
-                    ticker,
-                    stamp,
-                    # The New York calendar date of this instant — see the
-                    # module docstring for why it is derived and not `day`
-                    # by coincidence.
-                    stamp.astimezone(NY).date(),
-                    "NASDAQ",
-                    round(open_price, 4),
-                    round(high_price, 4),
-                    round(low_price, 4),
-                    round(close_price, 4),
-                    volume,
-                    round(rng.uniform(-1.0, 1.0), 4),
-                )
+        rows.append(
+            (
+                ticker,
+                stamp,
+                # The New York calendar date of this instant — see the
+                # module docstring for why it is derived and not `day`
+                # by coincidence.
+                stamp.astimezone(NY).date(),
+                "NASDAQ",
+                round(open_price, 4),
+                round(high_price, 4),
+                round(low_price, 4),
+                round(close_price, 4),
+                volume,
+                round(rng.uniform(-1.0, 1.0), 4),
             )
-            price = close_price
+        )
+        price = close_price
     return rows
 
 
@@ -314,22 +324,22 @@ def main() -> int:
                 # then the full universe writes two incompatible AAPL series
                 # that ON CONFLICT DO NOTHING then keeps side by side.
                 rng = random.Random(f"{args.seed}:{ticker}")
-                # Each run of missing days continues from the close stored
-                # just before it; days the table holds are not regenerated at
+                # Each run of missing bars continues from the close stored
+                # just before it; bars the table holds are not regenerated at
                 # all. A run with nothing before it (a backfill) has no close
                 # to anchor to and restarts from SEED_PRICES, leaving the seam
                 # the module docstring describes.
-                runs = missing_runs(days, stored_days(cursor, ticker))
+                runs = missing_runs(days, stored_bars(cursor, ticker))
                 rows: list[tuple] = []
                 for run in runs:
-                    first_stamp = datetime.combine(run[0], BAR_TIMES[0], tzinfo=NY)
+                    first_stamp = datetime.combine(*run[0], tzinfo=NY)
                     start_price = last_close_before(cursor, ticker, first_stamp)
                     rows += bars_for_ticker(ticker, run, rng, start_price)
                 # Chunked so one ticker-year is a handful of round trips
                 # rather than one statement with tens of thousands of tuples.
                 execute_values(cursor, INSERT_SQL, rows, page_size=1000)
-                skipped = len(days) - sum(len(run) for run in runs)
-                print(f"  {ticker:<6} {len(rows):>6} bars" + (f" ({skipped} stored days skipped)" if skipped else ""))
+                skipped = len(days) * len(BAR_TIMES) - len(rows)
+                print(f"  {ticker:<6} {len(rows):>6} bars" + (f" ({skipped} stored bars skipped)" if skipped else ""))
         connection.commit()
 
     print(f"Done. {len(tickers) * len(days) * len(BAR_TIMES)} bars offered to the table.")

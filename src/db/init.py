@@ -47,6 +47,30 @@ _ADDITIVE_MIGRATIONS = (
         f'ALTER TABLE "{APP_SCHEMA}".strategies '
         "ADD COLUMN IF NOT EXISTS authoring JSONB"
     ),
+    # Ownership of uploads. Rows older than the column are attributed to
+    # whoever ran their validation backtest — the only record of who uploaded
+    # them — and the ``IS NULL`` guard makes the backfill a no-op afterwards.
+    # Built-ins have no validation run and stay NULL on purpose.
+    text(
+        f'ALTER TABLE "{APP_SCHEMA}".strategies '
+        "ADD COLUMN IF NOT EXISTS owner_id UUID"
+    ),
+    # A finished run lives in backtest_reports (the transient run row is
+    # removed on completion); one still validating is only in backtest_runs.
+    # Either strategy column may name it: ``validation_job_id`` is written at
+    # submit time, ``validation_run_id`` when the worker finishes.
+    text(
+        f'UPDATE "{APP_SCHEMA}".strategies AS s '
+        f'SET owner_id = r.owner_id FROM "{APP_SCHEMA}".backtest_reports AS r '
+        "WHERE s.owner_id IS NULL AND s.kind = 'user' "
+        "AND r.id = COALESCE(s.validation_run_id, s.validation_job_id)"
+    ),
+    text(
+        f'UPDATE "{APP_SCHEMA}".strategies AS s '
+        f'SET owner_id = r.owner_id FROM "{APP_SCHEMA}".backtest_runs AS r '
+        "WHERE s.owner_id IS NULL AND s.kind = 'user' AND r.owner_id IS NOT NULL "
+        "AND r.id = COALESCE(s.validation_run_id, s.validation_job_id)"
+    ),
 )
 
 # Set once the tables have been confirmed to exist in this process. The lock

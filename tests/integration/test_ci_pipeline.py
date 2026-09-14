@@ -625,6 +625,49 @@ def _assert_exports(client, detail):
     assert client.get(f"{prefix}/strategy.py").status_code == 404
 
 
+def _assert_strategy_ownership(client, connection, key, other):
+    """Uploads belong to their uploader; built-ins belong to nobody.
+
+    Real rows, real FK: the upload has a validation run recorded against it,
+    so the delete must surface as 409 for the owner and 404 for everyone
+    else, and the source is readable only by the owner. A built-in (no
+    owner) cannot be deleted by anyone. Finally the migration's backfill is
+    exercised on a row written NULL, the way every pre-column upload reads.
+    """
+    from src.db.init import init_database
+
+    assert client.get(f"/api/strategies/{key}/source").status_code == 200
+    assert client.get(f"/api/strategies/{key}/source", headers=other).status_code == 404
+    assert client.delete(f"/api/strategies/{key}", headers=other).status_code == 404
+    # The owner is refused too, but for the stated reason: history references it.
+    assert client.delete(f"/api/strategies/{key}").status_code == 409
+    # A built-in, as the seed script writes one: vendored class, no package,
+    # no owner. The disposable database has none, so plant one.
+    with connection.cursor() as cursor:
+        cursor.execute("""INSERT INTO app.strategies
+            (key, name, description, tags, universe, param_specs, kind, class_path, status, enabled)
+            VALUES ('ci-builtin', 'CI built-in', '', '[]', '["AAPL"]', '[]', 'builtin',
+                    'engine.strategies.portfolio_1.strategy.VolMomentum', 'active', TRUE)
+            ON CONFLICT (key) DO NOTHING""")
+    assert client.delete("/api/strategies/ci-builtin").status_code == 404
+    assert client.delete("/api/strategies/ci-builtin", headers=other).status_code == 404
+    assert client.get("/api/strategies/ci-builtin/source").status_code == 404
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT owner_id FROM app.strategies WHERE key = 'ci-builtin'")
+        assert cursor.fetchone() == (None,), "the built-in must survive every delete attempt"
+        cursor.execute("SELECT owner_id FROM app.strategies WHERE key = %s", (key,))
+        assert str(cursor.fetchone()[0]) == "00000000-0000-0000-0000-000000000001"
+        # A row from before the column existed: owner NULL, validation run known.
+        cursor.execute("UPDATE app.strategies SET owner_id = NULL WHERE key = %s", (key,))
+    init_database()  # every boot replays the additive migrations
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT owner_id FROM app.strategies WHERE key = %s", (key,))
+        assert str(cursor.fetchone()[0]) == "00000000-0000-0000-0000-000000000001", (
+            "the backfill did not attribute a pre-column upload to its validation run's owner"
+        )
+    print("CI proof: strategy ownership on delete/source and the owner backfill passed", flush=True)
+
+
 async def _assert_concurrent_app_users():
     """Real PostgreSQL unique-key arbitration, only inside the guarded CI proof."""
     import asyncio
@@ -773,6 +816,8 @@ def _run_ci_proof():
             for suffix in ("", "/exports/report.json", f"/equity?period=max&endDate={days[-1]}"):
                 assert client.get(prefix + suffix, headers=other).status_code == 404
             assert client.delete(prefix, headers=other).status_code == 404
+
+            _assert_strategy_ownership(client, connection, key, other)
 
             # Inspect only: the real pool must own a live child that differs
             # from this TestClient host. No artificial job is submitted.

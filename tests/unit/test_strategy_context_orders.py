@@ -118,6 +118,22 @@ def test_execute_fills_exactly_as_the_direct_executor_call_did(side, position, w
     ]
 
 
+@pytest.mark.parametrize("side,position", [("BUY", 0), ("SELL", 12)])
+def test_execute_hands_the_sized_parent_to_a_configured_order_manager(side, position):
+    # Same seam as buy/sell: with an OMS the executor only sizes, and the OMS
+    # owns execution. Without one, execute() settles directly.
+    broker = executor(position=position)
+    ctx = context(broker, oms=True)
+    ctx.execute("AAPL", side, 0.65, ticker_weight=0.4)
+
+    (order,) = ctx._order_manager.orders
+    assert order["ticker"] == "AAPL" and order["side"] == side
+    assert order["total_quantity"] > 0
+    directly = executor(position=position)
+    raw_execute_trade(directly, "AAPL", side, 0.65, 0.4, context(directly))
+    assert broker.positions == directly.positions
+
+
 def test_execute_requires_the_weight_rather_than_guessing_a_universe():
     with pytest.raises(TypeError):
         context(executor()).execute("AAPL", "BUY", 1.0)

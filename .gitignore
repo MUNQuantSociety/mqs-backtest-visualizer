@@ -1,6 +1,8 @@
 # ---------------------------------------------------------------------------
 # Secrets & environment
-# ---------------------------------------------------------------------------
+# 
+.claude/
+#---------------------------------------------------------------------------
 # Real secrets never get committed. The annotated template does — it ships with
 # every clone so a new contributor can `cp .env.example .env` and start.
 # The negation must come after `.env.*`, which would otherwise match it.

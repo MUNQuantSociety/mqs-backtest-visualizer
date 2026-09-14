@@ -192,7 +192,10 @@ async def list_strategies(include_disabled: bool = False) -> StrategyListRespons
 
     async def available(row: StrategyRow) -> bool:
         if not row.strategy.storage_key:
-            return not on_s3
+            # Locally a row without a package is runnable only if the engine
+            # vendors its class. A user upload whose package was never stored
+            # has neither, and offering it would fail inside the run.
+            return not on_s3 and bool(row.strategy.class_path)
         async with limit:
             return await package_available(row.strategy.storage_key)
 
@@ -468,6 +471,7 @@ async def submit_strategy(
                 storage_key=storage_key,
                 authoring=authoring,
                 class_path=None,
+                owner_id=owner_id,
             )
     except Exception:
         await _discard_unregistered_source(key)
@@ -542,22 +546,24 @@ async def _discard_unregistered_source(key: str) -> None:
         )
 
 
-async def get_strategy_source(key: str) -> StrategySource | None:
+async def get_strategy_source(key: str, *, owner_id: uuid.UUID) -> StrategySource | None:
     """The Python this strategy was registered with, read back from the store.
 
     This is what makes a saved strategy editable. Source went into the store on
     upload and nothing could read it back out, so the editor could only ever
     start from the template — correcting one typo meant retyping the file.
 
-    None when the key is unknown, or when the row has no stored package: the
-    built-ins that ship with the engine were never uploaded. Read as text and
-    never imported, because answering a GET must not execute anything.
+    None when the key is unknown, when the row is not ``owner_id``'s, or when
+    it has no stored package: the built-ins that ship with the engine were
+    never uploaded, and another member's source is theirs to edit, not ours.
+    All three read the same so a probe learns nothing. Read as text and never
+    imported, because answering a GET must not execute anything.
     """
     await ensure_schema()
     async with session_scope() as session:
         row = await strategies_repo.get_strategy_row(session, key)
 
-    if row is None or not row.strategy.storage_key:
+    if row is None or row.strategy.owner_id != owner_id or not row.strategy.storage_key:
         return None
 
     storage_key = row.strategy.storage_key
@@ -599,8 +605,11 @@ class StrategyInUse(RuntimeError):
     """
 
 
-async def delete_strategy(key: str) -> bool:
-    """Remove a registry row and any source stored for it.
+async def delete_strategy(key: str, *, owner_id: uuid.UUID) -> bool:
+    """Remove one of ``owner_id``'s registry rows and any source stored for it.
+
+    False for a key that is not theirs — unknown, another member's, or a
+    built-in — so the route answers 404 for all three alike.
 
     The store is emptied after the row is gone, not before: an orphaned object
     in the store is invisible and harmless, while a row pointing at source that
@@ -611,7 +620,7 @@ async def delete_strategy(key: str) -> bool:
     await ensure_schema()
     try:
         async with session_scope() as session:
-            removed = await strategies_repo.delete_strategy(session, key)
+            removed = await strategies_repo.delete_strategy(session, key, owner_id=owner_id)
     except IntegrityError as exc:
         raise StrategyInUse(key) from exc
 

@@ -832,8 +832,15 @@ def indicator_parameters(source: str) -> list[tuple[str, object]]:
             continue
 
         default: object = None
-        if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
-            default = node.args[1].value
+        if len(node.args) > 1:
+            # Any literal, not only a bare constant: ``-1``, ``[5, 10]`` and
+            # ``{"a": 1}`` are defaults too. A name or a call is not — the
+            # value is unknowable without running the module, so it stays
+            # None and the editor asks.
+            try:
+                default = ast.literal_eval(node.args[1])
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                default = None
         seen.add(key.value)
         found.append((key.value, default))
     return found
