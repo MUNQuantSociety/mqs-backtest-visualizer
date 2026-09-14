@@ -42,3 +42,17 @@ class CoverageResponse(CamelModel):
     end: str | None = None
     # Tickers with no bars at all. Empty is the normal case.
     missing: list[str] = []
+
+
+class TickerValidation(CamelModel):
+    """Whether a ticker has market data available to the run engine."""
+
+    ticker: str
+    status: str
+
+
+class TickerValidationResponse(CamelModel):
+    """Validation result for the run form's explicit ticker additions."""
+
+    tickers: list[TickerValidation]
+    unknown: list[str]

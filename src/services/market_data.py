@@ -13,7 +13,7 @@ import logging
 import time
 from zoneinfo import ZoneInfo
 
-from engine.data.fmp import FMPMarketData, market_data_source
+from engine.data.fmp import FMPMarketData, FMPSymbolUnknown, market_data_source
 from engine.data.fmp import FMPUnavailable as FMPUnavailable
 
 from src.db.engine import session_scope
@@ -31,9 +31,14 @@ def _iso(day: date | None) -> str | None:
 
 @lru_cache(maxsize=512)
 def _fmp_span(ticker: str, as_of: date, cache_period: int) -> tuple[date, date] | None:
-    # Cache successful answers briefly while the user edits the form. An
-    # exception is never cached or interpreted as an absent ticker.
-    rows = FMPMarketData().get_historical_data(ticker, date(1900, 1, 1), as_of)
+    # Cache successful answers briefly while the user edits the form. A
+    # provider failure is never cached or interpreted as an absent ticker —
+    # except FMP's own "no such symbol" (404), which is the same fact as an
+    # empty history and the reason the validate-tickers endpoint exists.
+    try:
+        rows = FMPMarketData().get_historical_data(ticker, date(1900, 1, 1), as_of)
+    except FMPSymbolUnknown:
+        return None
     days = [row["date"] for row in rows]
     return (min(days), max(days)) if days else None
 

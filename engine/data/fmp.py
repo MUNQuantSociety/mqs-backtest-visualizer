@@ -32,6 +32,16 @@ class FMPUnavailable(EngineError):
     """A provider/configuration failure, never an assertion of missing history."""
 
 
+class FMPSymbolUnknown(FMPUnavailable):
+    """FMP answered for this one symbol that it has nothing: a 404.
+
+    Kept as a subclass so every caller that treats provider failures as an
+    outage still does; only coverage, which exists to tell "no such symbol"
+    from "FMP is down", catches it separately. Account and plan errors
+    (401/402/403) and transient ones (429/5xx) stay plain ``FMPUnavailable``.
+    """
+
+
 def market_data_source() -> str:
     load_dotenv(_ENV_FILE, override=False)
     source = os.getenv("MARKET_DATA_SOURCE", "").strip().lower() or "fmp"
@@ -72,6 +82,10 @@ class FMPMarketData:
                 if (code == 429 or code >= 500) and attempt == 0:
                     time.sleep(0.5)
                     continue
+                if code == 404:
+                    raise FMPSymbolUnknown(
+                        f"FMP has no history for {ticker} (HTTP 404). Check the symbol."
+                    ) from None
                 advice = {
                     401: "Check FMP_API_KEY in the backend .env.",
                     402: "Check the FMP plan's historical-data access.",

@@ -8,11 +8,45 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from src.schemas.market_data import CoverageResponse
+from src.schemas.market_data import (
+    CoverageResponse,
+    TickerValidationResponse,
+)
 from src.services import market_data as market_data_service
 from src.services.market_data import FMPUnavailable
 
 router = APIRouter(prefix="/market-data", tags=["market-data"])
+
+
+@router.get("/validate-tickers", response_model=TickerValidationResponse)
+async def validate_tickers(
+    tickers: str = Query(..., description="Comma-separated ticker symbols."),
+) -> TickerValidationResponse:
+    """Check explicitly entered tickers before they join a run universe."""
+    requested = list(
+        dict.fromkeys(
+            part.strip().upper() for part in tickers.split(",") if part.strip()
+        )
+    )
+    if not requested:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Pass at least one ticker.",
+        )
+
+    try:
+        coverage = await market_data_service.coverage_for(requested)
+    except FMPUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+    unknown = set(coverage.missing)
+    return TickerValidationResponse(
+        tickers=[
+            {"ticker": ticker, "status": "unknown" if ticker in unknown else "valid"}
+            for ticker in requested
+        ],
+        unknown=[ticker for ticker in requested if ticker in unknown],
+    )
 
 
 @router.get("/coverage", response_model=CoverageResponse)
