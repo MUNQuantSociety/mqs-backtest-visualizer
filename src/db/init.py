@@ -50,7 +50,9 @@ _ADDITIVE_MIGRATIONS = (
     # Ownership of uploads. Rows older than the column are attributed to
     # whoever ran their validation backtest — the only record of who uploaded
     # them — and the ``IS NULL`` guard makes the backfill a no-op afterwards.
-    # Built-ins have no validation run and stay NULL on purpose.
+    # Built-ins have no validation run and stay NULL on purpose. An upload
+    # whose validation never started has no run or report either and stays
+    # NULL too; scripts/claim_strategy_owner.py is the manual step for those.
     text(
         f'ALTER TABLE "{APP_SCHEMA}".strategies '
         "ADD COLUMN IF NOT EXISTS owner_id UUID"
