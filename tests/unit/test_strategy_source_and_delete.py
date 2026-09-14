@@ -5,13 +5,16 @@ source could be read back the editor always opened on the starter template, and
 without a delete their failed attempts stayed in the drafts list forever.
 """
 
+import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 from src.api.routes.strategies import router
 from src.repositories.strategies import StrategyRow
@@ -160,6 +163,40 @@ class TestDelete:
         key = str(uuid.uuid4())
         assert api.delete(f"/strategies/{key}").status_code == 204
         remove.assert_awaited_once_with(key)
+
+    def test_409_when_runs_still_reference_the_strategy(self, api, monkeypatch):
+        monkeypatch.setattr(
+            strategies_service,
+            "delete_strategy",
+            AsyncMock(side_effect=strategies_service.StrategyInUse(KEY)),
+        )
+
+        response = api.delete(f"/strategies/{KEY}")
+
+        assert response.status_code == 409
+        assert KEY in response.json()["detail"]
+
+    def test_service_translates_the_commit_failure(self, monkeypatch):
+        # The RESTRICT foreign key fires at commit, i.e. when the session scope
+        # exits — not inside the repository call.
+        @asynccontextmanager
+        async def failing_scope():
+            yield object()
+            raise IntegrityError("DELETE", {}, Exception("violates foreign key"))
+
+        monkeypatch.setattr(strategies_service, "ensure_schema", AsyncMock())
+        monkeypatch.setattr(strategies_service, "session_scope", failing_scope)
+        monkeypatch.setattr(
+            strategies_service.strategies_repo, "delete_strategy", AsyncMock(return_value=True)
+        )
+        discard = Mock()
+        monkeypatch.setattr(
+            strategies_service.strategy_validation, "discard_stored_source", discard
+        )
+
+        with pytest.raises(strategies_service.StrategyInUse):
+            asyncio.run(strategies_service.delete_strategy(KEY))
+        discard.assert_not_called()
 
 
 class TestFragmentAuthoredSource:

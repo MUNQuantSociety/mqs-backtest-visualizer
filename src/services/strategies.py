@@ -17,6 +17,8 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
+from sqlalchemy.exc import IntegrityError
+
 from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
@@ -585,16 +587,30 @@ def _read_stored_source(storage_key: str) -> str:
     return get_strategy_store().get(storage_key, "strategy.py")
 
 
+class StrategyInUse(RuntimeError):
+    """A strategy has backtests recorded against it and cannot be deleted.
+
+    Runs hold a ``RESTRICT`` foreign key to the strategy, so the database
+    refuses the delete at commit. Translated here so routes never have to know
+    what an ``IntegrityError`` is.
+    """
+
+
 async def delete_strategy(key: str) -> bool:
     """Remove a registry row and any source stored for it.
 
     The store is emptied after the row is gone, not before: an orphaned object
     in the store is invisible and harmless, while a row pointing at source that
     has been deleted is a strategy that fails at run time for no stated reason.
+
+    Raises :class:`StrategyInUse` when runs still reference the strategy.
     """
     await ensure_schema()
-    async with session_scope() as session:
-        removed = await strategies_repo.delete_strategy(session, key)
+    try:
+        async with session_scope() as session:
+            removed = await strategies_repo.delete_strategy(session, key)
+    except IntegrityError as exc:
+        raise StrategyInUse(key) from exc
 
     if removed:
         await asyncio.to_thread(strategy_validation.discard_stored_source, key)

@@ -189,8 +189,17 @@ def test_browser_default_costs_reach_real_event_execution_and_artifacts(monkeypa
         "timestamp": pd.to_datetime(["2026-03-02 10:00", "2026-03-02 10:01"]).tz_localize("America/New_York"),
         "ticker": ["AAPL", "AAPL"], "close_price": [100.0, 100.0],
     })
-    monkeypatch.setattr("engine.core.runner.fetch_historical_data", lambda *args: prices.copy())
-    monkeypatch.setattr(single, "EngineDBAdapter", lambda: SimpleNamespace(close=lambda: None))
+    history_requests = []
+
+    def fixture_history(tickers, start, end, *, require_all=True):
+        assert tickers == ["AAPL"]
+        history_requests.append((start, end))
+        days = prices.timestamp.dt.date
+        return prices.loc[days.between(pd.Timestamp(start).date(), pd.Timestamp(end).date())].copy()
+
+    # Stub only the provider boundary: keep the real adapter's prefetch/cache
+    # and the runner's history lookup. A runner-only stub misses the prefetch.
+    monkeypatch.setattr(fmp, "fetch_daily_history", fixture_history)
     # BasePortfolio.__init__ builds whatever INDICATORS declares, so emptying
     # the declaration is now part of "no indicators", not the base call alone.
     monkeypatch.setattr(CrossoverRmiStrategy, "INDICATORS", {})

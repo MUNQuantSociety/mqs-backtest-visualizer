@@ -10,7 +10,6 @@ import uuid
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import ValidationError
-from sqlalchemy.exc import IntegrityError
 
 from src.api.dependencies.current_user import require_current_user
 from src.schemas.strategies import (
@@ -31,6 +30,7 @@ from src.schemas.strategies import (
     StrategyTemplate,
 )
 from src.services import strategies as strategies_service
+from src.services.strategies import StrategyInUse
 from src.services.strategy_validation import ScaffoldEscape, StrategyValidationError
 from src.services.strategy_validation.scanning import indicator_parameters, indicator_sources
 
@@ -357,11 +357,12 @@ async def delete_strategy(key: str) -> Response:
     happened, and orphaning its history to tidy up the catalogue is a product
     decision, not something a delete button should do quietly. That case is a
     409 naming the reason, not a 500 — which is what it was before, because the
-    IntegrityError surfaced at commit with nothing catching it.
+    constraint violation surfaced at commit with nothing catching it. The
+    service raises :class:`StrategyInUse` for that case.
     """
     try:
         removed = await strategies_service.delete_strategy(key)
-    except IntegrityError as exc:
+    except StrategyInUse as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
