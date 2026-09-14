@@ -11,6 +11,8 @@ cause.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from src.schemas.common import CamelModel
 
 

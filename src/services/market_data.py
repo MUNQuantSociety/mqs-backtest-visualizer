@@ -7,9 +7,13 @@ by the run form, submission validation and uploaded-strategy validation.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+from concurrent.futures import Future
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 import logging
+import re
+import threading
 import time
 from zoneinfo import ZoneInfo
 
@@ -20,9 +24,79 @@ from src.db.engine import session_scope
 from src.db.init import ensure_schema
 from src.repositories import market_data as market_data_repo
 from src.repositories import strategies as strategies_repo
-from src.schemas.market_data import CoverageResponse, TickerCoverage
+from src.schemas.market_data import CoverageResponse, TickerCoverage, TickerValidation, TickerValidationResponse
 
 logger = logging.getLogger(__name__)
+
+# Only successful provider answers are cached. Coalesce concurrent checks for
+# the same symbol; bound active provider requests across all API callers.
+_symbol_cache: OrderedDict[str, tuple[float, bool]] = OrderedDict()
+_symbol_pending: dict[str, Future] = {}
+_symbol_lock = threading.Lock()
+_symbol_requests = threading.BoundedSemaphore(4)
+_symbol_clock = time.monotonic
+
+
+def normalize_tickers(tickers: list[str]) -> list[str]:
+    if not 1 <= len(tickers) <= 50 or any(not isinstance(t, str) for t in tickers):
+        raise ValueError("Pass between 1 and 50 ticker symbols.")
+    wanted = [ticker.strip().upper() for ticker in tickers]
+    if any(not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=-]{0,19}", ticker) for ticker in wanted):
+        raise ValueError("Enter valid ticker symbols of at most 20 characters.")
+    return list(dict.fromkeys(wanted))
+
+
+def _fmp_symbol_exists(ticker: str) -> bool:
+    with _symbol_lock:
+        cached = _symbol_cache.get(ticker)
+        if cached is not None and cached[0] > _symbol_clock():
+            _symbol_cache.move_to_end(ticker)
+            return cached[1]
+        pending = _symbol_pending.get(ticker)
+        leader = pending is None
+        if leader:
+            pending = _symbol_pending[ticker] = Future()
+    if not leader:
+        return pending.result()
+    try:
+        with _symbol_requests:
+            exists = FMPMarketData().symbol_exists(ticker)
+        with _symbol_lock:
+            _symbol_cache[ticker] = (_symbol_clock() + (3600 if exists else 300), exists)
+            _symbol_cache.move_to_end(ticker)
+            while len(_symbol_cache) > 512:
+                _symbol_cache.popitem(last=False)
+        pending.set_result(exists)
+        return exists
+    except BaseException as error:
+        pending.set_exception(error)
+        raise
+    finally:
+        with _symbol_lock:
+            _symbol_pending.pop(ticker, None)
+
+
+async def validate_tickers(tickers: list[str]) -> TickerValidationResponse:
+    """Look up FMP metadata only; no database price or history request."""
+    wanted = normalize_tickers(tickers)
+    limit = asyncio.Semaphore(4)
+
+    async def lookup(ticker):
+        async with limit:
+            exists = await asyncio.to_thread(_fmp_symbol_exists, ticker)
+            return TickerValidation(ticker=ticker, status="valid" if exists else "unknown")
+
+    tasks = [asyncio.create_task(lookup(ticker)) for ticker in wanted]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        # Stop queued work when one provider check fails. In-flight sockets
+        # retain the provider's short timeout and bounded transient retry.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return TickerValidationResponse(tickers=results, unknown=[r.ticker for r in results if r.status == "unknown"])
 
 
 def _iso(day: date | None) -> str | None:

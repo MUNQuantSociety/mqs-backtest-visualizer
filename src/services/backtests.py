@@ -40,11 +40,9 @@ from src.schemas.backtests import (
 
 logger = logging.getLogger(__name__)
 
-# Execution modes the engine offers. ``fast`` is the vectorised path and not
-# every strategy implements it; the engine rejects it per run with a message
-# naming the strategy, which is a better answer than importing the class here
-# just to refuse the request a second earlier.
-RUN_MODES = ("event", "fast")
+# New application submissions use real event execution. Existing fast-mode
+# reports and the standalone engine remain readable and executable.
+RUN_MODES = ("event",)
 
 # Long enough for "Regime adaptive — 2025 H1 with a 90 day lookback", short
 # enough that a run name stays a label rather than a paragraph pasted into a
@@ -446,12 +444,22 @@ async def _validated_coverage(universe: list[str], start: date, end: date) -> No
     if not universe:
         return
 
+    if market_data_service.market_data_source() == "fmp":
+        try:
+            validation = await market_data_service.validate_tickers(universe)
+        except ValueError as exc:
+            raise RunSubmissionError(str(exc)) from None
+        if validation.unknown:
+            raise RunSubmissionError(
+                f"FMP does not recognize these ticker symbols: {', '.join(validation.unknown)}. "
+                "Check the spelling and exchange suffix."
+            )
     coverage = await market_data_service.coverage_for(universe)
 
     if coverage.missing:
         raise RunSubmissionError(
-            f"There is no market data for {', '.join(coverage.missing)}, so this "
-            "strategy cannot be backtested over any window."
+            f"There is no available market-data history for {', '.join(coverage.missing)}. "
+            "Choose tickers with historical prices before submitting a run."
         )
     if coverage.start is None or coverage.end is None:
         raise RunSubmissionError(
