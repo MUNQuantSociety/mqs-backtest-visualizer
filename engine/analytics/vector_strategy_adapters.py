@@ -103,8 +103,8 @@ def vol_momentum_adapter(price_df: pd.DataFrame) -> VectorSignalResult:
         return VectorSignalResult(target_weights=empty, signal_strength=empty)
 
     roc_20 = close.pct_change(20)
-    vol_60 = close.pct_change().rolling(60, min_periods=20).std() * np.sqrt(252)
-    threshold = vol_60 * 1.5
+    vol_20 = close.pct_change().rolling(20, min_periods=20).std() * np.sqrt(20)
+    threshold = vol_20 * 1.5
 
     bullish = roc_20 > threshold
     bearish = roc_20 < (-threshold)

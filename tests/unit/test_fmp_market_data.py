@@ -107,6 +107,41 @@ def test_http_errors_are_bounded_actionable_and_secret_safe(monkeypatch, caplog,
     assert "test-secret-key" not in str(caught.value) + caplog.text
 
 
+def test_an_unknown_symbol_answered_with_404_is_missing_history_not_an_outage(monkeypatch):
+    def fail(url, **kwargs):
+        raise HTTPError(url, 404, "test-secret-key", {}, io.BytesIO(b"test-secret-key"))
+
+    monkeypatch.setattr(fmp, "urlopen", fail)
+    with pytest.raises(fmp.FMPSymbolUnknown) as caught:
+        fmp.fetch_daily_history(["NOPE"], "2025-03-28", "2025-03-31")
+    assert "test-secret-key" not in str(caught.value)
+
+
+def test_coverage_reports_a_404_symbol_as_missing_and_a_503_as_an_outage(monkeypatch):
+    # validate-tickers recognizes symbols by lookup, never by history; the
+    # 404-from-history distinction is coverage's alone.
+    app = FastAPI()
+    app.include_router(market_data.router)
+    client = TestClient(app)
+
+    def history(self, ticker, start, end):
+        if ticker == "NOPE":
+            raise fmp.FMPSymbolUnknown("FMP has no history for NOPE (HTTP 404).")
+        if ticker == "DOWN":
+            raise fmp.FMPUnavailable("FMP history for DOWN failed (HTTP 503).")
+        return [{"date": date(2025, 3, 28)}]
+
+    monkeypatch.setattr(fmp.FMPMarketData, "get_historical_data", history)
+
+    response = client.get("/market-data/coverage", params={"tickers": "CRWV,NOPE"})
+    assert response.status_code == 200
+    assert response.json()["missing"] == ["NOPE"]
+    assert response.json()["start"] is None
+
+    response = client.get("/market-data/coverage", params={"tickers": "CRWV,DOWN"})
+    assert response.status_code == 503
+
+
 def test_timeout_does_not_look_like_missing_history(monkeypatch):
     attempts = []
 

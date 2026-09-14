@@ -20,6 +20,7 @@ from sqlalchemy.dialects import postgresql
 
 from src.api.dependencies import current_user
 from src.api.routes import auth, backtests
+from src.api.routes import market_data as market_data_api, strategies as strategies_api
 from src.integrations.cognito import AuthenticationUnavailable, CognitoVerifier, InvalidAccessToken, get_verifier
 from src.models import AppUser, BacktestRun
 from src.repositories import runs, strategies, users
@@ -160,6 +161,8 @@ def api(monkeypatch, transport):
     app = FastAPI()
     app.include_router(auth.router, prefix="/api")
     app.include_router(backtests.router, prefix="/api")
+    app.include_router(strategies_api.router, prefix="/api")
+    app.include_router(market_data_api.router, prefix="/api")
     with TestClient(app) as client:
         yield client, configuration, mapping
 
@@ -249,8 +252,15 @@ def test_anonymous_protected_routes_reject_before_service_calls(api):
     prefix = f"/api/backtests/{uuid.uuid4()}"
     for method, path in (("get", "/api/backtests"), ("post", "/api/backtests"),
         ("get", prefix), ("get", prefix + "/equity?period=max&endDate=2026-01-01"),
-        ("get", prefix + "/exports/report.json"), ("delete", prefix)):
-        assert client.request(method, path).status_code == 401
+        ("get", prefix + "/exports/report.json"), ("delete", prefix),
+        # Every route that creates or destroys a strategy, reads back its
+        # source, or spends provider quota is gated the same way. Catalogue
+        # reads and checks stay open.
+        ("post", "/api/strategies"), ("post", "/api/strategies/upload"),
+        ("post", "/api/strategies/draft"), ("delete", "/api/strategies/user-x-1"),
+        ("get", "/api/strategies/user-x-1/source"),
+        ("get", "/api/market-data/validate-tickers?tickers=AAPL")):
+        assert client.request(method, path).status_code == 401, (method, path)
 
 
 def test_legacy_repository_owner_predicate_and_public_catalogue_privacy():

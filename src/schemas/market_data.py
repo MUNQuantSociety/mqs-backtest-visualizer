@@ -47,12 +47,14 @@ class CoverageResponse(CamelModel):
 
 
 class TickerValidation(CamelModel):
+    """Whether a ticker has market data available to the run engine."""
+
     ticker: str
-    status: Literal["valid", "unknown"]
+    status: str
 
 
 class TickerValidationResponse(CamelModel):
-    """FMP symbol recognition; 'valid' does not promise historical coverage."""
+    """Validation result for the run form's explicit ticker additions."""
 
     tickers: list[TickerValidation]
     unknown: list[str]

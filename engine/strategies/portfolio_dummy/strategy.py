@@ -1,6 +1,3 @@
-import logging
-from typing import Dict
-
 from engine.strategies.order_interface import StrategyContext
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
@@ -11,34 +8,15 @@ class CrossoverRmiStrategy(BasePortfolio):
     .toolkit accessor, and dynamic position logic.
     """
 
-    def __init__(
-        self,
-        db_connector,
-        executor,
-        debug=False,
-        config_dict=None,
-        backtest_start_date=None,
-        order_manager=None
-    ):
-        super().__init__(
-            db_connector, executor, debug, config_dict, backtest_start_date, order_manager
-        )
-        self.logger = logging.getLogger(
-            f"{self.__class__.__name__}_{self.portfolio_id}"
-        )
+    # --- 1. Define All Indicators ---
+    INDICATORS = {
+        "fast_sma": ("SimpleMovingAverage", {"period": 20}),
+        "slow_sma": ("SimpleMovingAverage", {"period": 50}),
+        "rmi": ("RelativeMomentumIndex", {"period": 14, "momentum_period": 4}),
+    }
 
-        # --- 1. Define All Indicators ---
-        indicator_definitions = {
-            "fast_sma": ("SimpleMovingAverage", {"period": 20}),
-            "slow_sma": ("SimpleMovingAverage", {"period": 50}),
-            "rmi": ("RelativeMomentumIndex", {"period": 14, "momentum_period": 4}),
-        }
-        self.RegisterIndicatorSet(indicator_definitions)
-
-        # --- State Tracking ---
-        self._previous_sma_values: Dict[str, Dict[str, float]] = {
-            ticker: {"fast": 0.0, "slow": 0.0} for ticker in self.tickers
-        }
+    # --- State Tracking ---
+    PER_TICKER_STATE = {"_previous_sma_values": {"fast": 0.0, "slow": 0.0}}
 
     def OnData(self, context: StrategyContext):
         # --- 1. Showcase PortfolioManager for top-down risk management ---

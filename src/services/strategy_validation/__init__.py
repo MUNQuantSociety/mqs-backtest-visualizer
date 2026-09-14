@@ -20,6 +20,14 @@ speed bump against accidents, not a boundary. See :mod:`.scanning`.
 
 from __future__ import annotations
 
+from src.services.strategy_validation.authoring import (
+    Assembled,
+    IndicatorSpec,
+    ScaffoldEscape,
+    StrategyDraft,
+    assemble,
+    check_draft,
+)
 from src.services.strategy_validation.packaging import (
     CONFIG_FILENAME,
     SOURCE_FILENAME,
@@ -47,6 +55,12 @@ from src.services.strategy_validation.scanning import (
 )
 
 __all__ = [
+    "Assembled",
+    "IndicatorSpec",
+    "ScaffoldEscape",
+    "StrategyDraft",
+    "assemble",
+    "check_draft",
     "ALLOWED_IMPORT_ROOTS",
     "BASE_CLASS_NAME",
     "CONFIG_FILENAME",

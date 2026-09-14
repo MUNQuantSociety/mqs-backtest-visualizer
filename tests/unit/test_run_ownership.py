@@ -219,7 +219,13 @@ class _FixtureReadSession:
 
 @pytest.mark.db
 @pytest.mark.parametrize("nested", [False, True], ids=["public-columns", "public-jsonb"])
-def test_current_and_legacy_runs_are_owner_scoped_and_follow_lifecycle(require_database, nested):
+def test_current_and_legacy_runs_are_owner_scoped_and_follow_lifecycle(
+    require_database, nested, monkeypatch
+):
+    # Both tables are fabricated as CTEs by the fixture session below, so the
+    # real catalog holds no public.backtest_runs for the existence probe to
+    # find. Declaring it present keeps this test about the union itself.
+    monkeypatch.setattr(public_runs, "_history_available", True)
     app_rows = [
         _fixture_run(6), _fixture_run(5, OTHER_OWNER),
         _fixture_run(4, purpose="validation"), _fixture_run(3, owner=None),

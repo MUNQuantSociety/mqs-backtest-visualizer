@@ -1,42 +1,18 @@
-import logging
-
 from engine.strategies.order_interface import StrategyContext
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 
 class MomentumStrategy(BasePortfolio):
-    def __init__(
-        self,
-        db_connector,
-        executor,
-        debug=False,
-        config_dict=None,
-        backtest_start_date=None,
-        order_manager=None,
-    ):
-        super().__init__(
-            db_connector,
-            executor,
-            debug,
-            config_dict,
-            backtest_start_date,
-            order_manager,
-        )
-        self.logger = logging.getLogger(
-            f"{self.__class__.__name__}_{self.portfolio_id}"
-        )
-
-        indicator_definitions = {  # Format: "indicator_variable_name": ("IndicatorName", {params})
-            "sma_fast": ("SimpleMovingAverage", {"period": 14}),
-            "sma_slow": ("SimpleMovingAverage", {"period": 28}),
-            "rmi": ("RelativeMomentumIndex", {"period": 14, "momentum_period": 14}),
-            "rsi": ("RelativeStrengthIndex", {"period": 14}),
-            "dma": ("DisplacedMovingAverage", {"period": 14, "displacement": 7}),
-            # "stochastic": ("StochasticOscillator", {"k_period": 14, "d_period": 3}),
-            # "macd": ("MACD", {"fast_period": 12, "slow_period": 26, "signal_period": 9}),
-        }
-
-        self.RegisterIndicatorSet(indicator_definitions)
+    # Format: "indicator_variable_name": ("IndicatorName", {params})
+    INDICATORS = {
+        "sma_fast": ("SimpleMovingAverage", {"period": 14}),
+        "sma_slow": ("SimpleMovingAverage", {"period": 28}),
+        "rmi": ("RelativeMomentumIndex", {"period": 14, "momentum_period": 14}),
+        "rsi": ("RelativeStrengthIndex", {"period": 14}),
+        "dma": ("DisplacedMovingAverage", {"period": 14, "displacement": 7}),
+        # "stochastic": ("StochasticOscillator", {"k_period": 14, "d_period": 3}),
+        # "macd": ("MACD", {"fast_period": 12, "slow_period": 26, "signal_period": 9}),
+    }
 
     def OnData(self, context: StrategyContext):
         portfolio = context.Portfolio

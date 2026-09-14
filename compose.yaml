@@ -1,6 +1,119 @@
+# Local development stack. See README.Docker.md for the walkthrough.
+#
+# Two ways to run this, and they need different POSTGRES_HOST values:
+#
+#   docker compose up -d db          # database only; uvicorn runs on the host
+#                                    # -> POSTGRES_HOST=localhost, PORT=5433
+#
+#   docker compose up --build        # database + API, both in containers
+#                                    # -> POSTGRES_HOST=db, PORT=5432
+#
+# The first is the normal loop: the engine is CPU-bound Python you want to
+# restart and profile without a rebuild.
+
+# Local development stack. See README.Docker.md for the walkthrough.
+#
+# Two ways to run this, and they need different POSTGRES_HOST values:
+#
+#   docker compose up -d db          # database only; uvicorn runs on the host
+#                                    # -> POSTGRES_HOST=localhost, PORT=5433
+#
+#   docker compose up --build        # database + API, both in containers
+#                                    # -> POSTGRES_HOST=db, PORT=5432
+#
+# The first is the normal loop: the engine is CPU-bound Python you want to
+# restart and profile without a rebuild.
+
 services:
+  db:
+    # 17 because README.md records the MQS instance as 17.6 — matching the
+    # major version is the whole argument for developing against this rather
+    # than whichever container was convenient. Pinned, not `latest`: an image
+    # that silently moves to a new major version will not start against an
+    # existing data directory, and the error arrives as a container that exits
+    # at 3am rather than as a warning.
+    image: postgres:17-alpine
+    # Credentials are dev-only and deliberately in the file. This container
+    # binds to localhost, holds nothing but synthetic bars, and having them
+    # here is what keeps a real warehouse password out of a teammate's shell
+    # history when they try to reproduce a bug.
+    environment:
+      POSTGRES_DB: mqsdb
+      POSTGRES_USER: mqs
+      POSTGRES_PASSWORD: mqs_dev_password
+      # Bars are stored as UTC timestamptz and read back through an explicit
+      # `AT TIME ZONE 'America/New_York'`. Pinning the server to UTC keeps a
+      # developer's local zone out of that conversion.
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      # 5433 on the host, not 5432: a machine that already runs Postgres for
+      # something else would otherwise fail to bind, and the error ("port is
+      # already allocated") sends people debugging the wrong thing. Loopback
+      # only: the password above is public, so the port must not be.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - mqs-dev-db:/var/lib/postgresql/data
+      # Runs once, and only while the volume above is empty. `docker compose
+      # down -v` is the way to re-run it after editing the SQL.
+      - ./docker/dev-db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # -d/-U matter: bare `pg_isready` checks the server is listening, which
+      # is true seconds before the init scripts have finished creating the
+      # tables. Even the named database accepting queries is not enough — the
+      # entrypoint runs the init SQL after that — so the check also asks for
+      # the last table each script creates.
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -h 127.0.0.1 -U mqs -d mqsdb &&
+          psql -h 127.0.0.1 -U mqs -d mqsdb -tAc
+          "SELECT to_regclass('public.market_data') IS NOT NULL
+          AND to_regclass('public.user_creds') IS NOT NULL" | grep -qx t
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      # The first boot has to initdb and run the schema script before the
+      # retries above start counting.
+      start_period: 15s
+    restart: unless-stopped
+
   server:
     build:
       context: .
     ports:
       - "8000:8000"
+    # `.env` is in .dockerignore, so the image never carries it; compose reads
+    # it from the host at start time instead. Everything in it applies except
+    # the connection settings, overridden below.
+    env_file:
+      - .env
+    volumes:
+      # Uploaded strategy source, which `STRATEGY_STORE_BACKEND=local` writes
+      # inside the container. Without this it lives only in the image's own
+      # filesystem, so every `--build` silently discards it and leaves registry
+      # rows pointing at source that is gone — a strategy the catalogue offers
+      # and the worker cannot load. The row and its source are two halves of
+      # one record; both have to be durable.
+      - mqs-dev-strategies:/app/.strategy_store
+    environment:
+      # Inside the compose network the database is the service name on its
+      # container port — not the host mapping. TLS is not configured on this
+      # container, so `disable` is honest; the remote instance is the one the
+      # `prefer` default in .env.example is written for.
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: mqsdb
+      POSTGRES_USER: mqs
+      POSTGRES_PASSWORD: mqs_dev_password
+      POSTGRES_SSLMODE: disable
+    depends_on:
+      db:
+        # Not just "started": src/db/init.py creates the app schema during
+        # startup, and a server that wins the race against initdb logs a
+        # connection error and serves without its tables.
+        condition: service_healthy
+
+volumes:
+  mqs-dev-db:
+  mqs-dev-strategies:

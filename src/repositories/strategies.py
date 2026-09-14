@@ -93,6 +93,8 @@ async def create_strategy(
     class_path: str | None = None,
     storage_key: str | None = None,
     source_staging: str | None = None,
+    # Set only for a fragment-authored strategy; NULL means "a whole file".
+    authoring: dict | None = None,
 ) -> Strategy:
     """Insert a registry row and return it, flushed so the key is usable."""
     strategy = Strategy(
@@ -108,6 +110,7 @@ async def create_strategy(
         status=status,
         enabled=enabled,
         source_staging=source_staging,
+        authoring=authoring,
     )
     session.add(strategy)
     await session.flush()

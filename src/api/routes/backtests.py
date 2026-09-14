@@ -5,8 +5,8 @@ straight through as query params — ``strategyId``, not ``strategy_id``.
 
 Everything here goes through ``src/services/backtests.py``, which owns the
 session and the worker pool; this module deliberately knows nothing about
-SQLAlchemy or the engine. ``POST /backtests`` is the endpoint the application
-exists for — see :func:`create_backtest`.
+database internals or the engine. ``POST /backtests`` is the endpoint the
+application exists for — see :func:`create_backtest`.
 """
 
 from __future__ import annotations

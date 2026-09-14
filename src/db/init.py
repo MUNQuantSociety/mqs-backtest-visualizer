@@ -40,6 +40,13 @@ _ADDITIVE_MIGRATIONS = (
         f'ALTER TABLE "{APP_SCHEMA}".backtest_runs '
         "ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ"
     ),
+    # Fragment authoring: the OnData body and indicator spec a draft was
+    # written from. Nullable, so every existing row reads as "authored as a
+    # whole file" and nothing needs backfilling.
+    text(
+        f'ALTER TABLE "{APP_SCHEMA}".strategies '
+        "ADD COLUMN IF NOT EXISTS authoring JSONB"
+    ),
 )
 
 # Set once the tables have been confirmed to exist in this process. The lock

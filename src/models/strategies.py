@@ -51,6 +51,23 @@ class Strategy(Base):
     # Takes precedence over class_path, retained as builtin metadata/rollback.
     storage_key: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # How this strategy was authored, when it was authored as a fragment:
+    # ``{"body": str, "indicators": [...], "state": {...}}``.
+    #
+    # On the row rather than in the strategy store, deliberately. The store has
+    # a two-file contract (``strategy.py`` + ``config.json``) and its retry path
+    # in ``packaging.store_strategy_source`` compares those two names exactly,
+    # returning early on a match — a third file would be silently skipped on any
+    # retry, with nothing raised. The row is also where this belongs anyway: it
+    # is metadata about how the source was produced, not part of the package the
+    # engine loads.
+    #
+    # NULL means "authored as a whole file", which is every row that exists
+    # today and every upload through ``POST /strategies``. No backfill: the
+    # editor reads the assembled ``strategy.py`` for those, which is exactly
+    # what a member wrote.
+    authoring: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     # The run that proved an uploaded strategy works. ``use_alter`` because
     # strategies and backtest_runs reference each other; without it create_all
     # cannot order the CREATE TABLE statements.

@@ -420,8 +420,52 @@ def known_indicators() -> frozenset[str]:
     return frozenset(names)
 
 
+@lru_cache(maxsize=1)
+def reserved_attributes() -> frozenset[str]:
+    """Every name ``BasePortfolio`` already owns on an instance, read from source.
+
+    ``STATE`` and ``INDICATORS`` entries become instance attributes through
+    ``setattr``, after ``__init__`` has bound the executor, the tickers and
+    the rest. A draft naming one of those would silently replace it, and the
+    failure would surface as a broken platform in the validation run rather
+    than as the member's mistake. Parsed, not imported, like the indicators:
+    the class body's own names plus every ``self.<name>`` the class assigns.
+    """
+    try:
+        spec = importlib.util.find_spec("engine.strategies.portfolio_BASE.strategy")
+    except (ImportError, ValueError):  # pragma: no cover - engine is vendored
+        return frozenset()
+    if spec is None or not spec.origin:  # pragma: no cover - engine is vendored
+        return frozenset()
+    try:
+        tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):  # pragma: no cover - vendored source
+        return frozenset()
+
+    names: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != "BasePortfolio":
+            continue
+        for member in node.body:
+            if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef):
+                names.add(member.name)
+            elif isinstance(member, ast.Assign):
+                names.update(t.id for t in member.targets if isinstance(t, ast.Name))
+            elif isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+                names.add(member.target.id)
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Attribute)
+                and isinstance(sub.ctx, ast.Store)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id == "self"
+            ):
+                names.add(sub.attr)
+    return frozenset(names)
+
+
 def _indicator_issues(strategy: ast.ClassDef) -> list[CompatibilityIssue]:
-    """Names passed to AddIndicator or RegisterIndicatorSet that do not exist.
+    """Indicator names the engine does not have, wherever the class names them.
 
     Only string literals are checked. A name built at run time cannot be read
     here, and guessing at one would refuse working code.
@@ -430,22 +474,63 @@ def _indicator_issues(strategy: ast.ClassDef) -> list[CompatibilityIssue]:
     if not available:  # pragma: no cover - only if the engine is missing
         return []
 
-    issues: list[CompatibilityIssue] = []
+    name_nodes = _declared_indicator_nodes(strategy)
     for node in ast.walk(strategy):
-        for name_node in _indicator_name_nodes(node):
-            name = name_node.value
-            if name in available:
-                continue
-            module = _camel_to_snake(name)
-            issues.append(
-                CompatibilityIssue(
-                    name_node.lineno,
-                    f"there is no indicator called {name!r}. The engine looks for "
-                    f"engine/indicators/{module}.py and finds nothing. Available: "
-                    f"{', '.join(sorted(available))}.",
-                )
+        name_nodes.extend(_indicator_name_nodes(node))
+
+    issues: list[CompatibilityIssue] = []
+    for name_node in name_nodes:
+        name = name_node.value
+        if name in available:
+            continue
+        module = _camel_to_snake(name)
+        issues.append(
+            CompatibilityIssue(
+                name_node.lineno,
+                f"there is no indicator called {name!r}. The engine looks for "
+                f"engine/indicators/{module}.py and finds nothing. Available: "
+                f"{', '.join(sorted(available))}.",
             )
+        )
     return issues
+
+
+# The class attribute BasePortfolio reads to build indicators without the
+# strategy writing an __init__. Checked alongside the two call forms, because a
+# typo in a declaration fails exactly like a typo in a call — at construction,
+# with a ModuleNotFoundError — and this check exists to catch it in the editor.
+DECLARED_INDICATORS_ATTRIBUTE = "INDICATORS"
+
+
+def _declared_indicator_nodes(strategy: ast.ClassDef) -> list[ast.Constant]:
+    """Indicator names from ``INDICATORS = {...}`` in the class body.
+
+    Read from the body rather than from ``ast.walk``, so an ``INDICATORS`` dict
+    built inside a method of some other object is not mistaken for the
+    declaration the engine reads.
+    """
+    found: list[ast.Constant] = []
+    for statement in strategy.body:
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+            if isinstance(statement, ast.AnnAssign)
+            else []
+        )
+        names = {
+            target.id for target in targets if isinstance(target, ast.Name)
+        }
+        if DECLARED_INDICATORS_ATTRIBUTE not in names:
+            continue
+        if not isinstance(statement.value, ast.Dict):
+            continue
+        for value in statement.value.values:
+            if isinstance(value, ast.Tuple) and value.elts:
+                head = value.elts[0]
+                if _is_str(head):
+                    found.append(head)
+    return found
 
 
 def _indicator_name_nodes(node: ast.AST) -> list[ast.Constant]:
@@ -668,3 +753,114 @@ def _calls_super_init(initializer: ast.FunctionDef | ast.AsyncFunctionDef) -> bo
     return False
 
 
+
+
+def declared_indicators(source: str) -> list[str]:
+    """Indicator class names a strategy's ``INDICATORS`` block registers.
+
+    Parsed with ``ast``, never imported — same rule as every other read in this
+    module, and it has to hold for uploaded source in particular.
+
+    Used to mark which of the engine's indicators a strategy actually uses. The
+    run form lists all of them and cannot let anyone change the set (the engine
+    builds indicators from the class), so saying which ones are live is the only
+    honest thing that list can do.
+
+    Deliberately forgiving: anything unparseable, or a file with no
+    ``INDICATORS`` at all, is an empty list. A strategy that registers its
+    indicators by hand with ``AddIndicator`` is invisible here, and that is
+    accepted — this answers "what does the declarative block say", not "what
+    will exist at run time".
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = {t.id for t in node.targets if isinstance(t, ast.Name)}
+        if "INDICATORS" not in targets or not isinstance(node.value, ast.Dict):
+            continue
+        for value in node.value.values:
+            # ("IndicatorName", {params}) — the name is the first element.
+            if isinstance(value, ast.Tuple) and value.elts:
+                first = value.elts[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    names.append(first.value)
+    # Sorted and de-duplicated: two attributes may share one indicator class.
+    return sorted(set(names))
+
+
+def indicator_parameters(source: str) -> list[tuple[str, object]]:
+    """The keyword parameters an indicator class reads, with defaults.
+
+    These classes take ``**kwargs`` and pull values out with
+    ``kwargs.get("period", 14)``, so the signature says nothing and the body
+    says everything. Parsed rather than imported for the usual reason: these
+    modules pull in pandas.
+
+    Returned in source order, which is the order a person reading the class
+    would meet them — ``period`` before ``momentum_period`` — and is a better
+    order for a form than alphabetical.
+
+    A parameter with no literal default reports ``None``: the class requires it
+    and the editor should ask for it rather than invent a number.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    found: list[tuple[str, object]] = []
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        # Match `kwargs.get(...)` and nothing else.
+        if node.func.attr != "get" or not isinstance(node.func.value, ast.Name):
+            continue
+        if node.func.value.id != "kwargs" or not node.args:
+            continue
+
+        key = node.args[0]
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            continue
+        if key.value in seen:
+            continue
+
+        default: object = None
+        if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+            default = node.args[1].value
+        seen.add(key.value)
+        found.append((key.value, default))
+    return found
+
+
+def indicator_sources() -> dict[str, str]:
+    """Every indicator class name mapped to the source of its module.
+
+    :func:`known_indicators` answers "what may a strategy name"; this answers
+    "and what does each one accept", by handing the module text to
+    :func:`indicator_parameters`. Split so the catalogue endpoint reads each
+    file once instead of once per class.
+    """
+    directory = _indicator_directory()
+    if directory is None:
+        return {}
+
+    sources: dict[str, str] = {}
+    for path in sorted(directory.glob("*.py")):
+        if path.name in {"__init__.py", "base.py"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (OSError, SyntaxError):  # pragma: no cover - vendored source
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name != "Indicator":
+                sources[node.name] = text
+    return sources

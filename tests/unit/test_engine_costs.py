@@ -200,6 +200,9 @@ def test_browser_default_costs_reach_real_event_execution_and_artifacts(monkeypa
     # Stub only the provider boundary: keep the real adapter's prefetch/cache
     # and the runner's history lookup. A runner-only stub misses the prefetch.
     monkeypatch.setattr(fmp, "fetch_daily_history", fixture_history)
+    # BasePortfolio.__init__ builds whatever INDICATORS declares, so emptying
+    # the declaration is now part of "no indicators", not the base call alone.
+    monkeypatch.setattr(CrossoverRmiStrategy, "INDICATORS", {})
     monkeypatch.setattr(CrossoverRmiStrategy, "__init__", BasePortfolio.__init__)
     monkeypatch.setattr(CrossoverRmiStrategy, "generate_signals_and_trade", lambda self, data, current_time: trade(self.executor, moment=current_time))
     def forbidden_model(*args, **kwargs):

@@ -1,10 +1,4 @@
-import json
-import logging
-import os
-from datetime import datetime, timedelta
-from typing import Dict, Optional
-
-import pandas as pd
+from datetime import timedelta
 
 from engine.strategies.order_interface import StrategyContext
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
@@ -14,245 +8,84 @@ class RegimeAdaptiveStrategy(BasePortfolio):
     Adaptive strategy that switches between momentum and mean-reversion (VWAP/ATR fades)
     based on the VIX, using the OnData framework.
 
-    All logic is contained within __init__, generate_signals_and_trade, and OnData.
+    All logic is contained within OnData; everything above it is a declaration.
     """
 
-    def __init__(
-        self,
-        db_connector,
-        executor,
-        debug=False,
-        config_dict=None,
-        backtest_start_date=None,
-        order_manager=None
-    ):
-        # --- Base Class Initialization ---
-        if config_dict is None:
-            config_path = os.path.join(os.path.dirname(__file__), "config.json")
-            if not os.path.exists(config_path):
-                raise FileNotFoundError(f"Config file not found at {config_path}")
-            with open(config_path, "r") as f:
-                config_dict = json.load(f)
+    # *---------------------------------------------------
+    # * 1. DEFINE YOUR INDICATORS HERE
+    # *---------------------------------------------------
+    # The VIX EMA is the sole determinant of is_high_vol, and is the one
+    # indicator bound to a single ticker rather than to the whole universe.
+    # The old is_market_open override has been removed: on daily bars (all timestamped
+    # at 9:30am) it permanently matched the 9:30-10:00 window, forcing the strategy
+    # into mean-reversion mode 100% of the time and making the momentum branch
+    # unreachable dead code.
+    INDICATORS = {
+        "vwap": (
+            "VWAP",
+            {"period": 20, "price_col": "close_price", "vol_col": "volume"},
+        ),
+        "atr": (
+            "AverageTrueRange",
+            {
+                "period": 14,
+                "high_col": "high_price",
+                "low_col": "low_price",
+                "close_col": "close_price",
+            },
+        ),
+        "momentum_pct": (
+            "RateOfChange",
+            {"period": 10, "price_col": "close_price", "mode": "percentage"},
+        ),
+        "sma50": (
+            "SimpleMovingAverage",
+            {"period": 50, "price_col": "close_price"},
+        ),
+        "vix_ema": ("ExponentialMovingAverage", {"period": 10}, "^VIX"),
+    }
 
-        super().__init__(
-            db_connector, executor, debug, config_dict, backtest_start_date, order_manager
-        )
-        self.logger = logging.getLogger(
-            f"{self.__class__.__name__}_{self.portfolio_id}"
-        )
-
-        # --- Strategy Properties ---
-        self.interval_seconds = self.poll_interval
-        self.last_decision_time = {}  # Cooldown timer per ticker
-
-        # --- Order Tracking ---
+    # --- Per-ticker bookkeeping, all keyed by ticker ---
+    STATE = {
+        # Cooldown timer per ticker.
+        "last_decision_time": {},
         # last_signal: last EXECUTED signal per ticker ("BUY", "SELL", or "HOLD")
-        self.last_signal = {}
-
+        "last_signal": {},
         # raw_signal_streak: (direction, consecutive_count) of the raw signal per ticker.
         # Accumulates even on suppressed cycles so hysteresis can confirm reversals.
-        self.raw_signal_streak = {}
-
+        "raw_signal_streak": {},
         # order_log: rolling log (last 10) of executed orders per ticker.
         # Each entry: {"timestamp": ts, "signal": str, "price": float, "confidence": float, ...}
-        self.order_log = {}
-
-        # --- Trade History (used for history-based confidence scaling) ---
+        "order_log": {},
         # entry_price: most recent buy price per ticker, used for stop-loss and PnL tracking.
-        self.entry_price = {}
-
+        "entry_price": {},
         # Track entry regime (high vs low) alongside entry_price, prevents MR exits while in momentum regime.
-        self.entry_regime = {}
-
+        "entry_regime": {},
         # trade_results: rolling list of (exit_price - entry_price) per ticker, capped at 5.
         # Positive = win, negative = loss. Drives history_factor in confidence formula.
-        self.trade_results = {}
+        "trade_results": {},
+    }
 
-        # Number of consecutive same-direction bars required before flipping direction.
-        self.REVERSAL_THRESHOLD = 2
+    # Number of consecutive same-direction bars required before flipping direction.
+    REVERSAL_THRESHOLD = 2
 
-        # --- Signal Parameters (tune these between runs) ---
-        # ATR multiplier for VWAP fade bands. Higher = fewer but higher-conviction signals.
-        # 1.0 triggers on routine intraday moves; 2.0 requires a meaningful dislocation.
-        self.ATR_BAND_MULT = 1.1
+    # --- Signal Parameters (tune these between runs) ---
+    # ATR multiplier for VWAP fade bands. Higher = fewer but higher-conviction signals.
+    # 1.0 triggers on routine intraday moves; 2.0 requires a meaningful dislocation.
+    ATR_BAND_MULT = 1.1
 
-        # 10-day ROC, threshold increased to 1.0, filter out noise.
-        self.MOMENTUM_THRESHOLD = 1.3
+    # 10-day ROC, threshold increased to 1.0, filter out noise.
+    MOMENTUM_THRESHOLD = 1.3
 
-        # Base trade confidence. Scales position size: 0.6 -> ~60% of one bar's allocation. 
-        self.BASE_CONF = 0.65
+    # Base trade confidence. Scales position size: 0.6 -> ~60% of one bar's allocation.
+    BASE_CONF = 0.65
 
-        # Stop-loss multiplier: exit if price drops this many ATRs below the recorded entry.
-        # 1.5 gives a buffer of roughly 1.5x the recent daily range before cutting the loss.
-        self.STOP_LOSS_ATR_MULT = 3
+    # Stop-loss multiplier: exit if price drops this many ATRs below the recorded entry.
+    # 1.5 gives a buffer of roughly 1.5x the recent daily range before cutting the loss.
+    STOP_LOSS_ATR_MULT = 3
 
-        # *---------------------------------------------------
-        # * 1. DEFINE YOUR INDICATORS HERE
-        # *---------------------------------------------------
-        indicator_definitions = {
-            "vwap": (
-                "VWAP",
-                {"period": 20, "price_col": "close_price", "vol_col": "volume"},
-            ),
-            "atr": (
-                "AverageTrueRange",
-                {
-                    "period": 14,
-                    "high_col": "high_price",
-                    "low_col": "low_price",
-                    "close_col": "close_price",
-                },
-            ),
-            "momentum_pct": (
-                "RateOfChange",
-                {"period": 10, "price_col": "close_price", "mode": "percentage"},
-            ),
-            "sma50": (
-                "SimpleMovingAverage",
-                {"period": 50, "price_col": "close_price"},
-            ),
-        }
-
-        self.RegisterIndicatorSet(indicator_definitions)
-
-        # VIX EMA for adaptive regime detection (sole determinant of is_high_vol).
-        # The old is_market_open override has been removed: on daily bars (all timestamped
-        # at 9:30am) it permanently matched the 9:30-10:00 window, forcing the strategy
-        # into mean-reversion mode 100% of the time and making the momentum branch
-        # unreachable dead code.
-        # Fix 
-        self.vix_ema = self.AddIndicator(
-            "ExponentialMovingAverage",
-            "^VIX",
-            period=10
-        )
-
-        self.logger.info("RegimeAdaptiveStrategy initialized for OnData framework.")
-        self.logger.info(f"Registered indicators: {list(indicator_definitions.keys())} + VIX EMA(10)"  )
-
-    
-    def generate_signals_and_trade(
-        self, data: Dict[str, pd.DataFrame], current_time: Optional[datetime] = None
-    ):
-        """
-        Overrides BasePortfolio.generate_signals_and_trade, which isn't designed
-        to handle our ATR and VWAP implementations.
-        """
-
-        # Code from original
-        market_data_df = data.get("MARKET_DATA")
-        if market_data_df is not None and not market_data_df.empty:
-            if self._last_processed_timestamp is not None:
-                new_data = market_data_df[
-                    market_data_df["timestamp"] > self._last_processed_timestamp
-                ]
-            else:
-                new_data = (
-                    market_data_df.sort_values("timestamp")
-                    .groupby("ticker")
-                    .last()
-                    .reset_index()
-                )
-            if not new_data.empty:
-                for timestamp, group in new_data.sort_values("timestamp").groupby("timestamp"):
-                    for row in group.itertuples():
-                        for indicator in self._indicators:
-                            if indicator.ticker != row.ticker:
-                                continue
-                            price_col = getattr(indicator, "price_col", "close_price")
-                            vol_col   = getattr(indicator, "vol_col",   "volume")
-                            high_col  = getattr(indicator, "high_col",  "high_price")
-                            low_col   = getattr(indicator, "low_col",   "low_price")
-
-                            # New
-                            price_val = getattr(row, price_col, None)
-                            if price_val is None or not pd.notna(price_val):
-                                continue
-
-                            # Build kwargs so all OHLCV data arrives in one call (instead of per-ticker)
-                            update_kwargs = {}
-                            if hasattr(indicator, "vol_col"):
-                                v = getattr(row, vol_col, None)
-                                if v is not None and pd.notna(v):
-                                    update_kwargs["volume"] = float(v)
-                            if hasattr(indicator, "high_col"):
-                                v = getattr(row, high_col, None)
-                                if v is not None and pd.notna(v):
-                                    update_kwargs[high_col] = float(v)
-                            if hasattr(indicator, "low_col"):
-                                v = getattr(row, low_col, None)
-                                if v is not None and pd.notna(v):
-                                    update_kwargs[low_col] = float(v)
-
-                            indicator.Update(row.timestamp, float(price_val), **update_kwargs)
-
-        # Update the last-processed timestamp.
-        if current_time is not None:
-            self._last_processed_timestamp = current_time
-        else:
-            if market_data_df is not None and not market_data_df.empty:
-                try:
-                    self._last_processed_timestamp = market_data_df["timestamp"].max()
-                except Exception:
-                    self.logger.warning(
-                        "Could not update last processed timestamp from market data."
-                    )
-
-        context = StrategyContext(
-            market_data_df=market_data_df,
-            cash_df=data.get("CASH_EQUITY"),
-            positions_df=data.get("POSITIONS"),
-            port_notional_df=data.get("PORT_NOTIONAL"),
-            current_time=current_time,
-            executor=self.executor,
-            portfolio_config=self.portfolio_config_dict,
-        )
-
-        self.OnData(context)
-
-
-    """
-    Replacement for context.buy() / context.sell() that fixes the executor's
-    equal-weight fallback. Weight fetched would be 0.0, fallback to 1/#oftickers
-    and include VIX ticker (should not). 
-
-    Just makes sure weight calculations are correct.
-
-    Is modular design, changes to buy/sell should be made within this method
-    """
-    def _execute_order(
-        self,
-        context: StrategyContext,
-        ticker: str,
-        signal_type: str,
-        confidence: float,
-        latest_price: float,
-        trade_ts: datetime,
-        n_tradeable: int,
-    ):
-        asset_data = context.Market[ticker]
-        if not asset_data.Exists or asset_data.Close is None or asset_data.Close <= 0:
-            self.logger.warning(
-                "No valid market data for %s at %s, skipping...", ticker, trade_ts
-            )
-            return
-
-        current_weight = context.Portfolio.get_asset_weight(ticker, latest_price)
-        # Correct weight if 0.0 returned above
-        ticker_weight = current_weight if current_weight != 0.0 else 1.0 / max(n_tradeable, 1)
-
-        context._executor.execute_trade(
-            portfolio_id=context._portfolio_config["id"],
-            ticker=ticker,
-            signal_type=signal_type,
-            confidence=confidence,
-            arrival_price=latest_price,
-            cash=context.Portfolio.cash,
-            positions=context._positions_df,
-            port_notional=context.Portfolio.total_value,
-            ticker_weight=ticker_weight,
-            timestamp=trade_ts,
-        )
+    # The ticker that sets the regime and is never itself traded.
+    REGIME_TICKER = "^VIX"
 
     def OnData(self, context: StrategyContext):
         """
@@ -268,7 +101,7 @@ class RegimeAdaptiveStrategy(BasePortfolio):
 
         # Get VIX data for OnData() call
         try:
-            vix_asset = context.Market["^VIX"]
+            vix_asset = context.Market[self.REGIME_TICKER]
 
             # Skip if no VIX data for date/time
             if not vix_asset.Exists or vix_asset.Close is None:
@@ -283,18 +116,18 @@ class RegimeAdaptiveStrategy(BasePortfolio):
         
         # Number of tradeable tickers
         #NOTE this is defined in other variables -> need to remove this and make one variable for whole class
-        n_stocks = len([t for t in self.tickers if t != "^VIX"])
+        n_stocks = len([t for t in self.tickers if t != self.REGIME_TICKER])
 
         # Loop through all tickers except vix
         for ticker in self.tickers:
-            if ticker == "^VIX":
+            if ticker == self.REGIME_TICKER:
                 continue
 
             try:
                 # Check cooldown time -> skip iteration if last decision for ticker was made to recently
                 last_decision = self.last_decision_time.get(ticker)
                 if last_decision and (trade_ts - last_decision) < timedelta(
-                    seconds=self.interval_seconds
+                    seconds=self.poll_interval
                 ):
                     continue
 
@@ -424,17 +257,19 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     or 1.0 / max(n_stocks, 1)
                 )
                 current_weight = context.Portfolio.get_asset_weight(ticker, latest_price)
+                # The weight to size from. A flat position reports 0.0, and the
+                # executor's own fallback would then divide by the whole
+                # universe, VIX included — this portfolio never trades VIX, so
+                # the share is one of the tradeable names.
+                sizing_weight = (
+                    current_weight
+                    if current_weight != 0.0
+                    else 1.0 / max(n_stocks, 1)
+                )
                 if signal == "BUY" and current_weight >= target_weight * 0.9:
                     self.logger.debug(
                         f"[{ticker}] BUY suppressed: weight {current_weight:.3f} "
                         f">= {target_weight * 0.9:.3f} (already at/near target long)"
-                    )
-                    continue
-
-                if signal == "SELL" and current_weight <= -(target_weight * 0.9):
-                    self.logger.debug(
-                        f"[{ticker}] SELL suppressed: weight {current_weight:.3f} "
-                        f"<= {-(target_weight * 0.9):.3f} (already at/near target short)"
                     )
                     continue
 
@@ -505,17 +340,20 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                     )
 
                     if signal == "BUY":
-                        self._execute_order(
-                            context, ticker, "BUY", confidence, latest_price, trade_ts, n_stocks
+                        context.execute(
+                            ticker, "BUY", confidence, ticker_weight=sizing_weight
                         )
                         # # Record entry price and entry regime for stop-loss and win/loss tracking.
                         self.entry_price[ticker] = latest_price
                         self.entry_regime[ticker] = "high_vol" if is_high_vol else "low_vol"
 
                     elif signal == "SELL":
-                        self._execute_order(
-                            context, ticker, "SELL", confidence, latest_price, trade_ts, n_stocks
-                        )
+                        # Close toward flat, never through it. ``execute`` keeps
+                        # the executor's signal model, where a SELL targets
+                        # minus ``ticker_weight`` — a short, which the guard
+                        # above ("sell signals only close existing longs")
+                        # promises never to open. ``sell`` targets weight 0.
+                        context.sell(ticker, confidence)
                         # Record completed trade result for history_factor scaling.
                         if ticker in self.entry_price:
                             pnl = latest_price - self.entry_price[ticker]

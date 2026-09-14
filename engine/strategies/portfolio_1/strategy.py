@@ -1,4 +1,3 @@
-import logging
 import math
 
 from engine.strategies.order_interface import StrategyContext
@@ -6,41 +5,28 @@ from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 
 class VolMomentum(BasePortfolio):
-    def __init__(
-        self,
-        db_connector,
-        executor,
-        debug=False,
-        config_dict=None,
-        backtest_start_date=None,
-        order_manager=None,
-    ):
-        super().__init__(
-            db_connector,
-            executor,
-            debug,
-            config_dict,
-            backtest_start_date,
-            order_manager,
-        )
-        self.logger = logging.getLogger(
-            f"{self.__class__.__name__}_{self.portfolio_id}"
-        )
-        # Format: "indicator_variable_name": ("IndicatorName", {params})
-        indicator_definitions = {
-            "roc": ("RateOfChange", {"period": 20}),
-        }
-        self.RegisterIndicatorSet(indicator_definitions)
-        self.strategy_diagnostics = self._new_diagnostics()
+    # Format: "indicator_variable_name": ("IndicatorName", {params})
+    INDICATORS = {
+        "roc": ("RateOfChange", {"period": 20}),
+    }
 
-    @staticmethod
-    def _new_diagnostics():
-        # Fixed-size counters and one snapshot per ticker; never retain bars.
-        return {
+    # Volatility window and the multiplier that turns it into a signal
+    # threshold. Named here rather than inline so the report and the comparison
+    # can never disagree about which numbers the run actually used.
+    VOLATILITY_SIGNAL_DAYS = 20
+    VOLATILITY_MULTIPLIER = 1.5
+    MINIMUM_RETURN_OBSERVATIONS = 20
+    TARGET_WEIGHT = 0.2
+
+    # Fixed-size counters and one snapshot per ticker; never retain bars.
+    # BasePortfolio deep copies this per instance, and run_single puts whatever
+    # it holds at the end of a run into the report.
+    STATE = {
+        "strategy_diagnostics": {
             "strategy": "VolMomentum",
-            "volatilityAnnualizationDays": 252,
-            "volatilityMultiplier": 1.5,
-            "minimumReturnObservations": 20,
+            "volatilitySignalDays": VOLATILITY_SIGNAL_DAYS,
+            "volatilityMultiplier": VOLATILITY_MULTIPLIER,
+            "minimumReturnObservations": MINIMUM_RETURN_OBSERVATIONS,
             "evaluationCount": 0,
             "warmupSkipCount": 0,
             "missingMarketDataSkipCount": 0,
@@ -50,6 +36,7 @@ class VolMomentum(BasePortfolio):
             "sellRequestCount": 0,
             "tickers": {},
         }
+    }
 
     @staticmethod
     def _momentum_strength(snapshot):
@@ -59,10 +46,6 @@ class VolMomentum(BasePortfolio):
         # infinity; report metadata always contains finite numbers or null.
         momentum = snapshot["momentumPct"]
         return math.copysign(math.inf, momentum) if momentum else 0.0
-
-    def _count_diagnostic(self, ticker_diagnostics, key):
-        self.strategy_diagnostics[key] += 1
-        ticker_diagnostics[key] += 1
 
     def OnData(self, context: StrategyContext):
         """Generates BUY, SELL, and HOLD signals based on momentum and volatility, updates cash available for trade, and then calls the trade execution logic for each signal."""
@@ -77,22 +60,27 @@ class VolMomentum(BasePortfolio):
         for ticker in self.tickers:
             asset = context.Market[ticker]
             roc = self.roc[ticker]
-            vol_multiplier = 1.5  # This can be adjusted or made configurable
-            diagnostics = self.strategy_diagnostics["tickers"].setdefault(ticker, {
-                "evaluationCount": 0,
-                "warmupSkipCount": 0,
-                "missingMarketDataSkipCount": 0,
-                "bullishSignalCount": 0,
-                "bearishSignalCount": 0,
-                "buyRequestCount": 0,
-                "sellRequestCount": 0,
-                "strongestMomentum": None,
-            })
+            vol_multiplier = self.VOLATILITY_MULTIPLIER
+            diagnostics = self.strategy_diagnostics["tickers"].setdefault(
+                ticker,
+                {
+                    "evaluationCount": 0,
+                    "warmupSkipCount": 0,
+                    "missingMarketDataSkipCount": 0,
+                    "bullishSignalCount": 0,
+                    "bearishSignalCount": 0,
+                    "buyRequestCount": 0,
+                    "sellRequestCount": 0,
+                    "strongestMomentum": None,
+                },
+            )
 
             if not all([asset.Exists, roc.IsReady]):
                 self._count_diagnostic(
                     diagnostics,
-                    "missingMarketDataSkipCount" if not asset.Exists else "warmupSkipCount",
+                    "missingMarketDataSkipCount"
+                    if not asset.Exists
+                    else "warmupSkipCount",
                 )
                 continue
 
@@ -100,17 +88,28 @@ class VolMomentum(BasePortfolio):
             # History is a calendar window of daily bars. A 60-row change in
             # this window has no observations and silently makes every signal
             # false. Estimate volatility from consecutive daily returns.
-            returns = return_history["close_price"].pct_change(fill_method=None).dropna()
-            if len(returns) < 20:
+            returns = (
+                return_history["close_price"].pct_change(fill_method=None).dropna()
+            )
+            if len(returns) < self.MINIMUM_RETURN_OBSERVATIONS:
                 self._count_diagnostic(diagnostics, "warmupSkipCount")
                 continue
-            # RateOfChange.Current is expressed in percent, so volatility must
-            # use percent as well before comparing the two quantities.
-            volatility = float(returns.std()) * (252**0.5) * 100.0
+            # ROC is a 20-bar return, so compare it with volatility measured
+            # over the same 20-bar horizon. Keep both values in percent.
+            signal_returns = returns.tail(self.VOLATILITY_SIGNAL_DAYS)
+            volatility = float(
+                signal_returns.std() * (self.VOLATILITY_SIGNAL_DAYS**0.5) * 100.0
+            )
 
             momentum = roc.Current
-            if momentum is None or not math.isfinite(momentum) or not math.isfinite(volatility):
-                raise ValueError(f"VolMomentum: non-finite momentum or volatility for {ticker}.")
+            if (
+                momentum is None
+                or not math.isfinite(momentum)
+                or not math.isfinite(volatility)
+            ):
+                raise ValueError(
+                    f"VolMomentum: non-finite momentum or volatility for {ticker}."
+                )
             threshold = volatility * vol_multiplier
             position = portfolio.positions.get(ticker, 0)
 
@@ -125,16 +124,17 @@ class VolMomentum(BasePortfolio):
                 "date": context.time.date().isoformat(),
                 "momentumPct": float(momentum),
                 "thresholdPct": float(threshold),
-                "momentumToThresholdRatio": float(momentum / threshold) if threshold else None,
+                "momentumToThresholdRatio": float(momentum / threshold)
+                if threshold
+                else None,
             }
             strongest = diagnostics["strongestMomentum"]
-            if strongest is None or self._momentum_strength(snapshot) > self._momentum_strength(strongest):
+            if strongest is None or self._momentum_strength(
+                snapshot
+            ) > self._momentum_strength(strongest):
                 diagnostics["strongestMomentum"] = snapshot
 
-            if bullish and not is_risk_off:
-                is_risk_off = False
-
-            weight = 0.2 if bullish else 0.0
+            weight = self.TARGET_WEIGHT if bullish else 0.0
             asset_weight = 0.0
             if asset.Exists:
                 asset_weight = portfolio.get_asset_weight(ticker, asset.Close)
@@ -143,14 +143,19 @@ class VolMomentum(BasePortfolio):
             elif asset_weight > weight:
                 target_weight = False
 
-            if (bullish and target_weight) or position < 0:  # Max 25% weight
+            if bullish and target_weight and not is_risk_off:
                 self.logger.debug(
                     f"[{ticker}] BUY signal: momentum ({momentum:.4f}) > threshold ({threshold:.4f}), position={position}"
                 )
                 self._count_diagnostic(diagnostics, "buyRequestCount")
                 context.buy(ticker, confidence=1.0)
 
-            elif position > 0 and (bearish or target_weight is False or is_risk_off):
+            # Risk-off means no *new* exposure, not liquidation: a held position
+            # is only reduced by its own signal or by drifting over weight. A
+            # fully invested book fails the cash test every bar, and selling
+            # its still-bullish names for that reason flattened and re-bought
+            # the whole book on alternate bars.
+            elif position > 0 and (bearish or target_weight is False):
                 self.logger.debug(
                     f"[{ticker}] SELL signal: momentum ({momentum:.4f}) < threshold ({threshold:.4f}), position={position}"
                 )

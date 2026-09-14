@@ -171,6 +171,9 @@ def test_real_event_runner_and_entrypoint_keep_final_bar_marks(monkeypatch, tmp_
     monkeypatch.setattr("engine.core.runner.fetch_historical_data", lambda *args: prices.copy())
     # Only replace indicator construction and signal policy. Configuration,
     # executor settlement, runner/report generation, and run_single are real.
+    # BasePortfolio.__init__ builds whatever INDICATORS declares, so emptying
+    # the declaration is now part of "no indicators", not the base call alone.
+    monkeypatch.setattr(CrossoverRmiStrategy, "INDICATORS", {})
     monkeypatch.setattr(CrossoverRmiStrategy, "__init__", BasePortfolio.__init__)
     polls = []
     def buy_once(self, data, current_time):

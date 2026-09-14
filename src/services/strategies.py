@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import lru_cache
+from pathlib import Path
 import re
 import time
 import uuid
 from datetime import datetime
 from decimal import Decimal
+
+from sqlalchemy.exc import IntegrityError
 
 from src.core.config import settings
 from src.db.engine import session_scope
@@ -21,19 +25,27 @@ from src.db.init import ensure_schema
 from src.repositories import strategies as strategies_repo
 from src.repositories.strategies import StrategyRow
 from src.schemas.strategies import (
+    MAX_SOURCE_BYTES,
     CompatibilityIssue,
     CompatibilityStatus,
     ParameterSpec,
     Strategy,
+    IndicatorSpec,
+    StrategyDraftRequest,
+    StrategyDraftSubmission,
     StrategyCheckRequest,
     StrategyCheckResult,
     StrategyListResponse,
     StrategyStatus,
     StrategySubmission,
     StrategySubmissionResult,
+    StrategySource,
     StrategyTemplate,
 )
 from src.services import strategy_validation
+from src.services.strategy_validation import authoring
+from src.services.strategy_validation.scanning import declared_indicators
+from src.integrations.strategy_store import get_strategy_store
 from src.services.strategy_availability import package_available
 from src.services.strategy_validation import template
 
@@ -81,6 +93,39 @@ def _parameter_specs(raw: list[dict] | None) -> list[ParameterSpec]:
     return [ParameterSpec.model_validate(spec) for spec in (raw or [])]
 
 
+@lru_cache(maxsize=64)
+def _builtin_indicators(class_path: str) -> tuple[str, ...]:
+    """A built-in's declared indicators, read from its vendored file.
+
+    Cached: the engine's files do not change while the process runs, and this
+    would otherwise re-read and re-parse them on every catalogue request.
+    """
+    module = class_path.rsplit(".", 1)[0]
+    path = Path(*module.split(".")).with_suffix(".py")
+    try:
+        return tuple(declared_indicators(path.read_text(encoding="utf-8")))
+    except OSError:
+        # A vendored file that moved is not worth failing a list request over.
+        logger.warning("CATALOGUE | Could not read %s for indicators", path)
+        return ()
+
+
+def _row_indicators(strategy) -> list[str]:
+    """What this strategy registers, from whichever source describes it.
+
+    A fragment-authored strategy carries its spec on the row, so nothing has to
+    be parsed. A built-in points at a vendored class. An uploaded whole file has
+    neither, and reading it would mean a store round trip per row on every
+    catalogue request — too expensive for a label, so it reports nothing.
+    """
+    authored = (strategy.authoring or {}).get("indicators")
+    if authored:
+        return sorted({spec["indicator"] for spec in authored})
+    if strategy.class_path:
+        return list(_builtin_indicators(strategy.class_path))
+    return []
+
+
 def to_schema(row: StrategyRow) -> Strategy:
     """ORM row plus aggregates → the frontend's ``Strategy``."""
     strategy = row.strategy
@@ -97,6 +142,7 @@ def to_schema(row: StrategyRow) -> Strategy:
         best_sharpe=_float(row.best_sharpe),
         best_return=_float(row.best_return),
         last_run_at=_iso(row.last_run_at),
+        indicators=_row_indicators(strategy),
         validation_state=strategy.status,
         validation_run_id=(
             str(getattr(strategy, "validation_job_id", None) or strategy.validation_run_id)
@@ -130,15 +176,35 @@ async def list_strategies(include_disabled: bool = False) -> StrategyListRespons
         rows = await strategies_repo.list_strategies(
             session, include_disabled=include_disabled
         )
-    if settings.strategy_store_backend == "s3":
-        limit = asyncio.Semaphore(4)
+    # Availability is checked for every backend, but what "missing" means
+    # differs. Under S3 a row with no published package is not runnable at all,
+    # including a built-in that was never uploaded — that is the rule this
+    # already had. Locally the built-ins are vendored in the image and load
+    # without a store, so only rows that claim a package are checked.
+    #
+    # Local is checked at all because "a local store cannot lose files" was
+    # never true: it is a directory inside the container, and one
+    # `docker compose up --build` without a volume empties it while every row
+    # still claims a package. Offering a strategy the worker cannot load turns
+    # a missing file into a stack trace minutes later, inside a run.
+    on_s3 = settings.strategy_store_backend == "s3"
+    limit = asyncio.Semaphore(4)
 
-        async def available(row: StrategyRow) -> bool:
-            async with limit:
-                return await package_available(row.strategy.storage_key)
+    async def available(row: StrategyRow) -> bool:
+        if not row.strategy.storage_key:
+            return not on_s3
+        async with limit:
+            return await package_available(row.strategy.storage_key)
 
-        present = await asyncio.gather(*(available(row) for row in rows))
-        rows = [row for row, exists in zip(rows, present) if exists]
+    present = await asyncio.gather(*(available(row) for row in rows))
+    missing = [row.strategy.key for row, exists in zip(rows, present) if not exists]
+    if missing:
+        logger.warning(
+            "CATALOGUE | Hiding %d strategy(ies) with no loadable package: %s",
+            len(missing),
+            missing,
+        )
+    rows = [row for row, exists in zip(rows, present) if exists]
     items = [to_schema(row) for row in rows]
     logger.info("CATALOGUE | Returning %d strategies: %s; elapsed_ms=%.0f", len(items), [item.id for item in items], (time.perf_counter() - started) * 1000)
     return StrategyListResponse(items=items, total=len(items))
@@ -158,9 +224,121 @@ async def get_strategy(key: str) -> Strategy | None:
 
 
 def strategy_template() -> StrategyTemplate:
-    """The starter source, straight from the module the check tests against."""
+    """The starter, as a whole file and as a fragment.
+
+    Both halves come from the same text: ``body`` and ``indicators`` are read
+    back out of ``source``, so the full-file editor and the fragment editor
+    cannot be taught different contracts.
+    """
     return StrategyTemplate(
-        filename=template.STARTER_FILENAME, source=template.STARTER_SOURCE
+        filename=template.STARTER_FILENAME,
+        source=template.STARTER_SOURCE,
+        body=template.STARTER_BODY,
+        indicators=[
+            IndicatorSpec(attribute=attribute, indicator=indicator, params=params)
+            for attribute, indicator, params in template.STARTER_INDICATORS
+        ],
+        state=dict(template.STARTER_STATE),
+    )
+
+
+def _draft(request: StrategyDraftRequest) -> authoring.StrategyDraft:
+    return authoring.StrategyDraft(
+        body=request.body,
+        state=dict(request.state or {}),
+        indicators=tuple(
+            authoring.IndicatorSpec(
+                attribute=spec.attribute, indicator=spec.indicator, params=spec.params
+            )
+            for spec in request.indicators
+        ),
+    )
+
+
+def check_draft(request: StrategyDraftRequest) -> StrategyCheckResult:
+    """Check a fragment, reporting every line as the member's own.
+
+    Same verdict semantics as :func:`check_strategy` — incompatible is a
+    successful check — plus the assembled file, so the editor can show what
+    will actually run.
+    """
+    draft = _draft(request)
+    assembled = authoring.assemble(draft)
+    report = authoring.check_draft(draft)
+
+    return StrategyCheckResult(
+        status=(
+            CompatibilityStatus.COMPATIBLE
+            if report.compatible
+            else CompatibilityStatus.INCOMPATIBLE
+        ),
+        ok=report.compatible,
+        class_name=report.class_name,
+        issues=[
+            CompatibilityIssue(line=issue.line, message=issue.message)
+            for issue in report.issues
+        ],
+        warnings=[
+            CompatibilityIssue(line=warning.line, message=warning.message)
+            for warning in report.warnings
+        ],
+        message=(
+            f"{report.class_name} is compatible with the engine. Submitting it "
+            "starts the validation backtest that proves it runs."
+            if report.compatible
+            else f"{len(report.issues)} problem"
+            f"{'' if len(report.issues) == 1 else 's'} to fix before this can run here."
+        ),
+        assembled_source=assembled.source,
+        body_offset=assembled.body_offset,
+    )
+
+
+async def submit_draft(
+    submission: StrategyDraftSubmission, *, owner_id: uuid.UUID | None = None
+) -> StrategySubmissionResult:
+    """Assemble a fragment and submit it exactly as an uploaded file.
+
+    The whole point is the delegation: once assembled there is nothing special
+    about a draft, so it goes through :func:`submit_strategy` — same scan, same
+    store, same registry row, same validation backtest. Nothing about the
+    upload path is duplicated or forked here.
+    """
+    # assemble_checked, not assemble: the submit path has to apply the same
+    # structural assertions the check endpoint does, or a draft refused by one
+    # is stored by the other.
+    assembled = authoring.assemble_checked(_draft(submission))
+
+    # The pre-assembly body limit does not bound the file: indicators and state
+    # add to it. `POST /strategies` enforces this at the route, and this path
+    # goes straight to the service, so it enforces it here.
+    size = len(assembled.source.encode("utf-8"))
+    if size > MAX_SOURCE_BYTES:
+        raise strategy_validation.StrategyValidationError(
+            f"The assembled strategy is {size} bytes; the limit is {MAX_SOURCE_BYTES}."
+        )
+    logger.info(
+        "UPLOAD | Assembled a draft; name=%r body_lines=%d indicators=%d",
+        submission.name,
+        assembled.body_lines,
+        len(submission.indicators),
+    )
+    return await submit_strategy(
+        StrategySubmission(
+            name=submission.name,
+            description=submission.description,
+            source=assembled.source,
+            filename=submission.filename,
+        ),
+        # Recorded so the editor can reopen this as the fragment it was, rather
+        # than as the assembled file. Without it, editing a draft would hand
+        # back generated boilerplate the member never wrote.
+        authoring={
+            "body": submission.body,
+            "indicators": [spec.model_dump() for spec in submission.indicators],
+            "state": dict(submission.state),
+        },
+        owner_id=owner_id,
     )
 
 
@@ -232,7 +410,12 @@ def _check_message(
     )
 
 
-async def submit_strategy(submission: StrategySubmission, *, owner_id: uuid.UUID | None = None) -> StrategySubmissionResult:
+async def submit_strategy(
+    submission: StrategySubmission,
+    *,
+    authoring: dict | None = None,
+    owner_id: uuid.UUID | None = None,
+) -> StrategySubmissionResult:
     """Store an upload and start the backtest that proves it works.
 
     Four steps, in this order for a reason. The source is scanned first, so a
@@ -283,6 +466,7 @@ async def submit_strategy(submission: StrategySubmission, *, owner_id: uuid.UUID
                 universe=list(config["TICKERS"]),
                 param_specs=strategy_validation.parameter_specs(),
                 storage_key=storage_key,
+                authoring=authoring,
                 class_path=None,
             )
     except Exception:
@@ -358,16 +542,78 @@ async def _discard_unregistered_source(key: str) -> None:
         )
 
 
+async def get_strategy_source(key: str) -> StrategySource | None:
+    """The Python this strategy was registered with, read back from the store.
+
+    This is what makes a saved strategy editable. Source went into the store on
+    upload and nothing could read it back out, so the editor could only ever
+    start from the template — correcting one typo meant retyping the file.
+
+    None when the key is unknown, or when the row has no stored package: the
+    built-ins that ship with the engine were never uploaded. Read as text and
+    never imported, because answering a GET must not execute anything.
+    """
+    await ensure_schema()
+    async with session_scope() as session:
+        row = await strategies_repo.get_strategy_row(session, key)
+
+    if row is None or not row.strategy.storage_key:
+        return None
+
+    storage_key = row.strategy.storage_key
+    try:
+        source = await asyncio.to_thread(_read_stored_source, storage_key)
+    except KeyError:
+        # The row outlived its package. Reported as "no source" rather than a
+        # 500: there is nothing the caller can do about it, and the registry
+        # entry itself is still real.
+        logger.warning("SOURCE | Package missing; strategy=%s key=%s", key, storage_key)
+        return None
+
+    # A fragment-authored strategy reopens as its fragment; an uploaded one
+    # reopens as the file. `authoring` being NULL is what distinguishes them.
+    authored = row.strategy.authoring or {}
+    return StrategySource(
+        filename="strategy.py",
+        source=source,
+        body=authored.get("body"),
+        indicators=(
+            [IndicatorSpec(**spec) for spec in authored["indicators"]]
+            if authored.get("indicators") is not None
+            else None
+        ),
+        state=authored.get("state"),
+    )
+
+
+def _read_stored_source(storage_key: str) -> str:
+    return get_strategy_store().get(storage_key, "strategy.py")
+
+
+class StrategyInUse(RuntimeError):
+    """A strategy has backtests recorded against it and cannot be deleted.
+
+    Runs hold a ``RESTRICT`` foreign key to the strategy, so the database
+    refuses the delete at commit. Translated here so routes never have to know
+    what an ``IntegrityError`` is.
+    """
+
+
 async def delete_strategy(key: str) -> bool:
     """Remove a registry row and any source stored for it.
 
     The store is emptied after the row is gone, not before: an orphaned object
     in the store is invisible and harmless, while a row pointing at source that
     has been deleted is a strategy that fails at run time for no stated reason.
+
+    Raises :class:`StrategyInUse` when runs still reference the strategy.
     """
     await ensure_schema()
-    async with session_scope() as session:
-        removed = await strategies_repo.delete_strategy(session, key)
+    try:
+        async with session_scope() as session:
+            removed = await strategies_repo.delete_strategy(session, key)
+    except IntegrityError as exc:
+        raise StrategyInUse(key) from exc
 
     if removed:
         await asyncio.to_thread(strategy_validation.discard_stored_source, key)
