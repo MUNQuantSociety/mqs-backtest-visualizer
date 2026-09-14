@@ -7,6 +7,7 @@ Provider errors are reported separately from tickers with no history.
 from __future__ import annotations
 
 import uuid
+from fastapi import APIRouter, HTTPException, Query, status
 
 from src.schemas.market_data import (
     CoverageResponse,
