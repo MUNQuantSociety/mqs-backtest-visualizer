@@ -47,12 +47,16 @@ class CoverageResponse(CamelModel):
 
 
 class TickerValidation(CamelModel):
+    """Whether FMP recognizes a ticker as an exact symbol."""
+
     ticker: str
+    # Closed on purpose: the OpenAPI enum is what the run form switches on.
+    # A provider failure is a 503, never a third status.
     status: Literal["valid", "unknown"]
 
 
 class TickerValidationResponse(CamelModel):
-    """FMP symbol recognition; 'valid' does not promise historical coverage."""
+    """Validation result for the run form's explicit ticker additions."""
 
     tickers: list[TickerValidation]
     unknown: list[str]

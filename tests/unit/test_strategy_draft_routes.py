@@ -5,21 +5,26 @@ behaviour worth protecting is that a draft is not a second pipeline: once
 assembled it goes through exactly what an uploaded file goes through.
 """
 
+import uuid
 from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from src.api.dependencies.current_user import require_current_user
 from src.api.routes.strategies import router
 from src.schemas.strategies import MAX_BODY_BYTES, StrategySubmissionResult
 from src.services import strategies as strategies_service
+
+OWNER = uuid.UUID(int=1)
 
 
 @pytest.fixture
 def api() -> TestClient:
     app = FastAPI()
     app.include_router(router, prefix="/api")
+    app.dependency_overrides[require_current_user] = lambda: OWNER
     return TestClient(app)
 
 
@@ -88,6 +93,59 @@ class TestCheckDraft:
         assert response.status_code == 422
 
 
+class TestReservedNames:
+    """STATE and INDICATORS entries become ``self.<name>`` via setattr, after
+    ``__init__`` — a draft naming ``executor`` would replace the real one."""
+
+    def _check(self, api, **fields):
+        return api.post("/api/strategies/check/draft", json={"body": GOOD_BODY, **fields})
+
+    @pytest.mark.parametrize("key", ["executor", "tickers", "OnData", "AddIndicator", "STATE"])
+    def test_a_state_key_the_base_class_owns_is_refused(self, api, key):
+        response = self._check(api, state={key: 0})
+
+        assert response.status_code == 422
+        assert "reserved" in response.text
+
+    @pytest.mark.parametrize("key", ["not an identifier", "class", "None", "for"])
+    def test_a_state_key_that_is_not_a_usable_identifier_is_refused(self, api, key):
+        response = self._check(api, state={key: 0})
+
+        assert response.status_code == 422
+        assert "identifiers" in response.text
+
+    def test_an_indicator_attribute_that_is_a_keyword_is_refused(self, api):
+        response = self._check(
+            api, indicators=[{"attribute": "class", "indicator": "SimpleMovingAverage", "params": {}}]
+        )
+
+        assert response.status_code == 422
+        assert "keyword" in response.text
+
+    def test_an_indicator_attribute_the_base_class_owns_is_refused(self, api):
+        response = self._check(
+            api, indicators=[{"attribute": "tickers", "indicator": "SimpleMovingAverage", "params": {}}]
+        )
+
+        assert response.status_code == 422
+        assert "reserved" in response.text
+
+    def test_a_name_used_as_both_state_and_indicator_is_refused(self, api):
+        response = self._check(
+            api,
+            state={"fast": 0},
+            indicators=[{"attribute": "fast", "indicator": "SimpleMovingAverage", "params": {}}],
+        )
+
+        assert response.status_code == 422
+        assert "both" in response.text
+
+    def test_an_ordinary_state_key_still_passes(self, api):
+        response = self._check(api, state={"last_signal": {}, "cooldown_until": None})
+
+        assert response.status_code == 200
+
+
 class TestSubmitDraft:
     def test_it_delegates_to_the_upload_path(self, api, monkeypatch):
         submit = AsyncMock(
@@ -110,6 +168,8 @@ class TestSubmitDraft:
         assert "class MyStrategy(BasePortfolio):" in sent.source
         assert GOOD_BODY.splitlines()[0] in sent.source
         assert sent.name == "Mine"
+        # The draft is attributed to its author exactly as an upload is.
+        assert submit.await_args.kwargs["owner_id"] == OWNER
 
     def test_a_nameless_draft_is_refused(self, api):
         assert api.post("/api/strategies/draft", json={"body": GOOD_BODY}).status_code == 422

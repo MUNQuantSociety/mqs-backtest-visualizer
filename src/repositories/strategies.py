@@ -95,10 +95,12 @@ async def create_strategy(
     source_staging: str | None = None,
     # Set only for a fragment-authored strategy; NULL means "a whole file".
     authoring: dict | None = None,
+    owner_id: uuid.UUID | None = None,
 ) -> Strategy:
     """Insert a registry row and return it, flushed so the key is usable."""
     strategy = Strategy(
         key=key,
+        owner_id=owner_id,
         name=name,
         description=description,
         tags=tags or [],
@@ -117,14 +119,20 @@ async def create_strategy(
     return strategy
 
 
-async def delete_strategy(session: AsyncSession, key: str) -> bool:
-    """Remove a registry row. Returns False when there was nothing to remove.
+async def delete_strategy(session: AsyncSession, key: str, *, owner_id: uuid.UUID) -> bool:
+    """Remove one of ``owner_id``'s rows. False when there is no such row of theirs.
+
+    Scoped by owner in the query, not checked afterwards: another member's
+    strategy and an unknown key are the same answer, so a probe cannot tell
+    them apart. The built-ins have no owner and therefore never match — the
+    shared catalogue cannot be emptied through this path.
 
     Runs hold a ``RESTRICT`` foreign key to the strategy, so this raises rather
     than orphaning history — deleting a strategy someone has backtested is a
     product decision, not something a cleanup path should do silently.
     """
-    strategy = await session.get(Strategy, key)
+    statement = select(Strategy).where(Strategy.key == key, Strategy.owner_id == owner_id)
+    strategy = (await session.execute(statement)).scalar_one_or_none()
     if strategy is None:
         return False
     await session.delete(strategy)

@@ -1,6 +1,7 @@
 """FMP exact symbol recognition, caching and authenticated submission enforcement."""
 
 import asyncio
+from contextlib import asynccontextmanager
 import io
 import json
 import threading
@@ -81,6 +82,29 @@ def test_anonymous_identity_header_is_rejected_before_fmp(monkeypatch):
     with TestClient(app) as client:
         response = client.get("/api/market-data/validate-tickers?tickers=AAPL", headers={"X-User-Id": str(uuid.UUID(int=1))})
     assert response.status_code == 401 and calls == []
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-User-Id": str(uuid.UUID(int=7))}])
+def test_development_identity_bypass_still_reaches_the_lookup(monkeypatch, headers):
+    # AUTH_ALLOW_DEV_IDENTITY=true with APP_ENV=development and no Cognito
+    # settings: no bearer token, the temporary user or X-User-Id stands in.
+    calls = transport(monkeypatch, lambda ticker: [{"symbol": ticker}])
+    monkeypatch.setattr(current_user, "settings", SimpleNamespace(app_env="development", auth_allow_dev_identity=True,
+                        auth_cognito_issuer="", auth_cognito_client_id="", temporary_user_id=str(uuid.UUID(int=1))))
+
+    @asynccontextmanager
+    async def scope():
+        yield object()
+
+    monkeypatch.setattr(current_user, "session_scope", scope)
+    monkeypatch.setattr(current_user.user_creds_repo, "get_user",
+                        AsyncMock(side_effect=lambda session, owner_id: SimpleNamespace(id=owner_id)))
+    app = FastAPI();app.include_router(market_data_api.router, prefix="/api")
+    with TestClient(app) as client:
+        response = client.get("/api/market-data/validate-tickers?tickers=AAPL", headers=headers)
+    assert response.status_code == 200
+    assert response.json() == {"tickers": [{"ticker": "AAPL", "status": "valid"}], "unknown": []}
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("symbols", ["", " ", "AAPL,", "AAPL,,MSFT", "AAPL/BAD", "@AAPL", "A" * 21, ",".join(["A"] * 51)])
@@ -262,3 +286,16 @@ def test_explicit_legacy_database_proof_does_not_contact_fmp(monkeypatch):
     request, coverage, create, dispatch = _submission(monkeypatch)
     assert asyncio.run(backtests.submit_backtest_run(request)) == "queued"
     coverage.assert_awaited_once();create.assert_awaited_once();dispatch.assert_awaited_once()
+
+
+def test_the_status_vocabulary_is_closed():
+    # The run form switches on this enum; a provider failure is a 503, never
+    # a third status the form has no branch for.
+    from pydantic import ValidationError
+
+    from src.schemas.market_data import TickerValidation
+
+    assert TickerValidation(ticker="AAPL", status="valid").status == "valid"
+    with pytest.raises(ValidationError):
+        TickerValidation(ticker="AAPL", status="error")
+    assert TickerValidation.model_json_schema()["properties"]["status"]["enum"] == ["valid", "unknown"]

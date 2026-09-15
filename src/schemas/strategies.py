@@ -7,12 +7,13 @@ a backtest is one test of it.
 from __future__ import annotations
 
 from enum import Enum
+import keyword
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from src.schemas.common import CamelModel
-from src.services.strategy_validation.scanning import known_indicators
+from src.services.strategy_validation.scanning import known_indicators, reserved_attributes
 
 # Largest source file accepted, in bytes. Matches MAX_SOURCE_BYTES on the client
 # so an oversized upload is rejected with the same limit at both ends.
@@ -29,6 +30,15 @@ MAX_INDICATORS = 32
 
 # Both halves of an indicator spec are written into Python source.
 IDENTIFIER_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*$"
+
+
+def _usable_attribute_name(name: str) -> bool:
+    """An identifier the body can actually spell as ``self.<name>``.
+
+    The pattern alone admits keywords: ``setattr(self, "class", …)`` succeeds,
+    and ``self.class`` is then a SyntaxError in the fragment that reads it.
+    """
+    return name.isidentifier() and not keyword.iskeyword(name)
 
 
 class StrategyStatus(str, Enum):
@@ -237,6 +247,21 @@ class IndicatorSpec(CamelModel):
     indicator: str = Field(min_length=1, max_length=64, pattern=IDENTIFIER_PATTERN)
     params: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("attribute")
+    @classmethod
+    def _not_a_base_attribute(cls, value: str) -> str:
+        """Refuse names the base class already binds on the instance.
+
+        The indicator is attached with ``setattr`` after ``__init__``, so a row
+        called ``executor`` or ``tickers`` would replace the real one and the
+        validation run would fail somewhere far from the cause.
+        """
+        if not _usable_attribute_name(value):
+            raise ValueError(f"{value!r} is a Python keyword; the body could not read it.")
+        if value in reserved_attributes():
+            raise ValueError(f"{value!r} is reserved by the strategy base class; choose another name.")
+        return value
+
     @field_validator("indicator")
     @classmethod
     def _known_to_the_engine(cls, value: str) -> str:
@@ -281,6 +306,37 @@ class StrategyDraftRequest(CamelModel):
         if duplicates:
             raise ValueError(f"duplicate indicator attribute(s): {', '.join(duplicates)}.")
         return value
+
+    @field_validator("state")
+    @classmethod
+    def _state_keys_are_safe_attribute_names(cls, value: dict[str, Any]) -> dict[str, Any]:
+        """Every key becomes ``self.<key>`` through ``setattr``, after ``__init__``.
+
+        So it has to be an identifier — the assembler renders the dict with
+        ``repr`` and a non-identifier would still parse, then fail as an
+        attribute — and it must not be one the base class already owns, or
+        the draft's default would overwrite the executor, the tickers, or a
+        method, and the validation run would fail far from the cause.
+        """
+        bad = sorted(key for key in value if not _usable_attribute_name(key))
+        if bad:
+            raise ValueError(f"state key(s) must be Python identifiers: {', '.join(bad)}.")
+        reserved = sorted(key for key in value if key in reserved_attributes())
+        if reserved:
+            raise ValueError(
+                f"state key(s) reserved by the strategy base class: {', '.join(reserved)}."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _state_and_indicators_do_not_share_a_name(self) -> "StrategyDraftRequest":
+        """One name, one attribute: the later ``setattr`` would win silently."""
+        shared = sorted(set(self.state) & {spec.attribute for spec in self.indicators})
+        if shared:
+            raise ValueError(
+                f"name(s) used as both a state key and an indicator attribute: {', '.join(shared)}."
+            )
+        return self
 
 
 class StrategyDraftSubmission(StrategyDraftRequest):

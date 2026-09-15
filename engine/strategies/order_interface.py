@@ -112,29 +112,10 @@ class StrategyContext:
         fallback inside the executor divides by the executor's whole universe,
         which is wrong for any strategy holding a ticker it never trades.
         """
-        asset_data = self.Market[ticker]
-        if not asset_data.Exists or asset_data.Close is None or asset_data.Close <= 0:
-            logging.warning(
-                "Skip trade: no valid market data for %s at %s (Exists=%s, Close=%s)",
-                ticker,
-                self.time,
-                asset_data.Exists,
-                asset_data.Close,
-            )
-            return
-
-        self._executor.execute_trade(
-            portfolio_id=self._portfolio_config["id"],
-            ticker=ticker,
-            signal_type=side,
-            confidence=confidence,
-            arrival_price=asset_data.Close,
-            cash=self.Portfolio.cash,
-            positions=self._positions_df,
-            port_notional=self.Portfolio.total_value,
-            ticker_weight=ticker_weight,
-            timestamp=self.time,
-        )
+        # The same two paths as _trade: with an order manager the executor
+        # only sizes and the OMS owns execution; without one the executor
+        # settles directly. Only the sizing model differs from buy/sell.
+        self._place(ticker, side, confidence, ticker_weight=ticker_weight, target_weight=None)
 
     def _allocation_weight(self, ticker: str) -> float:
         # BasePortfolio passes the existing WEIGHTS/TICKERS config under these
@@ -158,6 +139,17 @@ class StrategyContext:
         return weight
 
     def _trade(self, ticker: str, signal_type: str, confidence: float, *, target_weight: float):
+        self._place(ticker, signal_type, confidence, ticker_weight=0.0, target_weight=target_weight)
+
+    def _place(
+        self,
+        ticker: str,
+        signal_type: str,
+        confidence: float,
+        *,
+        ticker_weight: float,
+        target_weight: float | None,
+    ):
         asset_data = self.Market[ticker]
         if not asset_data.Exists or asset_data.Close is None or asset_data.Close <= 0:
             logging.warning(
@@ -181,7 +173,7 @@ class StrategyContext:
                 cash=self.Portfolio.cash,
                 positions=self._positions_df,
                 port_notional=self.Portfolio.total_value,
-                ticker_weight=0.0,
+                ticker_weight=ticker_weight,
                 target_weight=target_weight,
             )
             if sizing.quantity > 0:
@@ -216,7 +208,7 @@ class StrategyContext:
                 cash=self.Portfolio.cash,
                 positions=self._positions_df,
                 port_notional=self.Portfolio.total_value,
-                ticker_weight=0.0,
+                ticker_weight=ticker_weight,
                 target_weight=target_weight,
                 timestamp=self.time,
             )

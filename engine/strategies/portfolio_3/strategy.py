@@ -20,6 +20,10 @@ class RegimeAdaptiveStrategy(BasePortfolio):
     # at 9:30am) it permanently matched the 9:30-10:00 window, forcing the strategy
     # into mean-reversion mode 100% of the time and making the momentum branch
     # unreachable dead code.
+    # The ticker that sets the regime and is never itself traded. Declared
+    # before INDICATORS so the VIX EMA below can be bound to it by name.
+    REGIME_TICKER = "^VIX"
+
     INDICATORS = {
         "vwap": (
             "VWAP",
@@ -42,7 +46,7 @@ class RegimeAdaptiveStrategy(BasePortfolio):
             "SimpleMovingAverage",
             {"period": 50, "price_col": "close_price"},
         ),
-        "vix_ema": ("ExponentialMovingAverage", {"period": 10}, "^VIX"),
+        "vix_ema": ("ExponentialMovingAverage", {"period": 10}, REGIME_TICKER),
     }
 
     # --- Per-ticker bookkeeping, all keyed by ticker ---
@@ -83,9 +87,6 @@ class RegimeAdaptiveStrategy(BasePortfolio):
     # Stop-loss multiplier: exit if price drops this many ATRs below the recorded entry.
     # 1.5 gives a buffer of roughly 1.5x the recent daily range before cutting the loss.
     STOP_LOSS_ATR_MULT = 3
-
-    # The ticker that sets the regime and is never itself traded.
-    REGIME_TICKER = "^VIX"
 
     def OnData(self, context: StrategyContext):
         """
@@ -259,24 +260,18 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                 current_weight = context.Portfolio.get_asset_weight(ticker, latest_price)
                 # The weight to size from. A flat position reports 0.0, and the
                 # executor's own fallback would then divide by the whole
-                # universe, VIX included — this portfolio never trades VIX, so
-                # the share is one of the tradeable names.
+                # universe, VIX included — this portfolio never trades VIX. A
+                # first entry is sized to the name's configured target, which
+                # is the equal share only when config.json declares no weights.
                 sizing_weight = (
                     current_weight
                     if current_weight != 0.0
-                    else 1.0 / max(n_stocks, 1)
+                    else target_weight
                 )
                 if signal == "BUY" and current_weight >= target_weight * 0.9:
                     self.logger.debug(
                         f"[{ticker}] BUY suppressed: weight {current_weight:.3f} "
                         f">= {target_weight * 0.9:.3f} (already at/near target long)"
-                    )
-                    continue
-
-                if signal == "SELL" and current_weight <= -(target_weight * 0.9):
-                    self.logger.debug(
-                        f"[{ticker}] SELL suppressed: weight {current_weight:.3f} "
-                        f"<= {-(target_weight * 0.9):.3f} (already at/near target short)"
                     )
                     continue
 
@@ -355,9 +350,12 @@ class RegimeAdaptiveStrategy(BasePortfolio):
                         self.entry_regime[ticker] = "high_vol" if is_high_vol else "low_vol"
 
                     elif signal == "SELL":
-                        context.execute(
-                            ticker, "SELL", confidence, ticker_weight=sizing_weight
-                        )
+                        # Close toward flat, never through it. ``execute`` keeps
+                        # the executor's signal model, where a SELL targets
+                        # minus ``ticker_weight`` — a short, which the guard
+                        # above ("sell signals only close existing longs")
+                        # promises never to open. ``sell`` targets weight 0.
+                        context.sell(ticker, confidence)
                         # Record completed trade result for history_factor scaling.
                         if ticker in self.entry_price:
                             pnl = latest_price - self.entry_price[ticker]
