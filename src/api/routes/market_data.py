@@ -11,7 +11,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from src.api.dependencies.current_user import require_current_user
-from src.schemas.market_data import CoverageResponse, TickerValidationResponse
+from src.schemas.market_data import CoverageResponse, SymbolSearchResponse, TickerValidationResponse
 from src.services import market_data as market_data_service
 from src.services.market_data import FMPUnavailable
 
@@ -26,6 +26,25 @@ async def validate_tickers(
     """Check exact FMP symbols before adding them to a backtest universe."""
     try:
         return await market_data_service.validate_tickers(tickers.split(","))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except FMPUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
+@router.get("/search-symbols", response_model=SymbolSearchResponse)
+async def search_symbols(
+    query: str = Query(min_length=1, max_length=20, description="The start of an FMP ticker symbol."),
+    _owner_id: uuid.UUID = Depends(require_current_user),
+) -> SymbolSearchResponse:
+    """Offer symbols while a ticker is being typed.
+
+    Suggestions only: a chosen symbol still goes through ``validate-tickers``
+    before it joins a universe, so this endpoint never has to be right, just
+    helpful. Gated like the validation it feeds — it spends provider quota.
+    """
+    try:
+        return await market_data_service.search_symbols(query)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except FMPUnavailable as exc:

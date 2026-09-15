@@ -1,4 +1,4 @@
-"""Read-only access to ``public.market_data``.
+"""Access to ``public.market_data``: reads, plus the one guarded write the backfill makes.
 
 The live trading system owns this table. This application reads it and must
 never write to it.
@@ -76,3 +76,47 @@ async def ticker_coverage(
             continue
         coverage[ticker] = (first[0], last[0])
     return coverage
+
+
+_DISTINCT_TICKERS_SQL = text("SELECT DISTINCT ticker FROM public.market_data")
+
+
+async def loaded_tickers(session: AsyncSession) -> set[str]:
+    """Every ticker with at least one bar: what this database can already run."""
+    result = await session.execute(_DISTINCT_TICKERS_SQL)
+    return {str(row[0]).strip().upper() for row in result if row[0]}
+
+
+_INSERT_BARS_SQL = text(
+    "INSERT INTO public.market_data "
+    "(ticker, timestamp, date, exchange, open_price, high_price, low_price, close_price, volume) "
+    "VALUES (:ticker, :timestamp, :date, :exchange, :open_price, :high_price, :low_price, :close_price, :volume) "
+    "ON CONFLICT (ticker, timestamp) DO NOTHING"
+)
+
+
+_COUNT_BARS_SQL = text(
+    "SELECT count(*) FROM public.market_data "
+    "WHERE ticker = :ticker AND timestamp BETWEEN :first AND :last"
+)
+
+
+async def insert_daily_bars(session: AsyncSession, rows: list[dict]) -> int:
+    """Add bars the table does not have; the ones it has are left exactly as they were.
+
+    The unique (ticker, timestamp) index makes this idempotent, and it is the
+    reason a backfill never overwrites: the live system owns its own rows.
+    Returns how many were actually written — counted, because a batched
+    insert's rowcount is -1 on asyncpg and says nothing.
+    """
+    if not rows:
+        return 0
+    span = {
+        "ticker": rows[0]["ticker"],
+        "first": min(row["timestamp"] for row in rows),
+        "last": max(row["timestamp"] for row in rows),
+    }
+    before = await session.scalar(_COUNT_BARS_SQL, span)
+    await session.execute(_INSERT_BARS_SQL, rows)
+    after = await session.scalar(_COUNT_BARS_SQL, span)
+    return int(after or 0) - int(before or 0)

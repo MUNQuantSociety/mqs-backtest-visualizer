@@ -102,6 +102,20 @@ class Settings:
     auth_cognito_client_id: str = os.getenv("AUTH_COGNITO_CLIENT_ID", "").strip()
     # Never honored outside development/test or when Cognito is configured.
     auth_allow_dev_identity: bool = _env_bool("AUTH_ALLOW_DEV_IDENTITY", False)
+
+    # Ticker suggestions fall back to Yahoo Finance's unofficial search when
+    # FMP cannot answer. Suggestions only: a chosen symbol is still verified
+    # with FMP. Off when an unsupported third-party call is unwelcome.
+    symbol_search_yahoo_fallback: bool = _env_bool("SYMBOL_SEARCH_YAHOO_FALLBACK", True)
+
+    # In database mode, a universe ticker with no bars in the window is
+    # backfilled from FMP as daily 16:00 New York bars — the port of
+    # MQSMaster's specific backfill, at the granularity a backtest reads. It
+    # writes public.market_data, the live trading table, so it is on only
+    # where that table is a developer's own: APP_ENV=development, or set.
+    market_data_backfill_enabled: bool = _env_bool(
+        "MARKET_DATA_BACKFILL_ENABLED", os.getenv("APP_ENV", "development").lower() == "development"
+    )
     temporary_user_id: str = os.getenv("TEMPORARY_USER_ID", "").strip()
 
     repo_root: Path = REPO_ROOT

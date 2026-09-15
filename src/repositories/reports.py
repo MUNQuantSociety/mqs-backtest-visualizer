@@ -6,10 +6,11 @@ import json
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Engine, delete, func, insert, or_, select
+from sqlalchemy import Engine, delete, func, insert, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models import BacktestReport
+from src.models.base import APP_SCHEMA
 from src.schemas.backtests import BacktestDetail, BacktestStatus, BacktestSummary
 
 REPORT_VERSION = 1
@@ -66,6 +67,24 @@ def save(engine: Engine, owner_id: uuid.UUID, detail: BacktestDetail) -> None:
     values = _record_values(owner_id, detail)
     with engine.begin() as connection:
         connection.execute(insert(BacktestReport).values(**values))
+
+
+_RUN_TICKERS_SQL = text(
+    "SELECT DISTINCT jsonb_array_elements_text(results -> 'parameters' -> 'universe') "
+    f'FROM "{APP_SCHEMA}".backtest_reports '
+    "WHERE jsonb_typeof(results -> 'parameters' -> 'universe') = 'array'"
+)
+
+
+async def run_tickers(session: AsyncSession) -> set[str]:
+    """Every ticker any saved report has traded, across all owners.
+
+    Shared on purpose: which symbols the club has backtested is not private
+    the way the reports themselves are, and it is exactly the set a member
+    is most likely to type next.
+    """
+    result = await session.execute(_RUN_TICKERS_SQL)
+    return {str(row[0]).strip().upper() for row in result if row[0]}
 
 
 async def add_completed_reports(

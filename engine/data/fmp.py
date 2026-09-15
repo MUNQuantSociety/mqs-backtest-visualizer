@@ -26,6 +26,7 @@ from engine.contracts.errors import EngineError, NoMarketData
 logger = logging.getLogger(__name__)
 ENDPOINT = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 SYMBOL_ENDPOINT = "https://financialmodelingprep.com/stable/search-symbol"
+NAME_ENDPOINT = "https://financialmodelingprep.com/stable/search-name"
 SYMBOL_SEARCH_LIMIT = 100
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
@@ -120,14 +121,40 @@ class FMPMarketData:
             return payload
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def symbol_exists(self, ticker: str) -> bool:
-        """Recognize an exact provider symbol independently of its daily history."""
+    def search_symbols(self, query: str, *, limit: int = SYMBOL_SEARCH_LIMIT) -> list[dict]:
+        """The provider's symbols starting with ``query``, at most ``limit`` rows.
+
+        FMP's search is a prefix match over its whole symbol table. Every row
+        carries a ``symbol``; ``name`` and ``exchangeFullName`` are usually
+        present and left to the caller to read tolerantly. Only the symbol is
+        checked here, because it is the one field every consumer relies on.
+        """
         rows = self._request_list(
-            SYMBOL_ENDPOINT, {"query": ticker, "limit": SYMBOL_SEARCH_LIMIT},
-            label=f"symbol lookup for {ticker}", response_limit=512_000,
+            SYMBOL_ENDPOINT, {"query": query, "limit": limit},
+            label=f"symbol lookup for {query}", response_limit=512_000,
         )
         if any(not isinstance(row.get("symbol"), str) or not row["symbol"].strip() for row in rows):
-            raise FMPUnavailable(f"FMP returned invalid symbol metadata for {ticker}. Retry shortly.")
+            raise FMPUnavailable(f"FMP returned invalid symbol metadata for {query}. Retry shortly.")
+        return rows
+
+    def search_names(self, query: str, *, limit: int = SYMBOL_SEARCH_LIMIT) -> list[dict]:
+        """Symbols whose company name contains ``query``; same row shape as a symbol search.
+
+        A person who types "micro" means Microsoft, not the futures contract
+        whose symbol starts with those letters. Lists every exchange the
+        company trades on; the caller keeps the ones the engine can run.
+        """
+        rows = self._request_list(
+            NAME_ENDPOINT, {"query": query, "limit": limit},
+            label=f"name lookup for {query}", response_limit=512_000,
+        )
+        if any(not isinstance(row.get("symbol"), str) or not row["symbol"].strip() for row in rows):
+            raise FMPUnavailable(f"FMP returned invalid symbol metadata for {query}. Retry shortly.")
+        return rows
+
+    def symbol_exists(self, ticker: str) -> bool:
+        """Recognize an exact provider symbol independently of its daily history."""
+        rows = self.search_symbols(ticker)
         if any(row["symbol"].strip().upper() == ticker for row in rows):
             return True
         # A capped prefix-search page cannot prove absence. Never turn an

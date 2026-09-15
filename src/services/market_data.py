@@ -17,14 +17,24 @@ import threading
 import time
 from zoneinfo import ZoneInfo
 
-from engine.data.fmp import FMPMarketData, FMPSymbolUnknown, market_data_source
+from engine.data import yahoo
+from engine.data.fmp import FMPMarketData, FMPSymbolUnknown, fetch_daily_history, market_data_source
 from engine.data.fmp import FMPUnavailable as FMPUnavailable
 
+from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
 from src.repositories import market_data as market_data_repo
+from src.repositories import reports as reports_repo
 from src.repositories import strategies as strategies_repo
-from src.schemas.market_data import CoverageResponse, TickerCoverage, TickerValidation, TickerValidationResponse
+from src.schemas.market_data import (
+    CoverageResponse,
+    SymbolMatch,
+    SymbolSearchResponse,
+    TickerCoverage,
+    TickerValidation,
+    TickerValidationResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +46,47 @@ _symbol_lock = threading.Lock()
 _symbol_requests = threading.BoundedSemaphore(4)
 _symbol_clock = time.monotonic
 
+# Prefix suggestions, keyed by the normalized prefix. Same lock and the same
+# semaphore as the exact lookups: the provider cap is one number for the
+# whole process, not one per endpoint. A short TTL because a prefix page is
+# only ever a hint; the exact lookup remains the verdict.
+SYMBOL_SEARCH_RESULTS = 10
+_SEARCH_TTL_SECONDS = 300
+_SEARCH_CACHE_SIZE = 256
+_search_cache: OrderedDict[str, tuple[float, list[SymbolMatch], bool]] = OrderedDict()
+_search_pending: dict[str, Future] = {}
+_SYMBOL_PATTERN = re.compile(r"[A-Z0-9^][A-Z0-9.^=-]{0,19}")
+
+# The engine trades the New York session; a listing elsewhere would validate
+# and then run against the wrong calendar. Spelled the way each provider does.
+_US_EXCHANGES_FMP = frozenset({"NYSE", "NASDAQ", "AMEX"})
+_US_EXCHANGES_YAHOO = frozenset({"NYSE", "NASDAQ", "NYSEARCA", "NYSE AMERICAN", "AMEX", "BATS"})
+
+# Tickers this deployment already knows: every symbol with bars in
+# public.market_data and every symbol a saved report has traded. Answered from
+# memory, so a suggestion for them costs nothing and validation skips the
+# provider. Re-read every few minutes and whenever a report is saved.
+_KNOWN_TTL_SECONDS = 300
+_KNOWN_RETRY_SECONDS = 30
+_known_tickers: tuple[float, dict[str, str]] | None = None
+_known_lock = threading.Lock()
+
 
 def normalize_tickers(tickers: list[str]) -> list[str]:
     if not 1 <= len(tickers) <= 50 or any(not isinstance(t, str) for t in tickers):
         raise ValueError("Pass between 1 and 50 ticker symbols.")
     wanted = [ticker.strip().upper() for ticker in tickers]
-    if any(not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=-]{0,19}", ticker) for ticker in wanted):
+    if any(not _SYMBOL_PATTERN.fullmatch(ticker) for ticker in wanted):
         raise ValueError("Enter valid ticker symbols of at most 20 characters.")
     return list(dict.fromkeys(wanted))
+
+
+def normalize_search_query(query: str) -> str:
+    """The prefix a suggestion request may ask about: a partial ticker, nothing more."""
+    prefix = query.strip().upper()
+    if not _SYMBOL_PATTERN.fullmatch(prefix):
+        raise ValueError("Enter part of a ticker symbol, at most 20 characters.")
+    return prefix
 
 
 def _fmp_symbol_exists(ticker: str) -> bool:
@@ -76,12 +119,217 @@ def _fmp_symbol_exists(ticker: str) -> bool:
             _symbol_pending.pop(ticker, None)
 
 
+def _remember_symbols(symbols: list[str]) -> None:
+    """A symbol the provider just listed exists; say so before anyone asks.
+
+    Called under ``_symbol_lock``. The selection that follows a suggestion
+    goes through the exact lookup, and this is what makes that lookup a
+    cache hit rather than a second provider call for the same page. Only a
+    positive verdict is written: a page can prove presence, never absence.
+    A symbol someone is already looking up is left to that lookup.
+    """
+    expires = _symbol_clock() + 3600
+    for symbol in symbols:
+        if symbol in _symbol_pending:
+            continue
+        _symbol_cache[symbol] = (expires, True)
+        _symbol_cache.move_to_end(symbol)
+    while len(_symbol_cache) > 512:
+        _symbol_cache.popitem(last=False)
+
+
+def _to_match(row: dict, source: str) -> SymbolMatch:
+    name = row.get("name")
+    exchange = row.get("exchangeFullName") or row.get("exchange")
+    return SymbolMatch(
+        symbol=row["symbol"].strip().upper(),
+        name=name.strip() if isinstance(name, str) and name.strip() else None,
+        exchange=exchange.strip() if isinstance(exchange, str) and exchange.strip() else None,
+        source=source,
+    )
+
+
+def _is_us_listing(row: dict) -> bool:
+    code = row.get("exchange")
+    currency = row.get("currency")
+    return (
+        isinstance(code, str) and code.strip().upper() in _US_EXCHANGES_FMP
+        and (currency is None or (isinstance(currency, str) and currency.upper() == "USD"))
+    )
+
+
+def _fmp_search_symbols(prefix: str) -> tuple[list[SymbolMatch], bool]:
+    """FMP's symbols starting with ``prefix`` and companies named like it, US listings only."""
+    with _symbol_lock:
+        cached = _search_cache.get(prefix)
+        if cached is not None and cached[0] > _symbol_clock():
+            _search_cache.move_to_end(prefix)
+            return cached[1], cached[2]
+        pending = _search_pending.get(prefix)
+        leader = pending is None
+        if leader:
+            pending = _search_pending[prefix] = Future()
+    if not leader:
+        return pending.result()
+    try:
+        with _symbol_requests:
+            provider = FMPMarketData()
+            # One more than we show, so a full page is known to be a cut.
+            by_symbol = provider.search_symbols(prefix, limit=SYMBOL_SEARCH_RESULTS + 1)
+            # Two letters match too many company names to be worth a call;
+            # by then the symbol search is the better guess anyway.
+            by_name = provider.search_names(prefix, limit=SYMBOL_SEARCH_RESULTS + 1) if len(prefix) >= 3 else []
+        seen: set[str] = set()
+        rows: list[dict] = []
+        for row in [*by_symbol, *by_name]:
+            symbol = row["symbol"].strip().upper()
+            if symbol in seen or not _is_us_listing(row):
+                continue
+            seen.add(symbol)
+            rows.append(row)
+        truncated = len(rows) > SYMBOL_SEARCH_RESULTS
+        matches = [_to_match(row, "fmp") for row in rows[:SYMBOL_SEARCH_RESULTS]]
+        with _symbol_lock:
+            _search_cache[prefix] = (_symbol_clock() + _SEARCH_TTL_SECONDS, matches, truncated)
+            _search_cache.move_to_end(prefix)
+            while len(_search_cache) > _SEARCH_CACHE_SIZE:
+                _search_cache.popitem(last=False)
+            _remember_symbols([match.symbol for match in matches])
+        pending.set_result((matches, truncated))
+        return matches, truncated
+    except BaseException as error:
+        pending.set_exception(error)
+        raise
+    finally:
+        with _symbol_lock:
+            _search_pending.pop(prefix, None)
+
+
+def _yahoo_search_symbols(prefix: str) -> tuple[list[SymbolMatch], bool]:
+    """The unofficial fallback, US equities and ETFs only. Never warms the exact cache."""
+    with _symbol_requests:
+        quotes = yahoo.search_symbols(prefix)
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for quote in quotes:
+        symbol = quote.get("symbol")
+        exchange = quote.get("exchDisp") or quote.get("exchange")
+        if not isinstance(symbol, str) or not symbol.strip():
+            continue
+        if quote.get("quoteType") not in {"EQUITY", "ETF"}:
+            continue
+        if not isinstance(exchange, str) or exchange.strip().upper() not in _US_EXCHANGES_YAHOO:
+            continue
+        symbol = symbol.strip().upper()
+        if symbol in seen or not symbol.startswith(prefix):
+            continue
+        seen.add(symbol)
+        rows.append({"symbol": symbol, "name": quote.get("shortname") or quote.get("longname"), "exchange": exchange})
+    truncated = len(rows) > SYMBOL_SEARCH_RESULTS
+    return [_to_match(row, "yahoo") for row in rows[:SYMBOL_SEARCH_RESULTS]], truncated
+
+
+async def load_known_tickers() -> dict[str, str]:
+    """Ticker → why it is known. Reads the database; replaced in tests.
+
+    Database mode only. With FMP as the price source the provider is the
+    authority on what exists, and coverage in that mode is promised never to
+    open a database session — a promise the index would otherwise break.
+    """
+    if market_data_source() == "fmp":
+        return {}
+    known: dict[str, str] = {}
+    async with session_scope() as session:
+        try:
+            for ticker in await market_data_repo.loaded_tickers(session):
+                known[ticker] = "database"
+        except Exception:  # noqa: BLE001 - the live table may not exist on this database
+            logger.warning("SEARCH | public.market_data is not readable; known tickers come from runs only")
+        for ticker in await reports_repo.run_tickers(session):
+            known.setdefault(ticker, "run")
+    return known
+
+
+async def known_tickers() -> dict[str, str]:
+    global _known_tickers
+    now = _symbol_clock()
+    with _known_lock:
+        if _known_tickers is not None and _known_tickers[0] > now:
+            return _known_tickers[1]
+    try:
+        loaded = await load_known_tickers()
+        ttl = _KNOWN_TTL_SECONDS
+    except Exception:  # noqa: BLE001 - suggestions must not fail because the index could not load
+        logger.exception("SEARCH | Known tickers could not be loaded; retrying shortly")
+        loaded, ttl = {}, _KNOWN_RETRY_SECONDS
+    with _known_lock:
+        _known_tickers = (_symbol_clock() + ttl, loaded)
+    return loaded
+
+
+def invalidate_known_tickers() -> None:
+    """A report was saved or bars were written: the next request re-reads."""
+    global _known_tickers
+    with _known_lock:
+        _known_tickers = None
+
+
+async def search_symbols(query: str) -> SymbolSearchResponse:
+    """Suggestions for ``query``: what this deployment knows, then what the providers know.
+
+    Known tickers come first and cost nothing. The provider is asked only
+    when they leave room on the page. FMP is the provider; Yahoo's unofficial
+    search stands in when FMP cannot answer, and when neither can, the known
+    tickers are still returned with the failure noted rather than a 503 —
+    unless there is nothing at all to show.
+    """
+    prefix = normalize_search_query(query)
+    known = await known_tickers()
+    known_matches = [
+        SymbolMatch(symbol=ticker, source=source)
+        for ticker, source in sorted(known.items())
+        if ticker.startswith(prefix)
+    ]
+    if len(known_matches) >= SYMBOL_SEARCH_RESULTS:
+        return SymbolSearchResponse(matches=known_matches[:SYMBOL_SEARCH_RESULTS], truncated=True)
+
+    provider_error: str | None = None
+    provider_matches: list[SymbolMatch] = []
+    truncated = False
+    try:
+        provider_matches, truncated = await asyncio.to_thread(_fmp_search_symbols, prefix)
+    except FMPUnavailable as fmp_error:
+        if settings.symbol_search_yahoo_fallback:
+            try:
+                provider_matches, truncated = await asyncio.to_thread(_yahoo_search_symbols, prefix)
+            except yahoo.YahooUnavailable as yahoo_error:
+                logger.warning("SEARCH | Both providers failed; fmp=%s yahoo=%s", fmp_error, yahoo_error)
+                provider_error = str(fmp_error)
+        else:
+            provider_error = str(fmp_error)
+        if provider_error is not None and not known_matches:
+            raise fmp_error
+
+    known_symbols = {match.symbol for match in known_matches}
+    merged = known_matches + [m for m in provider_matches if m.symbol not in known_symbols]
+    if len(merged) > SYMBOL_SEARCH_RESULTS:
+        truncated = True
+    return SymbolSearchResponse(
+        matches=merged[:SYMBOL_SEARCH_RESULTS], truncated=truncated, provider_error=provider_error
+    )
+
+
 async def validate_tickers(tickers: list[str]) -> TickerValidationResponse:
     """Look up FMP metadata only; no database price or history request."""
     wanted = normalize_tickers(tickers)
+    known = await known_tickers()
     limit = asyncio.Semaphore(4)
 
     async def lookup(ticker):
+        # Bars in the database or a saved run: the symbol is real, no need
+        # to spend a provider call proving it.
+        if ticker in known:
+            return TickerValidation(ticker=ticker, status="valid")
         async with limit:
             exists = await asyncio.to_thread(_fmp_symbol_exists, ticker)
             return TickerValidation(ticker=ticker, status="valid" if exists else "unknown")
@@ -131,6 +379,55 @@ async def _fmp_coverage(tickers: list[str]) -> dict[str, tuple[date, date] | Non
     return dict(await asyncio.gather(*(lookup(ticker) for ticker in tickers)))
 
 
+async def backfill_missing(tickers: list[str], start: date, end: date) -> dict[str, int]:
+    """Load daily bars for ``tickers`` into ``public.market_data`` over ``start..end``.
+
+    The port of MQSMaster's ``specific_backfill``: fetch from FMP, insert what
+    the table lacks, leave what it has. Daily 16:00 New York bars rather than
+    MQSMaster's intraday minutes, because that is what a backtest here reads
+    and it is one provider call per ticker for the whole window. A ticker the
+    provider has nothing for is simply reported with 0 — the caller's
+    coverage still shows it missing, and that is the honest answer.
+    """
+    written: dict[str, int] = {}
+    for ticker in tickers:
+        try:
+            frame = await asyncio.to_thread(fetch_daily_history, [ticker], start, end, require_all=False)
+        except FMPUnavailable as exc:
+            logger.warning("BACKFILL | %s skipped; provider unavailable: %s", ticker, exc)
+            written[ticker] = 0
+            continue
+        rows = [
+            {
+                "ticker": ticker,
+                "timestamp": row.timestamp.to_pydatetime(),
+                "date": row.timestamp.date(),
+                "exchange": "NASDAQ",
+                "open_price": float(row.open_price),
+                "high_price": float(row.high_price),
+                "low_price": float(row.low_price),
+                "close_price": float(row.close_price),
+                "volume": int(row.volume),
+            }
+            for row in frame.itertuples(index=False)
+        ]
+        async with session_scope() as session:
+            written[ticker] = await market_data_repo.insert_daily_bars(session, rows)
+        logger.info("BACKFILL | %s: %d bars written for %s..%s", ticker, written[ticker], start, end)
+    if any(written.values()):
+        invalidate_known_tickers()
+    return written
+
+
+def _backfill_window(spans: dict[str, tuple[date, date] | None]) -> tuple[date, date]:
+    """The dates a new ticker should cover: what the others already do, else the last two years."""
+    present = [span for span in spans.values() if span is not None]
+    yesterday = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=1)
+    if present:
+        return min(first for first, _ in present), max(last for _, last in present)
+    return yesterday - timedelta(days=730), yesterday
+
+
 async def coverage_for(tickers: list[str]) -> CoverageResponse:
     """Coverage for a ticker set, and the window safe for every one of them.
 
@@ -146,6 +443,17 @@ async def coverage_for(tickers: list[str]) -> CoverageResponse:
     else:
         async with session_scope() as session:
             spans = await market_data_repo.ticker_coverage(session, tickers)
+        # A ticker the form was just given and the table has never seen:
+        # fetch its history now, over the window the rest of the universe
+        # covers, and read the table again. The person sees the dot turn
+        # green rather than a run they cannot start.
+        absent = [ticker for ticker, span in spans.items() if span is None]
+        if absent and settings.market_data_backfill_enabled:
+            first, last = _backfill_window(spans)
+            written = await backfill_missing(absent, first, last)
+            if any(written.values()):
+                async with session_scope() as session:
+                    spans = await market_data_repo.ticker_coverage(session, tickers)
 
     items: list[TickerCoverage] = []
     missing: list[str] = []
