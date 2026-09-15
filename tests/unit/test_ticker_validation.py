@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import io
 import json
 import threading
@@ -35,8 +36,21 @@ def isolated_provider(monkeypatch):
     monkeypatch.setattr(market_data, "session_scope", lambda: pytest.fail("Ticker validation must not read market-data DB"))
     monkeypatch.setattr(fmp.FMPMarketData, "get_historical_data", lambda *args: pytest.fail("Symbol lookup must not infer identity from history"))
     market_data._symbol_cache.clear()
+    market_data._search_cache.clear()
+    # The known-ticker index reads the database; here it is whatever a test
+    # says it is, and empty unless one says otherwise.
+    market_data.invalidate_known_tickers()
+    monkeypatch.setattr(market_data, "load_known_tickers", AsyncMock(return_value={}))
+    monkeypatch.setattr(market_data, "settings", replace(market_data.settings, symbol_search_yahoo_fallback=True))
+    # No test reaches the real Yahoo: by default it is simply down, and a
+    # test that wants it answering stubs the transport itself.
+    def yahoo_down(*args, **kwargs):
+        raise URLError("stubbed")
+    monkeypatch.setattr(market_data.yahoo, "urlopen", yahoo_down)
     yield
     market_data._symbol_cache.clear()
+    market_data._search_cache.clear()
+    market_data.invalidate_known_tickers()
 
 
 def transport(monkeypatch, payload):
@@ -299,3 +313,285 @@ def test_the_status_vocabulary_is_closed():
     with pytest.raises(ValidationError):
         TickerValidation(ticker="AAPL", status="error")
     assert TickerValidation.model_json_schema()["properties"]["status"]["enum"] == ["valid", "unknown"]
+
+
+# --- symbol search: suggestions while a ticker is typed -----------------------
+
+SEARCH = "/api/market-data/search-symbols"
+
+
+def rows(*symbols, **extra):
+    return [
+        {"symbol": symbol, "name": f"{symbol} Inc", "exchange": "NASDAQ", "exchangeFullName": "NASDAQ",
+         "currency": "USD", **extra}
+        for symbol in symbols
+    ]
+
+
+def test_search_answers_matches_in_provider_order_with_names_and_exchanges(api, monkeypatch):
+    calls = transport(monkeypatch, rows("MSFT", "MSTR"))
+
+    response = api.get(SEARCH, params={"query": " ms "})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "matches": [
+            {"symbol": "MSFT", "name": "MSFT Inc", "exchange": "NASDAQ", "source": "fmp"},
+            {"symbol": "MSTR", "name": "MSTR Inc", "exchange": "NASDAQ", "source": "fmp"},
+        ],
+        "truncated": False,
+        "providerError": None,
+    }
+    (call,) = calls
+    assert call[:3] == ("https", "financialmodelingprep.com", "/stable/search-symbol")
+    # One more than shown, so a full page is known to be a cut; the query is
+    # normalized before it reaches the provider.
+    assert call[3]["query"] == ["MS"] and call[3]["limit"] == ["11"]
+    assert call[3]["apikey"] == ["test-secret-never-logged"] and call[4] == 6
+
+
+def test_search_tolerates_missing_metadata_but_not_a_missing_symbol(api, monkeypatch):
+    transport(monkeypatch, [{"symbol": "MSFT", "exchange": "NASDAQ"}, {"symbol": "MSTR", "name": 7, "exchange": "NASDAQ"}])
+    response = api.get(SEARCH, params={"query": "MS"})
+    assert response.status_code == 200
+    assert response.json()["matches"] == [
+        {"symbol": "MSFT", "name": None, "exchange": "NASDAQ", "source": "fmp"},
+        {"symbol": "MSTR", "name": None, "exchange": "NASDAQ", "source": "fmp"},
+    ]
+
+    market_data._search_cache.clear()
+    calls = transport(monkeypatch, [{"symbol": "MSFT"}, {"name": "no symbol"}])
+    assert api.get(SEARCH, params={"query": "MS"}).status_code == 503
+    # Not cached: the next request asks the provider again.
+    assert api.get(SEARCH, params={"query": "MS"}).status_code == 503
+    assert len(calls) == 2
+
+
+def test_search_marks_a_full_page_as_truncated_and_shows_ten(api, monkeypatch):
+    transport(monkeypatch, rows(*(f"A{i:02d}" for i in range(11))))
+
+    body = api.get(SEARCH, params={"query": "A"}).json()
+
+    assert body["truncated"] is True
+    assert [m["symbol"] for m in body["matches"]] == [f"A{i:02d}" for i in range(10)]
+
+
+def test_search_pages_are_cached_by_prefix_until_they_expire(api, monkeypatch):
+    calls = transport(monkeypatch, rows("MSFT"))
+    now = [1000.0]
+    monkeypatch.setattr(market_data, "_symbol_clock", lambda: now[0])
+
+    assert api.get(SEARCH, params={"query": "MS"}).status_code == 200
+    assert api.get(SEARCH, params={"query": "ms"}).status_code == 200
+    assert len(calls) == 1, "same prefix, differently typed, is one provider call"
+
+    now[0] += market_data._SEARCH_TTL_SECONDS + 1
+    assert api.get(SEARCH, params={"query": "MS"}).status_code == 200
+    assert len(calls) == 2
+
+
+def test_concurrent_same_prefix_searches_are_coalesced(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def open_url(url, *, timeout):
+        calls.append(url)
+        started.set()
+        release.wait(5)
+        return io.BytesIO(json.dumps(rows("MSFT")).encode())
+
+    monkeypatch.setattr(fmp, "urlopen", open_url)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(market_data._fmp_search_symbols, "MS") for _ in range(6)]
+        assert started.wait(5)
+        time.sleep(0.05)
+        release.set()
+        results = [future.result(5) for future in futures]
+    assert len(calls) == 1
+    assert all(result == results[0] for result in results)
+
+
+def test_a_suggested_symbol_validates_without_a_second_provider_call(api, monkeypatch):
+    calls = transport(monkeypatch, lambda query: rows("MSFT", "MSTR") if query == "MS" else rows(query))
+
+    assert api.get(SEARCH, params={"query": "MS"}).status_code == 200
+    validated = api.get("/api/market-data/validate-tickers", params={"tickers": "MSFT"})
+    assert validated.json()["unknown"] == []
+    assert len(calls) == 1, "the page already proved MSFT exists"
+
+    # A symbol the page did not list still has to be looked up.
+    api.get("/api/market-data/validate-tickers", params={"tickers": "AAPL"})
+    assert len(calls) == 2
+
+
+def test_anonymous_search_is_rejected_before_fmp(monkeypatch):
+    calls = transport(monkeypatch, rows("MSFT"))
+    monkeypatch.setattr(current_user, "settings", SimpleNamespace(app_env="production", auth_allow_dev_identity=False,
+                        auth_cognito_issuer="", auth_cognito_client_id="", temporary_user_id=str(uuid.UUID(int=1))))
+    app = FastAPI();app.include_router(market_data_api.router, prefix="/api")
+    with TestClient(app) as client:
+        response = client.get(SEARCH, params={"query": "MS"})
+    assert response.status_code == 401 and calls == []
+
+
+@pytest.mark.parametrize("query", ["", " ", "A" * 21, "M S", "MS/", "@MS"])
+def test_invalid_search_input_is_rejected_without_provider_requests(api, monkeypatch, query):
+    calls = transport(monkeypatch, rows("MSFT"))
+    assert api.get(SEARCH, params={"query": query}).status_code == 422
+    assert calls == []
+
+
+def test_search_provider_failure_is_503_and_retried_next_time(api, monkeypatch):
+    calls = []
+
+    def fail(url, *, timeout):
+        calls.append(url)
+        raise HTTPError(url, 503, "test-secret-never-logged", {}, io.BytesIO(b""))
+
+    monkeypatch.setattr(fmp, "urlopen", fail)
+    first = api.get(SEARCH, params={"query": "MS"})
+    assert first.status_code == 503 and "test-secret-never-logged" not in first.text
+    second = api.get(SEARCH, params={"query": "MS"})
+    assert second.status_code == 503
+    # Two requests, each with the provider's one transient retry: nothing cached.
+    assert len(calls) == 4
+
+
+# --- the fallback chain: known tickers → FMP (symbol ∪ name, US only) → Yahoo ---
+
+def known(**tickers):
+    market_data.invalidate_known_tickers()
+    return AsyncMock(return_value=tickers)
+
+
+def test_known_tickers_come_first_and_cost_no_provider_call_when_they_fill_the_page(api, monkeypatch):
+    calls = transport(monkeypatch, rows("MSFT"))
+    monkeypatch.setattr(market_data, "load_known_tickers", known(**{f"MS{i:02d}": "database" for i in range(12)}))
+
+    body = api.get(SEARCH, params={"query": "MS"}).json()
+
+    assert [m["source"] for m in body["matches"]] == ["database"] * 10
+    assert body["truncated"] is True and calls == []
+
+
+def test_known_tickers_lead_and_the_provider_fills_the_rest_without_repeats(api, monkeypatch):
+    transport(monkeypatch, rows("MSFT", "MSTR"))
+    monkeypatch.setattr(market_data, "load_known_tickers", known(MSFT="database", MSCI="run"))
+
+    body = api.get(SEARCH, params={"query": "MS"}).json()
+
+    assert [(m["symbol"], m["source"]) for m in body["matches"]] == [
+        ("MSCI", "run"), ("MSFT", "database"), ("MSTR", "fmp"),
+    ]
+
+
+def test_a_known_ticker_validates_without_the_provider(api, monkeypatch):
+    calls = transport(monkeypatch, lambda query: rows(query))
+    monkeypatch.setattr(market_data, "load_known_tickers", known(MSFT="database"))
+
+    body = api.get("/api/market-data/validate-tickers", params={"tickers": "MSFT,AAPL"}).json()
+
+    assert body["unknown"] == []
+    assert [c[3]["query"] for c in calls] == [["AAPL"]], "only the unknown symbol reached FMP"
+
+
+def test_company_name_search_joins_in_from_three_letters_and_foreign_listings_are_dropped(api, monkeypatch):
+    by_name = [
+        {"symbol": "MSF.F", "name": "Microsoft Corporation", "exchange": "FSX", "currency": "EUR"},
+        {"symbol": "MSFT", "name": "Microsoft Corporation", "exchange": "NASDAQ", "currency": "USD"},
+        {"symbol": "4338.HK", "name": "Microsoft Corporation", "exchange": "HKSE", "currency": "HKD"},
+    ]
+    paths = []
+
+    def open_url(url, *, timeout):
+        path = urlparse(url).path
+        paths.append(path)
+        return io.BytesIO(json.dumps(by_name if path.endswith("search-name") else rows("MICROS")).encode())
+
+    monkeypatch.setattr(fmp, "urlopen", open_url)
+
+    body = api.get(SEARCH, params={"query": "mic"}).json()
+
+    assert paths == ["/stable/search-symbol", "/stable/search-name"]
+    assert [m["symbol"] for m in body["matches"]] == ["MICROS", "MSFT"]
+
+    market_data._search_cache.clear(); paths.clear()
+    api.get(SEARCH, params={"query": "mi"})
+    assert paths == ["/stable/search-symbol"], "two letters is too short for a name search"
+
+
+def yahoo_transport(monkeypatch, quotes):
+    calls = []
+
+    def open_url(request, *, timeout):
+        calls.append(request.full_url)
+        return io.BytesIO(json.dumps({"quotes": quotes}).encode())
+
+    monkeypatch.setattr(market_data.yahoo, "urlopen", open_url)
+    return calls
+
+
+def test_yahoo_answers_when_fmp_cannot_and_keeps_only_us_equities(api, monkeypatch):
+    def fail(url, *, timeout):
+        raise HTTPError(url, 503, "down", {}, io.BytesIO(b""))
+    monkeypatch.setattr(fmp, "urlopen", fail)
+    yahoo_calls = yahoo_transport(monkeypatch, [
+        {"symbol": "MSFT", "shortname": "Microsoft", "exchDisp": "NASDAQ", "quoteType": "EQUITY"},
+        {"symbol": "MSFT.MX", "shortname": "Microsoft", "exchDisp": "Mexico", "quoteType": "EQUITY"},
+        {"symbol": "MS=F", "shortname": "Futures", "exchDisp": "NYMEX", "quoteType": "FUTURE"},
+    ])
+
+    body = api.get(SEARCH, params={"query": "MS"}).json()
+
+    assert [(m["symbol"], m["source"]) for m in body["matches"]] == [("MSFT", "yahoo")]
+    assert body["providerError"] is None and len(yahoo_calls) == 1
+    # Yahoo never vouches for a symbol: the exact lookup still goes to FMP.
+    assert "MSFT" not in market_data._symbol_cache
+
+
+def test_known_tickers_still_answer_when_every_provider_is_down(api, monkeypatch):
+    def fail(url, *, timeout):
+        raise HTTPError(url, 503, "down", {}, io.BytesIO(b""))
+    monkeypatch.setattr(fmp, "urlopen", fail)
+    monkeypatch.setattr(market_data.yahoo, "urlopen", fail)
+    monkeypatch.setattr(market_data, "load_known_tickers", known(MSFT="database"))
+
+    response = api.get(SEARCH, params={"query": "MS"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [m["symbol"] for m in body["matches"]] == ["MSFT"]
+    assert "HTTP 503" in body["providerError"]
+
+    market_data.invalidate_known_tickers()
+    monkeypatch.setattr(market_data, "load_known_tickers", known())
+    assert api.get(SEARCH, params={"query": "MS"}).status_code == 503, "nothing to show is still an outage"
+
+
+def test_yahoo_fallback_can_be_switched_off(api, monkeypatch):
+    def fail(url, *, timeout):
+        raise HTTPError(url, 503, "down", {}, io.BytesIO(b""))
+    monkeypatch.setattr(fmp, "urlopen", fail)
+    yahoo_calls = yahoo_transport(monkeypatch, [{"symbol": "MSFT", "exchDisp": "NASDAQ", "quoteType": "EQUITY"}])
+    monkeypatch.setattr(market_data, "settings", replace(market_data.settings, symbol_search_yahoo_fallback=False))
+
+    assert api.get(SEARCH, params={"query": "MS"}).status_code == 503
+    assert yahoo_calls == []
+
+
+def test_the_known_index_is_reread_after_its_ttl_and_on_invalidation(monkeypatch):
+    loader = known(MSFT="database")
+    monkeypatch.setattr(market_data, "load_known_tickers", loader)
+    now = [1000.0]
+    monkeypatch.setattr(market_data, "_symbol_clock", lambda: now[0])
+
+    assert asyncio.run(market_data.known_tickers()) == {"MSFT": "database"}
+    assert asyncio.run(market_data.known_tickers()) == {"MSFT": "database"}
+    assert loader.await_count == 1
+    now[0] += market_data._KNOWN_TTL_SECONDS + 1
+    asyncio.run(market_data.known_tickers())
+    assert loader.await_count == 2
+    market_data.invalidate_known_tickers()
+    asyncio.run(market_data.known_tickers())
+    assert loader.await_count == 3

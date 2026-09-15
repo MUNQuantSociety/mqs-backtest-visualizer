@@ -265,7 +265,8 @@ def test_anonymous_protected_routes_reject_before_service_calls(api):
         ("post", "/api/strategies"), ("post", "/api/strategies/upload"),
         ("post", "/api/strategies/draft"), ("delete", "/api/strategies/user-x-1"),
         ("get", "/api/strategies/user-x-1/source"),
-        ("get", "/api/market-data/validate-tickers?tickers=AAPL")):
+        ("get", "/api/market-data/validate-tickers?tickers=AAPL"),
+        ("get", "/api/market-data/search-symbols?query=AAP")):
         assert client.request(method, path).status_code == 401, (method, path)
 
 
