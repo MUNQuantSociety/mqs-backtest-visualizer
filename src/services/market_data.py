@@ -393,6 +393,7 @@ async def backfill_missing(tickers: list[str], start: date, end: date) -> dict[s
     for ticker in tickers:
         try:
             frame = await asyncio.to_thread(fetch_daily_history, [ticker], start, end, require_all=False)
+            exchange = await asyncio.to_thread(_listing_exchange, ticker)
         except FMPUnavailable as exc:
             logger.warning("BACKFILL | %s skipped; provider unavailable: %s", ticker, exc)
             written[ticker] = 0
@@ -402,7 +403,7 @@ async def backfill_missing(tickers: list[str], start: date, end: date) -> dict[s
                 "ticker": ticker,
                 "timestamp": row.timestamp.to_pydatetime(),
                 "date": row.timestamp.date(),
-                "exchange": "NASDAQ",
+                "exchange": exchange,
                 "open_price": float(row.open_price),
                 "high_price": float(row.high_price),
                 "low_price": float(row.low_price),
@@ -417,6 +418,29 @@ async def backfill_missing(tickers: list[str], start: date, end: date) -> dict[s
     if any(written.values()):
         invalidate_known_tickers()
     return written
+
+
+# What the dev seed writes and the only value the table held before the
+# backfill existed. Used when the provider does not name the listing.
+_DEFAULT_EXCHANGE = "NASDAQ"
+
+
+def _listing_exchange(ticker: str) -> str:
+    """The exchange code FMP lists ``ticker`` on — NYSE, NASDAQ, AMEX.
+
+    The daily history endpoint does not say where a bar traded, and inventing
+    a venue would be wrong for two exchanges out of three. One symbol lookup
+    answers it; the table's column is NOT NULL, so a symbol the provider does
+    not place falls back to the seed's convention.
+    """
+    with _symbol_requests:
+        rows = FMPMarketData().search_symbols(ticker)
+    for row in rows:
+        if row["symbol"].strip().upper() == ticker:
+            code = row.get("exchange")
+            if isinstance(code, str) and code.strip():
+                return code.strip().upper()
+    return _DEFAULT_EXCHANGE
 
 
 def _backfill_window(spans: dict[str, tuple[date, date] | None]) -> tuple[date, date]:

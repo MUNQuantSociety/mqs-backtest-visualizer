@@ -259,6 +259,9 @@ def backfill_on(monkeypatch: pytest.MonkeyPatch, stub_repo):
         market_data_service, "settings",
         replace(market_data_service.settings, market_data_backfill_enabled=True),
     )
+    # The exchange lookup constructs the provider client, which refuses
+    # without a key; the transport itself is stubbed below.
+    monkeypatch.setenv("FMP_API_KEY", "test-secret-key")
     state = {"spans": {}, "fetched": [], "inserted": []}
 
     def install(spans):
@@ -284,6 +287,13 @@ def backfill_on(monkeypatch: pytest.MonkeyPatch, stub_repo):
         monkeypatch.setattr(market_data_repo, "ticker_coverage", fake_coverage)
         monkeypatch.setattr(market_data_service, "fetch_daily_history", fake_fetch)
         monkeypatch.setattr(market_data_repo, "insert_daily_bars", fake_insert)
+        # The provider places NEWCO on the NYSE; anything else it does not know.
+        monkeypatch.setattr(
+            market_data_service.FMPMarketData, "search_symbols",
+            lambda self, query, limit=100: (
+                [{"symbol": "NEWCO", "exchange": "NYSE"}] if query == "NEWCO" else []
+            ),
+        )
         return state
 
     return install
@@ -299,10 +309,34 @@ def test_a_missing_ticker_is_backfilled_over_the_universes_window_and_coverage_r
     reported = {item.ticker: item for item in result.tickers}
     assert reported["NEWCO"].first_bar == "2024-01-02"
     row = state["inserted"][0]
-    assert row["ticker"] == "NEWCO" and row["exchange"] == "NASDAQ"
+    # The venue is the provider's, not invented: the history endpoint does not
+    # say where a bar traded, and the table's column is NOT NULL.
+    assert row["ticker"] == "NEWCO" and row["exchange"] == "NYSE"
     assert row["timestamp"].hour == 16 and row["date"] == date(2024, 1, 2)
     assert set(row) == {"ticker", "timestamp", "date", "exchange", "open_price", "high_price",
                         "low_price", "close_price", "volume"}
+
+
+def test_a_symbol_the_provider_does_not_place_falls_back_to_the_seeds_exchange(backfill_on) -> None:
+    state = backfill_on({"AAPL": (date(2024, 1, 2), date(2026, 7, 15)), "OTHER": None})
+
+    asyncio.run(market_data_service.coverage_for(["AAPL", "OTHER"]))
+
+    assert state["inserted"][0]["exchange"] == "NASDAQ"
+
+
+def test_the_backfill_is_off_unless_a_deployment_turns_it_on() -> None:
+    # Settings are read once at import, so this checks the default the test
+    # process imported with — MARKET_DATA_BACKFILL_ENABLED unset — and that
+    # the default is not derived from APP_ENV, which itself defaults to
+    # "development": an unconfigured process must never write the live table.
+    import os
+
+    from src.core.config import settings
+
+    assert "MARKET_DATA_BACKFILL_ENABLED" not in os.environ
+    assert settings.app_env == "development"
+    assert settings.market_data_backfill_enabled is False
 
 
 def test_with_nothing_to_anchor_to_the_backfill_takes_the_last_two_years(backfill_on) -> None:

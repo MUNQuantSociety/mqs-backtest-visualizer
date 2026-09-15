@@ -107,6 +107,9 @@ services:
       POSTGRES_USER: mqs
       POSTGRES_PASSWORD: mqs_dev_password
       POSTGRES_SSLMODE: disable
+      # This table is the developer's own, so a universe ticker it lacks may
+      # be loaded from FMP on demand. Off by default everywhere else.
+      MARKET_DATA_BACKFILL_ENABLED: "true"
     depends_on:
       db:
         # Not just "started": src/db/init.py creates the app schema during

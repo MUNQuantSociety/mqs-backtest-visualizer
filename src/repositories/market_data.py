@@ -78,7 +78,19 @@ async def ticker_coverage(
     return coverage
 
 
-_DISTINCT_TICKERS_SQL = text("SELECT DISTINCT ticker FROM public.market_data")
+# A "loose index scan": walk the (ticker, timestamp) index one ticker at a
+# time instead of reading every bar for a DISTINCT. On the live table that is
+# the difference between touching a few hundred index entries and scanning
+# years of intraday rows every five minutes.
+_DISTINCT_TICKERS_SQL = text(
+    "WITH RECURSIVE walk AS ("
+    "  (SELECT ticker FROM public.market_data ORDER BY ticker LIMIT 1)"
+    "  UNION ALL"
+    "  SELECT (SELECT ticker FROM public.market_data WHERE ticker > walk.ticker"
+    "          ORDER BY ticker LIMIT 1)"
+    "  FROM walk WHERE walk.ticker IS NOT NULL"
+    ") SELECT ticker FROM walk WHERE ticker IS NOT NULL"
+)
 
 
 async def loaded_tickers(session: AsyncSession) -> set[str]:

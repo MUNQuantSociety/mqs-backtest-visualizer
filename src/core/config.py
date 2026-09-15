@@ -111,11 +111,12 @@ class Settings:
     # In database mode, a universe ticker with no bars in the window is
     # backfilled from FMP as daily 16:00 New York bars — the port of
     # MQSMaster's specific backfill, at the granularity a backtest reads. It
-    # writes public.market_data, the live trading table, so it is on only
-    # where that table is a developer's own: APP_ENV=development, or set.
-    market_data_backfill_enabled: bool = _env_bool(
-        "MARKET_DATA_BACKFILL_ENABLED", os.getenv("APP_ENV", "development").lower() == "development"
-    )
+    # writes public.market_data, the live trading table, so it is off unless
+    # a deployment says otherwise. Not derived from APP_ENV: that defaults to
+    # "development", so an unconfigured process pointed at the live table
+    # would otherwise be allowed to write it. compose.yaml turns it on for
+    # the dev stack, whose table is the developer's own.
+    market_data_backfill_enabled: bool = _env_bool("MARKET_DATA_BACKFILL_ENABLED", False)
     temporary_user_id: str = os.getenv("TEMPORARY_USER_ID", "").strip()
 
     repo_root: Path = REPO_ROOT
