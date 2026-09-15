@@ -1,9 +1,15 @@
 # Completed report storage
 
-Only successful backtests create rows in `app.backtest_reports`. There is no
+Real executions create rows in `app.backtest_reports` only after success. There is no
 status column, placeholder row, or partial report. Failed and cancelled runs
 never enter saved history. The JSON document also excludes `status`,
 `progressPct`, and `errorMessage`.
+
+First-sign-in [starter examples](STARTER_REPORTS.md) also use this storage, with
+explicit simulated labels and `purpose: "example"`. They are excluded from
+ordinary run history and are available through `/api/backtests/examples`.
+For current Cognito authentication, see [Production auth](PRODUCTION_AUTH.md);
+the temporary-account sections below describe the earlier development rollout.
 
 The table has exactly seven columns:
 

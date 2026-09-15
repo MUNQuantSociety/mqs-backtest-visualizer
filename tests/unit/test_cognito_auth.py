@@ -156,6 +156,11 @@ def api(monkeypatch, transport):
     monkeypatch.setattr(auth_service, "session_scope", scope)
     monkeypatch.setattr(auth_service, "ensure_schema", AsyncMock())
     monkeypatch.setattr(auth_service.users, "get_or_create_user", mapping)
+    onboarding = AsyncMock()
+    monkeypatch.setattr(
+        auth_service.starter_reports, "ensure_starter_reports", onboarding
+    )
+    mapping.onboarding = onboarding
     legacy = AsyncMock(side_effect=AssertionError("JWT auth must not access legacy credentials"))
     monkeypatch.setattr(current_user.user_creds_repo, "get_user", legacy)
     app = FastAPI()
@@ -174,6 +179,7 @@ def test_me_returns_mapped_user_and_never_uses_forged_owner(keys, api):
     assert response.json() == {"id": str(OWNER), "email": None, "displayName": None}
     assert response.headers["cache-control"] == "private, no-store"
     assert mapping.await_args.kwargs == {"issuer": ISSUER, "subject": "opaque-subject/not-a-uuid"}
+    mapping.onboarding.assert_awaited_once()
 
 
 @pytest.mark.parametrize("environment", ["production", "staging", "development", "test"])

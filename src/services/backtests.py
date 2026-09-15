@@ -233,6 +233,23 @@ async def list_backtests(
     return BacktestListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
+async def list_example_backtests(
+    *, owner_id: uuid.UUID, search: str | None = None,
+    status: BacktestStatus | None = None, strategy_id: str | None = None,
+    page: int = 1, page_size: int = 25,
+) -> BacktestListResponse:
+    """List owned simulations separately from real performance history."""
+    if status is not None and status != BacktestStatus.COMPLETED:
+        return BacktestListResponse(items=[], total=0, page=page, page_size=page_size)
+    await ensure_schema()
+    async with session_scope() as session:
+        items, total = await reports_repo.list_reports(
+            session, owner_id, search=search, strategy_key=strategy_id,
+            page=page, page_size=page_size, examples=True,
+        )
+    return BacktestListResponse(items=items, total=total, page=page, page_size=page_size)
+
+
 async def get_backtest(run_id: str, *, owner_id: uuid.UUID | None = None) -> BacktestDetail | None:
     """Poll transient execution or retrieve this owner's completed JSON report."""
     from src.workers.job_manager import get_job_manager

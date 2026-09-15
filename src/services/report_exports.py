@@ -23,7 +23,15 @@ class ReportExport:
     media_type: str
 
 
-def _csv(columns: list[str], rows: list[dict[str, Any]]) -> str:
+def _csv(
+    columns: list[str], rows: list[dict[str, Any]], *, report: BacktestDetail
+) -> str:
+    if report.report_metadata.get("purpose") == "example":
+        columns = ["reportType", "reportName", *columns]
+        rows = [
+            {**row, "reportType": "simulated_example", "reportName": report.name}
+            for row in rows
+        ]
     output = io.StringIO(newline="")
     writer = csv.DictWriter(
         output, fieldnames=columns, lineterminator="\n", extrasaction="ignore"
@@ -54,7 +62,9 @@ def export_report(detail: BacktestDetail, filename: str) -> ReportExport:
             json.dumps(data, allow_nan=False, indent=2) + "\n", "application/json"
         )
     if filename == "equity.csv":
-        content = _csv(["date", "equity", "benchmark"], data["equityCurve"])
+        content = _csv(
+            ["date", "equity", "benchmark"], data["equityCurve"], report=detail
+        )
     elif filename == "trades.csv":
         content = _csv(
             [
@@ -71,6 +81,7 @@ def export_report(detail: BacktestDetail, filename: str) -> ReportExport:
                 "fees",
             ],
             data["trades"],
+            report=detail,
         )
     else:
         unavailable = data["metrics"].get("unavailable", {})
@@ -87,5 +98,5 @@ def export_report(detail: BacktestDetail, filename: str) -> ReportExport:
             {"metric": key, "value": data[key], "unavailableReason": ""}
             for key in ("initialCapital", "finalEquity")
         ]
-        content = _csv(["metric", "value", "unavailableReason"], rows)
+        content = _csv(["metric", "value", "unavailableReason"], rows, report=detail)
     return ReportExport(content, "text/csv")

@@ -13,6 +13,27 @@ from src.models import BacktestReport
 from src.schemas.backtests import BacktestDetail, BacktestStatus, BacktestSummary
 
 REPORT_VERSION = 1
+EXAMPLE_WARNING = (
+    "Simulated onboarding example. Prices, trades, and returns are generated "
+    "illustrations; no FMP market data was fetched and no backtest engine was "
+    "executed. Excluded from real backtest history and performance totals."
+)
+
+
+def example_name(strategy_name: str) -> str:
+    """Keep the simulation disclosure visible in existing list/detail clients."""
+    return f"Example: {strategy_name} (simulated)"
+
+
+def _is_example_metadata(metadata: dict) -> bool:
+    starter = metadata.get("starterExample")
+    market_data = metadata.get("marketData")
+    return (
+        metadata.get("purpose") == "example"
+        or (isinstance(starter, dict) and starter.get("generated") is True)
+        or (isinstance(market_data, dict)
+            and market_data.get("source") == "bundled_starter_example")
+    )
 
 
 def document(detail: BacktestDetail) -> dict:
@@ -25,24 +46,60 @@ def document(detail: BacktestDetail) -> dict:
     return result
 
 
+def _record_values(owner_id: uuid.UUID, detail: BacktestDetail) -> dict:
+    return {
+        "id": uuid.UUID(detail.id),
+        "owner_id": owner_id,
+        "created_at": datetime.fromisoformat(
+            detail.created_at.replace("Z", "+00:00")
+        ),
+        "strategy_key": detail.strategy_id,
+        "name": detail.name,
+        "version": REPORT_VERSION,
+        "results": document(detail),
+    }
+
+
 def save(engine: Engine, owner_id: uuid.UUID, detail: BacktestDetail) -> None:
     if owner_id is None:
         raise ValueError("A saved report requires an owner.")
-    payload = document(detail)
+    values = _record_values(owner_id, detail)
     with engine.begin() as connection:
-        connection.execute(insert(BacktestReport).values(
-            id=uuid.UUID(detail.id), owner_id=owner_id,
-            created_at=datetime.fromisoformat(detail.created_at.replace("Z", "+00:00")),
-            strategy_key=detail.strategy_id, name=detail.name,
-            version=REPORT_VERSION, results=payload,
-        ))
+        connection.execute(insert(BacktestReport).values(**values))
+
+
+async def add_completed_reports(
+    session: AsyncSession,
+    owner_id: uuid.UUID,
+    details: list[BacktestDetail],
+) -> None:
+    """Stage ordinary completed reports in the caller's transaction."""
+    if owner_id is None:
+        raise ValueError("A saved report requires an owner.")
+    session.add_all(
+        [BacktestReport(**_record_values(owner_id, detail)) for detail in details]
+    )
+    await session.flush()
 
 
 def to_detail(report: BacktestReport) -> BacktestDetail:
     if report.version != REPORT_VERSION:
         raise ValueError(f"Unsupported saved report version: {report.version}")
+    metadata = dict(report.results.get("reportMetadata") or {})
+    name = report.name
+    if _is_example_metadata(metadata):
+        # Older local examples used purpose=user. Disclose them consistently
+        # without rewriting immutable stored reports or changing their IDs.
+        metadata["purpose"] = "example"
+        starter = metadata.get("starterExample")
+        metadata["starterExample"] = {
+            **(starter if isinstance(starter, dict) else {}),
+            "generated": True, "deletable": True, "message": EXAMPLE_WARNING,
+        }
+        name = example_name(report.results["strategyName"])
     return BacktestDetail.model_validate({
-        **report.results, "id": str(report.id), "name": report.name,
+        **report.results, "id": str(report.id), "name": name,
+        "reportMetadata": metadata,
         "strategyId": report.strategy_key, "createdAt": report.created_at.isoformat().replace("+00:00", "Z"),
         # Compatibility with the existing frontend; this is not stored.
         "status": "completed", "progressPct": 100, "errorMessage": None,
@@ -62,10 +119,41 @@ async def remove(session: AsyncSession, run_id: uuid.UUID, owner_id: uuid.UUID) 
     return bool(result.rowcount)
 
 
-async def list_reports(session: AsyncSession, owner_id: uuid.UUID, *, search=None, strategy_key=None, page=1, page_size=25):
+def _example_predicate():
+    metadata = BacktestReport.results["reportMetadata"]
+    return func.coalesce(or_(
+        metadata["purpose"].astext == "example",
+        metadata["starterExample"]["generated"].astext == "true",
+        metadata["marketData"]["source"].astext == "bundled_starter_example",
+    ), False)
+
+
+def _visible_owner_predicates(owner_id: uuid.UUID, *, examples: bool = False) -> list:
     report = BacktestReport
-    predicates = [report.owner_id == owner_id,
-                  func.coalesce(report.results["reportMetadata"]["purpose"].astext, "user") == "user"]
+    if examples:
+        return [report.owner_id == owner_id, _example_predicate()]
+    return [report.owner_id == owner_id, ~_example_predicate(),
+            func.coalesce(report.results["reportMetadata"]["purpose"].astext, "user") == "user"]
+
+
+async def owner_has_visible_reports(
+    session: AsyncSession, owner_id: uuid.UUID
+) -> bool:
+    """Onboarding respects existing real reports and earlier examples alike."""
+    statement = (
+        select(BacktestReport.id)
+        .where(BacktestReport.owner_id == owner_id, or_(
+            func.coalesce(BacktestReport.results["reportMetadata"]["purpose"].astext, "user") == "user",
+            _example_predicate(),
+        ))
+        .limit(1)
+    )
+    return (await session.execute(statement)).first() is not None
+
+
+async def list_reports(session: AsyncSession, owner_id: uuid.UUID, *, search=None, strategy_key=None, page=1, page_size=25, examples=False):
+    report = BacktestReport
+    predicates = _visible_owner_predicates(owner_id, examples=examples)
     if strategy_key:
         predicates.append(report.strategy_key == strategy_key)
     if search:
@@ -77,12 +165,14 @@ async def list_reports(session: AsyncSession, owner_id: uuid.UUID, *, search=Non
                               func.lower(report.results["parameters"]["universe"].astext).like(needle)))
     total = (await session.execute(select(func.count()).select_from(report).where(*predicates))).scalar_one()
     # Project just the card fields in SQL; do not transfer every curve/trade list.
-    columns = [report.id, report.name, report.strategy_key, report.created_at]
+    columns = [report.id, report.name, report.strategy_key, report.created_at,
+               _example_predicate().label("is_example")]
     fields = ("strategyName", "symbol", "timeframe", "startDate", "endDate", "initialCapital", "finalEquity", "totalReturn", "sharpe", "maxDrawdown")
     columns.extend(report.results[field].label(field) for field in fields)
     rows = (await session.execute(select(*columns).where(*predicates)
             .order_by(report.created_at.desc(), report.id).offset((page - 1) * page_size).limit(page_size))).mappings()
     items = [BacktestSummary.model_validate({**dict(row), "id": str(row["id"]),
+             "name": example_name(row["strategyName"]) if row.get("is_example") else row["name"],
              "strategyId": row["strategy_key"], "createdAt": row["created_at"].isoformat(),
              "status": "completed"}) for row in rows]
     return items, int(total)

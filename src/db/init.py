@@ -73,6 +73,13 @@ _ADDITIVE_MIGRATIONS = (
         "WHERE s.owner_id IS NULL AND s.kind = 'user' AND r.owner_id IS NOT NULL "
         "AND r.id = COALESCE(s.validation_run_id, s.validation_job_id)"
     ),
+    # Existing authenticated users receive the same one-time onboarding check
+    # as a newly inserted user. The marker stays set if they later delete both
+    # examples, so a blank dashboard remains their explicit choice.
+    text(
+        f'ALTER TABLE "{APP_SCHEMA}".users '
+        "ADD COLUMN IF NOT EXISTS starter_reports_seeded_at TIMESTAMPTZ"
+    ),
 )
 
 # Set once the tables have been confirmed to exist in this process. The lock

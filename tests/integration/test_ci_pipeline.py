@@ -22,6 +22,10 @@ The guard tests below require no database and always run.
 After upload validation, two identical browser-form submissions include universe,
 slippage, commission, empty signal overrides, and a disabled sentiment gate. Both
 must produce the same persisted report, including positive cash fees.
+
+Onboarding also uses real PostgreSQL transactions and signed bearer tokens. Only
+the trusted JWKS transport and its test configuration are substituted: identity
+mapping, row locks, report persistence, pagination, and ownership remain real.
 """
 
 from __future__ import annotations
@@ -705,6 +709,145 @@ async def _assert_concurrent_app_users():
     print("CI proof: concurrent app-user mapping, idempotence and issuer isolation passed", flush=True)
 
 
+def _assert_starter_onboarding(client, connection):
+    """Prove one-time examples without live Cognito, FMP, or production data."""
+    import asyncio
+    import uuid
+    from dataclasses import replace
+    from unittest.mock import patch
+
+    import httpx
+    import jwt
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from sqlalchemy import func, select
+
+    from server import app
+    from src.api.dependencies import current_user
+    from src.db.engine import session_scope
+    from src.integrations.cognito import get_verifier
+    from src.models import AppUser, BacktestReport
+    from src.repositories.users import get_or_create_user
+    from src.services.starter_reports import ensure_starter_reports
+
+    assert client.get("/api/backtests/examples").status_code == 401
+    with connection.cursor() as cursor:
+        _assert_disposable_connection(connection, cursor)
+        for key, name in (("portfolio_1", "Volatility Momentum"),
+                          ("portfolio_2", "CI second built-in")):
+            cursor.execute("""INSERT INTO app.strategies
+                (key, name, description, tags, universe, param_specs, kind,
+                 class_path, status, enabled)
+                VALUES (%s, %s, '', '[]', '["AAPL","MSFT"]', '[]', 'builtin',
+                        'engine.strategies.portfolio_1.strategy.VolMomentum',
+                        'active', TRUE)
+                ON CONFLICT (key) DO NOTHING""", (key, name))
+
+    issuer = "https://cognito-idp.us-east-2.amazonaws.com/us-east-2_CIOnboarding"
+    client_id = "cionboardingclient"
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key = dict(jwt.algorithms.RSAAlgorithm.to_jwk(
+        private_key.public_key(), as_dict=True), kid="ci-onboarding", alg="RS256")
+    verifier = get_verifier(issuer, client_id)
+
+    def credential(subject):
+        now = int(time.time())
+        token = jwt.encode(
+            dict(iss=issuer, sub=subject, iat=now - 10, exp=now + 600,
+                 client_id=client_id, token_use="access"),
+            private_key, algorithm="RS256", headers={"kid": "ci-onboarding"},
+        )
+        return {"Authorization": f"Bearer {token}"}
+
+    async def persisted_state(owner_id):
+        async with session_scope() as session:
+            count = await session.scalar(select(func.count()).select_from(
+                BacktestReport).where(BacktestReport.owner_id == owner_id))
+            marker = await session.scalar(select(AppUser.starter_reports_seeded_at)
+                                          .where(AppUser.id == owner_id))
+            return count, marker
+
+    async def proof():
+        owner_headers = credential("new-" + uuid.uuid4().hex)
+        other_headers = credential("other-" + uuid.uuid4().hex)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://ci.invalid"
+        ) as api:
+            async def get(path, headers=owner_headers):
+                response = await api.get(path, headers=headers)
+                assert response.status_code == 200, response.text
+                return response.json()
+
+            # Eight first authenticated requests race through the actual INSERT,
+            # row lock, report writes, and transaction commits.
+            signed_in = await asyncio.gather(*[
+                get("/api/auth/me") for _ in range(8)
+            ])
+            identities = {item["id"] for item in signed_in}
+            assert len(identities) == 1
+            owner_id = uuid.UUID(identities.pop())
+            count, marker = await persisted_state(owner_id)
+            assert count == 2 and marker is not None
+            assert (await get("/api/backtests"))["total"] == 0
+            first_page = await get("/api/backtests/examples?pageSize=1&page=1")
+            second_page = await get("/api/backtests/examples?pageSize=1&page=2")
+            assert first_page["total"] == second_page["total"] == 2
+            assert len(first_page["items"]) == len(second_page["items"]) == 1
+            examples = first_page["items"] + second_page["items"]
+            example_ids = {item["id"] for item in examples}
+            assert len(example_ids) == 2
+            assert all(item["name"].startswith("Example: ")
+                       and item["name"].endswith(" (simulated)") for item in examples)
+            for item in examples:
+                detail = await get(f"/api/backtests/{item['id']}")
+                assert detail["reportMetadata"]["purpose"] == "example"
+                assert detail["reportMetadata"]["starterExample"]["generated"] is True
+                assert (await get(f"/api/backtests?strategyId={item['strategyId']}"))["total"] == 0
+
+            other = await get("/api/backtests/examples", other_headers)
+            assert other["total"] == 2
+            assert example_ids.isdisjoint(item["id"] for item in other["items"])
+            for report_id in example_ids:
+                path = f"/api/backtests/{report_id}"
+                assert (await api.get(path, headers=other_headers)).status_code == 404
+                assert (await api.delete(path, headers=other_headers)).status_code == 404
+                assert (await api.delete(path, headers=owner_headers)).status_code == 204
+            await asyncio.gather(*[get("/api/auth/me") for _ in range(4)])
+            assert (await get("/api/backtests/examples"))["total"] == 0
+            assert (await get("/api/backtests"))["total"] == 0
+            assert await persisted_state(owner_id) == (0, marker), (
+                "Deleted examples were recreated or the one-time marker changed"
+            )
+
+            # A request can load the user before another transaction finishes
+            # onboarding. SELECT FOR UPDATE must refresh its identity-map row.
+            stale_subject = "stale-" + uuid.uuid4().hex
+            async with session_scope() as session:
+                stale_owner = await get_or_create_user(
+                    session, issuer=issuer, subject=stale_subject)
+                stale_id = stale_owner.id
+            async with session_scope() as stale_session:
+                stale_user = await stale_session.get(AppUser, stale_id)
+                assert stale_user.starter_reports_seeded_at is None
+                await get("/api/auth/me", credential(stale_subject))
+                assert stale_user.starter_reports_seeded_at is None
+                assert await ensure_starter_reports(stale_session, stale_user) == 0
+                assert stale_user.starter_reports_seeded_at is not None
+            assert (await persisted_state(stale_id))[0] == 2
+
+    configuration = replace(current_user.settings, auth_cognito_issuer=issuer,
+                            auth_cognito_client_id=client_id,
+                            auth_allow_dev_identity=False)
+    try:
+        with patch.object(current_user, "settings", configuration), patch.object(
+            verifier.jwks, "fetch_data", return_value={"keys": [public_key]}
+        ):
+            client.portal.call(proof)
+    finally:
+        get_verifier.cache_clear()
+    print("CI proof: real PostgreSQL onboarding, stale-row refresh, deletion, "
+          "owner isolation and example-only history passed", flush=True)
+
+
 def _run_ci_proof():
     # This guard also protects a direct invocation of the helper script. It is
     # deliberately before imports that load .env or construct database engines.
@@ -745,6 +888,7 @@ def _run_ci_proof():
         source = SOURCE_PATH.read_text(encoding="utf-8")
         with TestClient(app) as client:
             client.portal.call(_assert_concurrent_app_users)
+            _assert_starter_onboarding(client, connection)
             client.headers["X-User-Id"] = "00000000-0000-0000-0000-000000000001"
             manager = get_job_manager()
             assert manager.running and manager.max_workers == 1

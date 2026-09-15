@@ -56,6 +56,22 @@ async def list_backtests(
     )
 
 
+@router.get("/examples", response_model=BacktestListResponse)
+async def list_example_backtests(
+    search: str | None = Query(default=None),
+    status_filter: BacktestStatus | None = Query(default=None, alias="status"),
+    strategy_id: str | None = Query(default=None, alias="strategyId"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100, alias="pageSize"),
+    owner_id: uuid.UUID = Depends(require_current_user),
+) -> BacktestListResponse:
+    """This user's clearly labelled simulations, excluded from real history."""
+    return await backtests_service.list_example_backtests(
+        owner_id=owner_id, search=search, status=status_filter,
+        strategy_id=strategy_id, page=page, page_size=page_size,
+    )
+
+
 @router.post(
     "",
     response_model=BacktestSummary,

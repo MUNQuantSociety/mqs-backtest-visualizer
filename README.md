@@ -29,6 +29,8 @@ assert that a release is deployed.
 
 For the request/worker/database design, read [Architecture Flow](docs/ARCHITECTURE_FLOW.md).
 For current result semantics, read [Report Contract](docs/REPORT_CONTRACT.md).
+For first-sign-in examples and their separation from real performance, read
+[Starter reports](docs/STARTER_REPORTS.md).
 For portfolio publication, S3 execution and visible terminal logs, read
 [S3 strategy flow and logging](docs/S3_STRATEGY_FLOW.md).
 

@@ -7,6 +7,7 @@ from src.db.init import ensure_schema
 from src.integrations.cognito import AuthenticationUnavailable, InvalidAccessToken, get_verifier
 from src.repositories import users
 from src.schemas.auth import AuthUser
+from src.services import starter_reports
 
 
 def validate_configuration(configuration) -> None:
@@ -22,5 +23,6 @@ async def authenticate(token: str, *, issuer: str, client_id: str) -> AuthUser:
     await ensure_schema()
     async with session_scope() as session:
         user = await users.get_or_create_user(session, issuer=identity.issuer, subject=identity.subject)
+        await starter_reports.ensure_starter_reports(session, user)
         # No unverified profile claims or legacy passwords enter this mapping.
         return AuthUser(id=user.id, email=user.email, display_name=user.display_name)
