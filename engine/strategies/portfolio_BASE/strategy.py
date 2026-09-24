@@ -5,14 +5,25 @@ import importlib
 import logging
 import re
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any, Literal, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from engine.indicators.base import Indicator
 from engine.data.fmp import FMPDataAdapter, fetch_daily_history, market_data_source
+from engine.data.bar_interval import (
+    DAILY_BAR_SECONDS,
+    bar_minutes,
+    is_intraday,
+    warmup_calendar_days,
+)
+from engine.data.intraday import fetch_intraday_bars
 from engine.strategies.order_interface import StrategyContext
+
+
+_NY_TZ = ZoneInfo("America/New_York")
 
 
 def _camel_to_snake(name: str) -> str:
@@ -85,6 +96,12 @@ class BasePortfolio(ABC):
         self.tickers: list[str] = config_dict.get("TICKERS", [])
         self.poll_interval: int = config_dict.get("INTERVAL", 60)
         self.lookback_days: int = config_dict.get("LOOKBACK_DAYS", 30)
+        # VISUALIZER: the bar size the engine loads. Daily unless a run asks
+        # for intraday bars; an unsupported size fails here, before any fetch.
+        self.bar_interval_seconds: int = int(
+            config_dict.get("BAR_INTERVAL_SECONDS", DAILY_BAR_SECONDS)
+        )
+        bar_minutes(self.bar_interval_seconds)
         self.portfolio_weights: list[Any] | None = config_dict.get("WEIGHTS")
         self.data_feeds: list[str] = config_dict.get(
             "DATA_FEEDS",
@@ -123,6 +140,7 @@ class BasePortfolio(ABC):
             "weights": self.portfolio_weights,
             "poll_interval": self.poll_interval,
             "lookback_days": self.lookback_days,
+            "bar_interval_seconds": self.bar_interval_seconds,
             "exchange": self.exchange,
             "oms": self.oms_config,
             "config": self.config,
@@ -287,7 +305,20 @@ class BasePortfolio(ABC):
         end_time = self.backtest_start_date or datetime.now()
         start_time = end_time - timedelta(days=warmup_days)
 
-        if market_data_source() == "fmp":
+        if is_intraday(self.bar_interval_seconds):
+            # VISUALIZER: warm with bars of the run's own size, so an
+            # indicator's period counts the same bars before and during the
+            # simulation. Completed days only, as on the daily path.
+            minutes = bar_minutes(self.bar_interval_seconds)
+            warmup_start = end_time - timedelta(
+                days=warmup_calendar_days(int(kwargs.get("period", 20)), minutes)
+            )
+            frame = fetch_intraday_bars(
+                self.db, [ticker], warmup_start, end_time - timedelta(days=1), minutes,
+                require_all=False,
+            )
+            result = {"status": "success", "data": frame.to_dict("records")}
+        elif market_data_source() == "fmp":
             # Warm indicators only with completed days before the simulation.
             # A newly listed ticker may have no warmup yet; it becomes ready
             # naturally as the event loop receives bars.
@@ -298,9 +329,18 @@ class BasePortfolio(ABC):
             )
             result = {"status": "success", "data": frame.to_dict("records")}
         else:
-            sql = self.MARKET_DATA_QUERY.format(placeholders="%s")
-            params = [ticker, start_time.date(), end_time.date()]
-            result = self.db.execute_query(sql, params, fetch="all")
+            # VISUALIZER: daily bars, the resolution the simulation feeds the
+            # indicator next. Raw market_data rows (hourly in the default
+            # store) made a period count hours in warmup and days afterwards.
+            # Imported here because engine.core.utils imports this module.
+            from engine.core import utils as core_utils
+
+            frame = core_utils._fetch_from_db(
+                self, [ticker],
+                datetime.combine(start_time.date(), time.min, tzinfo=_NY_TZ),
+                datetime.combine(end_time.date(), time.min, tzinfo=_NY_TZ),
+            )
+            result = {"status": "success", "data": frame.to_dict("records")}
 
         price_col: str = kwargs.get("price_col") or kwargs.get("close_col", "close_price")
         if result["status"] == "success" and result.get("data"):

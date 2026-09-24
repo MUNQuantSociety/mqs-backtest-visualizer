@@ -256,7 +256,7 @@ def test_current_and_legacy_runs_are_owner_scoped_and_follow_lifecycle(
             assert total == 2
             assert [row.id.int for row in rows] == [6, 2]
             assert rows[0].results["name"] == "Run 6"
-            assert backtests._public_to_summary(rows[0]).status == "queued"
+            assert rows[0].results["status"] == "queued"
             assert all(row.owner_id == OWNER for row in rows)
             assert listing(page=2, page_size=1)[0][0].id.int == 2
             assert listing(page=2, page_size=1)[1] == 2
@@ -268,9 +268,8 @@ def test_current_and_legacy_runs_are_owner_scoped_and_follow_lifecycle(
             app_rows[0].update(status="completed", final_equity=110_000, total_return=0.1)
             rows, total = listing(status="completed")
             assert total == 2
-            summary = backtests._public_to_summary(rows[0])
-            assert summary.final_equity == 110_000
-            assert summary.total_return == 0.1
+            assert rows[0].results["final_equity"] == 110_000
+            assert rows[0].results["total_return"] == 0.1
 
             app_rows[0]["status"] = "failed"
             assert listing(status="failed")[0][0].id.int == 6

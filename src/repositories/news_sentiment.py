@@ -2,8 +2,9 @@
 
 The MQSMaster NLP pipeline owns this table: one row per article URL, scored by
 the fine-tuned FinBERT model into ``sentiment_score`` in [-1, 1]. This
-application only reads it, for the dashboard's news list and sentiment gauges,
-and must never write to it.
+application only reads it, for each backtest's news panel and the dashboard's
+sentiment gauges, and must never write to it. The table is a fixed historical
+dataset, not a live feed, so news is always asked for by a run's dates.
 
 ``published_at`` is a naive timestamp holding UTC (the scrapers normalise to UTC
 and drop the zone). ``content_summary`` is the article title and body joined and
@@ -27,16 +28,20 @@ _ARTICLE_COLUMNS = (
     "WHERE sentiment_score IS NOT NULL AND published_at IS NOT NULL "
 )
 
-# Newest first over the published_at index.
-_LATEST_ARTICLES_SQL = text(
-    _ARTICLE_COLUMNS + "ORDER BY published_at DESC, id DESC LIMIT :limit"
-).bindparams(bindparam("limit"))
-
-# Same, restricted to a ticker set; served by the (ticker, published_at) index.
-_LATEST_ARTICLES_FOR_TICKERS_SQL = text(
+# A backtest run's articles: its tickers, published inside its window, newest
+# first. Served by the (ticker, published_at) index.
+_ARTICLES_IN_WINDOW_SQL = text(
     _ARTICLE_COLUMNS
-    + "AND ticker IN :tickers ORDER BY published_at DESC, id DESC LIMIT :limit"
-).bindparams(bindparam("tickers", expanding=True), bindparam("limit"))
+    + "AND ticker IN :tickers AND published_at >= :start AND published_at < :end "
+    "ORDER BY published_at DESC, id DESC LIMIT :limit"
+).bindparams(
+    bindparam("tickers", expanding=True),
+    bindparam("start"),
+    bindparam("end"),
+    bindparam("limit"),
+)
+
+_ARTICLE_BY_ID_SQL = text(_ARTICLE_COLUMNS + "AND id = :id").bindparams(bindparam("id"))
 
 _SCORES_IN_RANGE_SQL = text(
     "SELECT published_at, sentiment_score FROM public.news_sentiment "
@@ -57,22 +62,26 @@ class ArticleRow:
     content_summary: str | None
 
 
-async def latest_articles(
-    session: AsyncSession, tickers: list[str] | None, limit: int
+async def articles_between(
+    session: AsyncSession,
+    tickers: list[str],
+    start: datetime,
+    end: datetime,
+    limit: int,
 ) -> list[ArticleRow]:
-    """The ``limit`` most recently published articles, optionally for ``tickers`` only.
+    """Up to ``limit`` articles for ``tickers`` published in ``[start, end)``, newest first.
 
     Args:
         session: An open async session.
-        tickers: Upper-case symbols to restrict to, or None for every ticker.
+        tickers: Upper-case symbols; at least one.
+        start: Inclusive lower bound, naive UTC like the column.
+        end: Exclusive upper bound, naive UTC.
         limit: Maximum rows to return; the caller bounds it.
     """
-    if tickers is None:
-        result = await session.execute(_LATEST_ARTICLES_SQL, {"limit": limit})
-    else:
-        result = await session.execute(
-            _LATEST_ARTICLES_FOR_TICKERS_SQL, {"tickers": tickers, "limit": limit}
-        )
+    result = await session.execute(
+        _ARTICLES_IN_WINDOW_SQL,
+        {"tickers": tickers, "start": start, "end": end, "limit": limit},
+    )
     return [
         ArticleRow(
             id=int(row.id),
@@ -84,6 +93,21 @@ async def latest_articles(
         )
         for row in result
     ]
+
+
+async def article_by_id(session: AsyncSession, article_id: int) -> ArticleRow | None:
+    """One scored article, or None when no such row exists."""
+    row = (await session.execute(_ARTICLE_BY_ID_SQL, {"id": article_id})).first()
+    if row is None:
+        return None
+    return ArticleRow(
+        id=int(row.id),
+        ticker=str(row.ticker),
+        article_url=row.article_url,
+        published_at=row.published_at,
+        sentiment_score=float(row.sentiment_score),
+        content_summary=row.content_summary,
+    )
 
 
 async def scores_between(

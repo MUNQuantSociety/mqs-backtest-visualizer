@@ -31,17 +31,20 @@ pytestmark = pytest.mark.db
 
 
 @pytest.fixture(scope="module")
-def client(database_available: tuple[bool, str]) -> Iterator[TestClient]:
+def client(
+    database_available: tuple[bool, str], integration_user_headers: dict[str, str]
+) -> Iterator[TestClient]:
     reachable, reason = database_available
     if not reachable:
         pytest.skip(reason)
     with TestClient(app) as test_client:
+        test_client.headers.update(integration_user_headers)
         yield test_client
         test_client.portal.call(dispose_async_engine)
 
 
 @pytest.fixture(scope="module")
-def uploaded(client: TestClient) -> Iterator[dict]:
+def uploaded(client: TestClient, integration_user_id: uuid.UUID) -> Iterator[dict]:
     """One template upload sent as a real multipart file; removed afterwards."""
     response = client.post(
         "/api/strategies/upload",
@@ -59,9 +62,15 @@ def uploaded(client: TestClient) -> Iterator[dict]:
         # Runs first, then the strategy row and its stored source.
         if body.get("validationRunId"):
             client.portal.call(
-                partial(backtests_service.delete_backtest, body["validationRunId"])
+                partial(
+                    backtests_service.delete_backtest,
+                    body["validationRunId"],
+                    owner_id=integration_user_id,
+                )
             )
-        client.portal.call(partial(strategies_service.delete_strategy, body["id"]))
+        client.portal.call(
+            partial(strategies_service.delete_strategy, body["id"], owner_id=integration_user_id)
+        )
 
 
 def _poll_run(client: TestClient, run_id: str) -> dict:

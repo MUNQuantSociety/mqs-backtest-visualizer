@@ -47,8 +47,26 @@ class NewsArticle(CamelModel):
     # ISO 8601 with an explicit UTC offset.
     published_at: str
     headline: str
+    # The stored text: title and body joined, cut by the pipeline at 1,000
+    # characters. What the story card shows.
+    summary: str
+    # The publisher's page, or null when the stored link is not an http(s) URL.
+    url: str | None = None
     tickers: list[str]
     score: float = Field(ge=-1, le=1)
+
+
+class NewsStory(CamelModel):
+    """One article's own title and summary paragraph, for its story card."""
+
+    id: str
+    title: str
+    # The real summary paragraph, or null when neither the publisher's page nor
+    # the stored text yields one separate from the title.
+    summary: str | None = None
+    # Where the summary came from: the publisher's page head, the stored text
+    # with the publisher's title cut off it, or nowhere.
+    origin: Literal["publisher", "stored", "none"]
 
 
 class NewsResponse(CamelModel):

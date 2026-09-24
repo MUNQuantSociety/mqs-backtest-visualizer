@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,12 @@ from engine.core.backtest_engine import BacktestEngine
 from engine.core.sentiment_gate import SentimentGate
 from engine.data.db_adapter import EngineDBAdapter
 from engine.data.fmp import FMPDataAdapter, market_data_source
+from engine.data.bar_interval import (
+    DAILY_BAR_SECONDS,
+    bar_minutes,
+    check_intraday_size,
+    is_intraday,
+)
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 logger = logging.getLogger(__name__)
@@ -165,6 +172,17 @@ def _equity_curve(
     return points
 
 
+def _strategy_config(strategy_class: type[BasePortfolio], params: dict | None) -> dict:
+    """The sibling ``config.json`` the engine loads, with the request overlay applied."""
+    try:
+        config_path = Path(inspect.getfile(strategy_class)).parent / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        config = {}
+    config.update(params or {})
+    return config
+
+
 def strategy_tickers(strategy_class: type[BasePortfolio], params: dict) -> list[str]:
     """Tickers this strategy will trade, without instantiating it.
 
@@ -172,13 +190,26 @@ def strategy_tickers(strategy_class: type[BasePortfolio], params: dict) -> list[
     request's parameter overlay, so an error message can name the universe even
     when construction never got far enough to build a portfolio object.
     """
-    try:
-        config_path = Path(inspect.getfile(strategy_class)).parent / "config.json"
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        config = {}
-    config.update(params or {})
-    return [str(t) for t in config.get("TICKERS", [])]
+    return [str(t) for t in _strategy_config(strategy_class, params).get("TICKERS", [])]
+
+
+def _reject_oversized_intraday_window(
+    strategy_class: type[BasePortfolio], request: RunRequest
+) -> None:
+    """Refuse an intraday window, lookback included, before any bar is downloaded.
+
+    Constructing the portfolio already warms its indicators, which fetches
+    bars, so the runner's own check comes too late to save that traffic.
+    """
+    config = _strategy_config(strategy_class, request.params)
+    bar_seconds = config.get("BAR_INTERVAL_SECONDS", DAILY_BAR_SECONDS)
+    if not is_intraday(bar_seconds):
+        return
+    # BasePortfolio's LOOKBACK_DAYS default, which the runner prepends.
+    lookback_days = int(config.get("LOOKBACK_DAYS", 30))
+    first = date.fromisoformat(str(request.start_date)[:10]) - timedelta(days=lookback_days)
+    last = date.fromisoformat(str(request.end_date)[:10])
+    check_intraday_size(len(config.get("TICKERS", [])), first, last, bar_minutes(bar_seconds))
 
 
 def fast_mode_supported(strategy_class: type[BasePortfolio]) -> bool:
@@ -205,6 +236,23 @@ def _reject_unsupported_fast_mode(strategy_class: type[BasePortfolio]) -> None:
         "engine/analytics/vector_strategy_adapters.py "
         f"(only {supported} have one). Run this strategy in event mode."
     )
+
+
+def _reject_unsupported_bar_interval(params: dict | None, mode: str) -> None:
+    """Fail an unsupported bar size, or intraday bars in fast mode, before any load.
+
+    Fast mode replays daily closes, so a finer bar would be silently ignored.
+    """
+    bar_seconds = (params or {}).get("BAR_INTERVAL_SECONDS", DAILY_BAR_SECONDS)
+    try:
+        intraday = is_intraday(bar_seconds)
+    except ValueError as exc:
+        raise EngineError(str(exc)) from None
+    if intraday and mode == "fast":
+        raise EngineError(
+            "Fast mode replays daily closes and cannot use intraday bars; "
+            "use event mode or a 1-day bar interval."
+        )
 
 
 def _fast_mode_perf(engine: BacktestEngine) -> pd.DataFrame | None:
@@ -289,7 +337,9 @@ def run_single(request: RunRequest) -> RunResult:
             )
         if mode == "fast" and request.sentiment_gate is not None:
             raise EngineError("Fast mode does not support the sentiment gate; use event mode.")
+        _reject_unsupported_bar_interval(request.params, mode)
         strategy_class = load_strategy_class(request.class_path)
+        _reject_oversized_intraday_window(strategy_class, request)
         if mode == "fast":
             # Checked here, before the engine loads a single bar: a student who
             # picked the wrong mode should be told in milliseconds, not after

@@ -221,9 +221,12 @@ all three. This handoff does not authorize bypassing these gates or merging main
 
 These are not silently included in the completed backtest work:
 
-- **Dashboard news and indicators:** `/api/news` reads `public.news_sentiment`
-  on the live database (`NEWS_POSTGRES_*`, read-only; 503 when unset, no
-  fallback to `POSTGRES_*`);
+- **Run news and dashboard indicators:** `/api/news?tickers=&start=&end=`
+  reads `public.news_sentiment` (`NEWS_POSTGRES_*`, read-only; 503 when unset,
+  no fallback to `POSTGRES_*`) for one backtest run's universe and dates, in
+  whole New York days. The table is a fixed historical dataset, not a live
+  feed, so there is no "latest news": the dashboard has no news card, and each
+  run's detail page shows its own window's articles.
   `/api/indicators` computes RSI(14), MACD(12,26,9) histogram, the SMA 50/200
   regime and 20-session momentum from `public.market_data` session closes, with
   7-day article sentiment. Both are read-only. Tickers with fewer than 200

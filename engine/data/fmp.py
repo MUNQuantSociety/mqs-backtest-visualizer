@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 ENDPOINT = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 SYMBOL_ENDPOINT = "https://financialmodelingprep.com/stable/search-symbol"
 NAME_ENDPOINT = "https://financialmodelingprep.com/stable/search-name"
+INTRADAY_ENDPOINT = "https://financialmodelingprep.com/stable/historical-chart/{interval}"
+INTRADAY_INTERVALS = frozenset({"1min", "5min", "15min", "30min", "1hour"})
 SYMBOL_SEARCH_LIMIT = 100
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
@@ -163,6 +165,25 @@ class FMPMarketData:
             raise FMPUnavailable(f"FMP symbol lookup for {ticker} was incomplete. Retry with the exact exchange-qualified symbol.")
         return False
 
+    def get_intraday_history(self, ticker: str, interval: str, start: date, end: date) -> list[dict]:
+        """Raw intraday rows for one symbol, both dates inclusive, newest first.
+
+        Rows are labelled at the bar's start in New York wall time. FMP answers
+        only the latest few days of a long window, so callers chunk the window
+        (see ``engine.data.intraday``).
+
+        Raises:
+            ValueError: ``interval`` is not one of ``INTRADAY_INTERVALS``.
+            FMPUnavailable: The provider failed or answered with a non-list.
+        """
+        if interval not in INTRADAY_INTERVALS:
+            raise ValueError(f"Unsupported FMP intraday interval {interval!r}.")
+        return self._request_list(
+            INTRADAY_ENDPOINT.format(interval=interval),
+            {"symbol": ticker, "from": start.isoformat(), "to": end.isoformat()},
+            label=f"{interval} history for {ticker}",
+        )
+
     def get_historical_data(self, tickers, from_date, to_date) -> list[dict]:
         """Daily OHLCV records for each symbol; both exchange dates inclusive."""
         wanted = tickers.split(",") if isinstance(tickers, str) else tickers
@@ -225,6 +246,7 @@ class FMPDataAdapter:
 
     def __init__(self) -> None:
         self._history = {}
+        self._intraday = {}
 
     def get_daily_history(self, tickers, start, end, *, require_all=True):
         import pandas as pd
@@ -263,6 +285,41 @@ class FMPDataAdapter:
             return pd.DataFrame()
         return pd.concat(parts, ignore_index=True).sort_values(["timestamp", "ticker"]).reset_index(drop=True)
 
+    def get_intraday_history(self, tickers, start, end, minutes: int):
+        """Intraday bars for this run, downloaded once per ticker and bar size.
+
+        Warmup and simulation ask for overlapping windows of the same tickers;
+        remembering the widest window fetched keeps a run from paying FMP twice.
+        """
+        import pandas as pd
+
+        from engine.data.intraday import fetch_fmp_intraday_bars
+
+        wanted = list(dict.fromkeys(t.strip().upper() for t in tickers if t.strip()))
+        start, end = _day(start), _day(end)
+        needed = []
+        for ticker in wanted:
+            cached = self._intraday.get((ticker, minutes))
+            if cached is None or start < cached[0] or end > cached[1]:
+                first = min(start, cached[0]) if cached else start
+                last = max(end, cached[1]) if cached else end
+                needed.append((ticker, first, last))
+        for ticker, first, last in needed:
+            frame = fetch_fmp_intraday_bars([ticker], first, last, minutes)
+            self._intraday[(ticker, minutes)] = (first, last, frame)
+        parts = []
+        for ticker in wanted:
+            frame = self._intraday[(ticker, minutes)][2]
+            if frame.empty:
+                continue
+            days = frame["timestamp"].dt.date
+            frame = frame[(days >= start) & (days <= end)]
+            if not frame.empty:
+                parts.append(frame)
+        if not parts:
+            return pd.DataFrame()
+        return pd.concat(parts, ignore_index=True).sort_values(["timestamp", "ticker"]).reset_index(drop=True)
+
     def execute_query(self, *args, **kwargs):
         raise FMPUnavailable(
             "Database price queries are disabled for FMP backtests. "
@@ -271,3 +328,4 @@ class FMPDataAdapter:
 
     def close(self):
         self._history.clear()
+        self._intraday.clear()

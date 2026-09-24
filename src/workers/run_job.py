@@ -560,6 +560,8 @@ def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest
     params = dict(context.params)
     slippage = float(params.pop("slippageBps", 0.0)) / 10_000.0
     commission = float(params.pop("commissionPerShare", 0.0))
+    # Recorded for reporting; the engine reads the BAR_INTERVAL_SECONDS overlay.
+    params.pop("barIntervalSeconds", None)
     # The selected universe is retained for reporting; validated TICKERS and
     # WEIGHTS overlays are present only when it differs from the strategy.
     universe = params.pop("universe", None)

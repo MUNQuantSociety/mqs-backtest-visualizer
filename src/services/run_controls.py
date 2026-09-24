@@ -10,6 +10,7 @@ import math
 import re
 from typing import Any
 
+from engine.data.bar_interval import is_intraday
 from src.core.config import settings
 
 # The run form's slider range; mirrors engine/core/sentiment_gate.py.
@@ -17,8 +18,30 @@ SENTIMENT_THRESHOLD_MIN = -1.0
 SENTIMENT_THRESHOLD_MAX = 0.0
 
 CONTROL_KEYS = frozenset(
-    {"universe", "slippageBps", "commissionPerShare", "signals", "sentimentGate"}
+    {
+        "universe",
+        "slippageBps",
+        "commissionPerShare",
+        "signals",
+        "sentimentGate",
+        "barIntervalSeconds",
+    }
 )
+
+# The API's ``timeframe`` label for each bar size the run form offers.
+_TIMEFRAME_LABELS = {60: "1m", 300: "5m", 900: "15m", 1800: "30m", 3600: "1h", 86400: "1d"}
+
+
+def timeframe_label(params: dict[str, Any]) -> str:
+    """The run's bar size as a ``timeframe`` label; ``"1d"`` when unset.
+
+    Runs submitted before the bar-interval control existed carry no key and
+    were daily, which is why daily is the fallback rather than an error.
+    """
+    seconds = params.get("barIntervalSeconds")
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        return "1d"
+    return _TIMEFRAME_LABELS.get(seconds, "1d")
 
 
 def split_controls(
@@ -68,6 +91,9 @@ def split_controls(
             "Per-share commission requires event mode; use event mode or set commission to zero."
         )
 
+    if "barIntervalSeconds" in raw:
+        controls.update(_bar_interval_controls(raw["barIntervalSeconds"], mode))
+
     if "signals" in raw and raw["signals"] != []:
         raise ValueError(
             "Signal overrides are not supported. Indicators are defined by the strategy code."
@@ -109,3 +135,27 @@ def _validated_sentiment_gate(raw: Any, mode: str) -> dict[str, Any] | None:
             "has not been configured to reach."
         )
     return {"enabled": True, "threshold": float(threshold)}
+
+
+def _bar_interval_controls(value: Any, mode: str) -> dict[str, int]:
+    """Validate the bar size and return the controls and engine overlay it implies.
+
+    A daily bar is recorded but overlays nothing, so the strategy runs exactly
+    as it did before the control existed. An intraday bar sets the engine's
+    ``BAR_INTERVAL_SECONDS`` and makes the strategy decide on every bar
+    (``INTERVAL`` 0). Setting ``INTERVAL`` to the bar length instead would skip
+    the session's short closing bar (15:30–16:00 on hourly bars), because the
+    runner drops any bar closer than ``INTERVAL`` to the previous decision.
+
+    Raises:
+        ValueError: An unsupported size, or intraday bars in fast mode.
+    """
+    intraday = is_intraday(value)
+    seconds = int(value)
+    if not intraday:
+        return {"barIntervalSeconds": seconds}
+    if mode == "fast":
+        raise ValueError(
+            "Intraday bars require event mode; use event mode or a 1-day bar interval."
+        )
+    return {"barIntervalSeconds": seconds, "BAR_INTERVAL_SECONDS": seconds, "INTERVAL": 0}

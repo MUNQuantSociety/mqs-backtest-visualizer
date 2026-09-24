@@ -1,11 +1,12 @@
-"""Dashboard market context: scored news and per-ticker indicators.
+"""Market context: a backtest run's scored news, and dashboard indicators.
 
-News and sentiment always come from ``public.news_sentiment`` on the live MQS
+News and sentiment always come from ``public.news_sentiment`` on the MQS
 database (NEWS_POSTGRES_*), through read-only sessions, whichever database
 POSTGRES_* points at. Prices come from ``public.market_data`` on the app's own
-database. Neither table is ever written here.
+database. Neither table is ever written here. The news table is a fixed
+historical dataset, not a live feed: news is served per run, by its dates.
 
-Every window is anchored on the ticker's last stored bar, never on today:
+Indicator windows are anchored on the ticker's last stored bar, never on today:
 market data ends weeks behind the calendar, and a window computed from ``now()``
 would hold no closes. Sentiment uses the same anchor, so a gauge never counts
 news published after the prices it sits beside.
@@ -46,6 +47,7 @@ _PRICE_LOOKBACK = timedelta(days=420)
 _EXCHANGE_TZ = ZoneInfo("America/New_York")
 _SESSION_CLOSE = time(16, 0)
 _ELLIPSIS = "…"
+_LINK_SCHEMES = frozenset({"http", "https"})
 
 
 class MarketContextUnavailable(RuntimeError):
@@ -83,36 +85,71 @@ def _headline_from_summary(summary: str | None, fallback: str) -> str:
     return cut.rstrip(" ,;:-") + _ELLIPSIS
 
 
+def _safe_link(url: str | None) -> str | None:
+    """The stored link when it is an http(s) URL with a host, else None.
+
+    The client renders it as a link, so a ``javascript:`` or other scheme from
+    a scraped page must never reach it.
+    """
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme.lower() not in _LINK_SCHEMES or not parsed.hostname:
+        return None
+    return parsed.geturl()
+
+
 def to_news_article(row: ArticleRow) -> NewsArticle:
-    """Shape a stored row for the dashboard's news list."""
+    """Shape a stored row for a news list and its story card."""
     source = _source_from_url(row.article_url)
     return NewsArticle(
         id=str(row.id),
         source=source,
         published_at=row.published_at.replace(tzinfo=timezone.utc).isoformat(),
         headline=_headline_from_summary(row.content_summary, fallback=source),
+        summary=" ".join((row.content_summary or "").split()),
+        url=_safe_link(row.article_url),
         tickers=[row.ticker.strip().upper()],
         score=min(max(row.sentiment_score, -1.0), 1.0),
     )
 
 
-async def latest_news(tickers: list[str] | None, limit: int) -> NewsResponse:
-    """The newest scored articles from the live table, for ``tickers`` or all.
+def _day_start_utc(day: date) -> datetime:
+    """Midnight New York at the start of ``day`` as naive UTC, matching ``published_at``."""
+    start = datetime.combine(day, time.min, tzinfo=_EXCHANGE_TZ)
+    return start.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+async def news_for_run(
+    tickers: list[str], start: date, end: date, limit: int
+) -> NewsResponse:
+    """A backtest run's scored articles: its tickers, inside its date window.
+
+    The table is a fixed historical dataset, not a live feed, so there is no
+    "latest news": news is only ever asked for by a run's dates. The window is
+    whole New York calendar days, ``start`` through ``end`` inclusive; the
+    newest ``limit`` articles in it come back first.
 
     Args:
-        tickers: Symbols to restrict to (validated here), or None for all.
+        tickers: The run's universe (validated here).
+        start: The run's first day.
+        end: The run's last day.
         limit: 1 to ``NEWS_LIMIT_MAX`` articles.
 
     Raises:
-        ValueError: invalid tickers or limit.
-        MarketContextUnavailable: the live news database could not be read.
+        ValueError: invalid tickers, dates or limit.
+        MarketContextUnavailable: the news database could not be read.
     """
     if not 1 <= limit <= NEWS_LIMIT_MAX:
         raise ValueError(f"limit must be between 1 and {NEWS_LIMIT_MAX}.")
-    wanted = None if tickers is None else normalize_tickers(tickers)
+    if start > end:
+        raise ValueError("start must be on or before end.")
+    wanted = list(dict.fromkeys(normalize_tickers(tickers)))
+    window_start = _day_start_utc(start)
+    window_end = _day_start_utc(end + timedelta(days=1))
     try:
         async with news_session_scope() as session:
-            rows = await news_repo.latest_articles(session, wanted, limit)
+            rows = await news_repo.articles_between(
+                session, wanted, window_start, window_end, limit
+            )
     except _DATABASE_ERRORS as exc:
         logger.error("News query failed: %s", _describe(exc))
         raise MarketContextUnavailable("News is unavailable. Please try again later.") from exc

@@ -39,12 +39,13 @@ from src.core.config import settings
 from src.db.engine import create_sync_engine, dispose_async_engine
 from src.db.init import init_database
 from src.integrations.strategy_store import LocalStrategyStore, strategy_key
-from src.models import BacktestRun, Strategy
+from src.models import BacktestReport, BacktestRun, Strategy
 from src.services import strategy_validation
 
 pytestmark = pytest.mark.db
 
 _RUNS = BacktestRun.__table__
+_REPORTS = BacktestReport.__table__
 _STRATEGIES = Strategy.__table__
 
 # How long a validation run may take before something is wrong. The window is
@@ -177,17 +178,27 @@ def db_engine(require_database: None):
 
 
 @pytest.fixture(scope="module")
-def client() -> Iterator[TestClient]:
+def client(
+    integration_user_headers: dict[str, str], tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[TestClient]:
     """The real app, lifespan and worker pool included.
 
     Used as a context manager rather than bare: entering it runs the lifespan,
     which is what creates the process pool these validation runs execute in,
     and keeps one event loop for the whole module so the asyncpg pool is not
     left bound to a loop that has already closed.
+
+    Signed in as the integration user, with an empty parquet cache of its own:
+    the shared ``data/backfill_cache`` may hold another source's prices for
+    this window. Set before the client opens, because the lifespan's spawned
+    workers copy the environment when they start.
     """
-    with TestClient(app) as test_client:
-        yield test_client
-        test_client.portal.call(dispose_async_engine)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("MARKET_CACHE_DIR", str(tmp_path_factory.mktemp("market_cache")))
+        with TestClient(app) as test_client:
+            test_client.headers.update(integration_user_headers)
+            yield test_client
+            test_client.portal.call(dispose_async_engine)
 
 
 @pytest.fixture(scope="module")
@@ -202,15 +213,18 @@ def uploads(db_engine) -> Iterator[list[str]]:
 
 
 def _forget_strategy(db_engine, key: str) -> None:
-    """Remove a strategy, its runs, their artifacts, and its stored source."""
+    """Remove a strategy, its runs and reports, their artifacts, and its stored source."""
     with db_engine.begin() as connection:
         run_ids = [
             row[0]
+            for table in (_RUNS, _REPORTS)
             for row in connection.execute(
-                select(_RUNS.c.id).where(_RUNS.c.strategy_key == key)
+                select(table.c.id).where(table.c.strategy_key == key)
             ).all()
         ]
         connection.execute(delete(_RUNS).where(_RUNS.c.strategy_key == key))
+        # Saved reports hold the strategy key ON DELETE RESTRICT.
+        connection.execute(delete(_REPORTS).where(_REPORTS.c.strategy_key == key))
         connection.execute(delete(_STRATEGIES).where(_STRATEGIES.c.key == key))
 
     for run_id in run_ids:
@@ -243,13 +257,17 @@ def _strategy_row(db_engine, key: str):
 
 
 def _validation_run_id(db_engine, key: str) -> uuid.UUID:
-    with db_engine.begin() as connection:
-        row = connection.execute(
-            select(_RUNS.c.id).where(
-                _RUNS.c.strategy_key == key, _RUNS.c.purpose == "validation"
-            )
-        ).one()
-    return row[0]
+    """The strategy's validation run, as the catalogue points at it.
+
+    New validation runs have no ``backtest_runs`` row: the strategy names its
+    transient job or saved report in ``validation_job_id``. Older rows still
+    use ``validation_run_id``, which is why the API falls back between them.
+    """
+    row = _strategy_row(db_engine, key)
+    assert row is not None, f"strategy {key} does not exist"
+    run_id = row.validation_job_id or row.validation_run_id
+    assert run_id is not None, f"strategy {key} names no validation run"
+    return run_id
 
 
 def _await_strategy_settled(db_engine, key: str, timeout: float):
@@ -263,17 +281,10 @@ def _await_strategy_settled(db_engine, key: str, timeout: float):
             return row
         time.sleep(POLL_SECONDS)
 
-    run = _run_row(db_engine, _validation_run_id(db_engine, key))
     pytest.fail(
         f"strategy {key} was still {row.status!r} after {timeout:.0f}s; "
-        f"its validation run is {run.status!r} at {run.progress_pct}% "
-        f"({run.error_message!r})"
+        f"its validation run is {row.validation_job_id}"
     )
-
-
-def _run_row(db_engine, run_id: uuid.UUID):
-    with db_engine.begin() as connection:
-        return connection.execute(select(_RUNS).where(_RUNS.c.id == run_id)).one()
 
 
 def _poll_run(client: TestClient, run_id: str, timeout: float) -> dict:
@@ -384,7 +395,7 @@ def test_validation_activates_the_strategy(db_engine, validated_upload) -> None:
 
     assert row.status == "active", "a validation run that passed must activate it"
     assert row.enabled is True
-    assert row.validation_run_id == _validation_run_id(db_engine, key)
+    assert row.validation_job_id is not None
 
 
 def test_an_activated_strategy_appears_in_the_catalogue(client, validated_upload) -> None:
@@ -431,7 +442,7 @@ def test_an_activated_strategy_reruns_from_the_catalogue(
 ) -> None:
     """Select it, submit it, get results — the same POST /backtests as a built-in."""
     key, _ = validated_upload
-    window = _rerun_window(db_engine, key)
+    window = _rerun_window(client, db_engine, key)
 
     response = client.post(
         "/api/backtests",
@@ -455,13 +466,11 @@ def test_an_activated_strategy_reruns_from_the_catalogue(
     assert detail["metrics"]["totalReturn"] is not None
 
 
-def _rerun_window(db_engine, key: str) -> dict[str, str]:
+def _rerun_window(client: TestClient, db_engine, key: str) -> dict[str, str]:
     """Reuse the validation run's window, which is known to hold data."""
-    run = _run_row(db_engine, _validation_run_id(db_engine, key))
-    return {
-        "startDate": run.start_date.isoformat(),
-        "endDate": run.end_date.isoformat(),
-    }
+    run_id = _validation_run_id(db_engine, key)
+    detail = client.get(f"/api/backtests/{run_id}").json()
+    return {"startDate": detail["startDate"], "endDate": detail["endDate"]}
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +538,7 @@ def test_a_strategy_that_cannot_be_imported_fails_validation(
     assert row.enabled is False
     # Pointed at the run even in failure: it is where the error message lives,
     # and there is no other way to find it from the catalogue.
-    assert row.validation_run_id == _validation_run_id(db_engine, key)
+    assert row.validation_job_id is not None
 
 
 def test_the_failure_reason_is_retrievable_from_the_run(
