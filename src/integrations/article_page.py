@@ -31,6 +31,7 @@ import logging
 import re
 import socket
 import ssl
+from time import monotonic
 from urllib.parse import urljoin, urlsplit
 
 logger = logging.getLogger(__name__)
@@ -152,13 +153,29 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
         self.sock = socket.create_connection((self._address, self.port), self.timeout)
 
 
+def _socket_timeout(deadline: float) -> float:
+    """The next socket operation's timeout: the smaller of TIMEOUT_SECONDS and the remaining deadline.
+
+    Raises:
+        socket.timeout: the deadline has passed, so the fetch must stop.
+    """
+    remaining = min(TIMEOUT_SECONDS, deadline - monotonic())
+    if remaining <= 0:
+        raise socket.timeout("article page fetch deadline exceeded")
+    return remaining
+
+
 def _request(target: _Target) -> _Response:
     connection_class = (
         _PinnedHTTPSConnection if target.scheme == "https" else _PinnedHTTPConnection
     )
     connection = connection_class(target.host, target.address, target.port, TIMEOUT_SECONDS)
     try:
+        deadline = monotonic() + TIMEOUT_SECONDS
+        connection.timeout = _socket_timeout(deadline)
         connection.request("GET", target.path, headers=_HEADERS)
+        sock = connection.sock
+        sock.settimeout(_socket_timeout(deadline))
         response = connection.getresponse()
         content_type = (response.getheader("Content-Type") or "").lower()
         body = b""
@@ -166,6 +183,7 @@ def _request(target: _Target) -> _Response:
             chunks: list[bytes] = []
             size = 0
             while size < MAX_BYTES:
+                sock.settimeout(_socket_timeout(deadline))
                 chunk = response.read(min(_READ_CHUNK, MAX_BYTES - size))
                 if not chunk:
                     break

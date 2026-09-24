@@ -232,23 +232,75 @@ def test_run_news_reports_a_database_failure_as_unavailable(monkeypatch, stub_se
         _news()
 
 
-def test_indicators_omit_tickers_without_enough_history(monkeypatch, stub_session):
-    async def last_bar(_session, ticker):
-        return None if ticker == "NEWCO" else LAST_SESSION
+def _stub_price_reads(monkeypatch, last_dates, closes_by_ticker, calls=None):
+    """Replace the batched price reads; ``calls`` records each one in order."""
+    calls = [] if calls is None else calls
 
-    async def closes(_session, _ticker, _since):
-        return _closes(250)
+    async def limit(_session, milliseconds):
+        calls.append(("timeout", milliseconds))
 
-    async def no_scores(*_args):
-        return []
+    async def last_bars(_session, tickers):
+        calls.append(("last_bar_dates", list(tickers)))
+        return {ticker: day for ticker, day in last_dates.items() if ticker in tickers}
 
-    monkeypatch.setattr(market_context.market_data_repo, "last_bar_date", last_bar)
+    async def closes(_session, since_by_ticker):
+        calls.append(("daily_closes", dict(since_by_ticker)))
+        return {ticker: closes_by_ticker[ticker] for ticker in since_by_ticker}
+
+    monkeypatch.setattr(market_context.market_data_repo, "limit_statement_time", limit)
+    monkeypatch.setattr(market_context.market_data_repo, "last_bar_dates", last_bars)
     monkeypatch.setattr(market_context.market_data_repo, "daily_closes", closes)
-    monkeypatch.setattr(market_context.news_repo, "scores_between", no_scores)
+    return calls
 
-    response = asyncio.run(market_context.indicators_for(["AAPL", "NEWCO"]))
+
+async def _no_scores(*_args):
+    return []
+
+
+def test_indicators_omit_tickers_without_enough_history(monkeypatch, stub_session):
+    _stub_price_reads(
+        monkeypatch,
+        {"AAPL": LAST_SESSION, "THIN": LAST_SESSION},
+        {"AAPL": _closes(250), "THIN": _closes(199)},
+    )
+    monkeypatch.setattr(market_context.news_repo, "scores_between", _no_scores)
+
+    response = asyncio.run(market_context.indicators_for(["AAPL", "NEWCO", "THIN"]))
 
     assert [row.ticker for row in response.items] == ["AAPL"]
+
+
+def test_indicators_read_prices_in_one_query_per_step_under_a_timeout(
+    monkeypatch, stub_session
+):
+    calls = _stub_price_reads(
+        monkeypatch,
+        {"AAPL": LAST_SESSION, "MSFT": LAST_SESSION},
+        {"AAPL": _closes(250), "MSFT": _closes(250)},
+    )
+    monkeypatch.setattr(market_context.news_repo, "scores_between", _no_scores)
+
+    asyncio.run(market_context.indicators_for(["AAPL", "MSFT", "NEWCO"]))
+
+    assert [name for name, _ in calls] == ["timeout", "last_bar_dates", "daily_closes"]
+    assert calls[0][1] > 0
+    assert calls[1][1] == ["AAPL", "MSFT", "NEWCO"]
+
+
+def test_indicators_look_back_from_each_tickers_own_last_bar(monkeypatch, stub_session):
+    earlier = LAST_SESSION - timedelta(days=30)
+    calls = _stub_price_reads(
+        monkeypatch,
+        {"AAPL": LAST_SESSION, "MSFT": earlier},
+        {"AAPL": _closes(250), "MSFT": _closes(250)},
+    )
+    monkeypatch.setattr(market_context.news_repo, "scores_between", _no_scores)
+
+    asyncio.run(market_context.indicators_for(["AAPL", "MSFT"]))
+
+    since_by_ticker = calls[2][1]
+    assert since_by_ticker["AAPL"].date() - since_by_ticker["MSFT"].date() == timedelta(days=30)
+    assert set(since_by_ticker) == {"AAPL", "MSFT"}
 
 
 def test_news_route_returns_items_envelope(monkeypatch, client):
@@ -365,15 +417,13 @@ def test_routes_require_a_signed_in_user():
 
 
 def test_indicators_skip_the_news_database_when_no_ticker_has_history(monkeypatch, stub_session):
-    async def no_bars(_session, _ticker):
-        return None
+    _stub_price_reads(monkeypatch, {}, {})
 
     @asynccontextmanager
     async def news_must_not_open():
         pytest.fail("the live news database was opened for nothing")
         yield
 
-    monkeypatch.setattr(market_context.market_data_repo, "last_bar_date", no_bars)
     monkeypatch.setattr(market_context, "news_session_scope", news_must_not_open)
 
     assert asyncio.run(market_context.indicators_for(["NEWCO"])).items == []

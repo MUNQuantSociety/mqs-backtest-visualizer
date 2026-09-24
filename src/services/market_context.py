@@ -44,6 +44,9 @@ UNKNOWN_SOURCE = "Unknown"
 # Calendar days of bars to read: comfortably more than the 200 sessions the SMA
 # regime needs (about 290 NYSE sessions fit in 420 calendar days).
 _PRICE_LOOKBACK = timedelta(days=420)
+# Bounds the indicator price reads on the app database, as the news engine's
+# server setting bounds sentiment, so a slow plan cannot hold a dashboard poll open.
+_PRICE_STATEMENT_TIMEOUT_MS = 15_000
 _EXCHANGE_TZ = ZoneInfo("America/New_York")
 _SESSION_CLOSE = time(16, 0)
 _ELLIPSIS = "…"
@@ -204,15 +207,25 @@ def build_indicators(
 
 
 async def _closes_for(
-    session: AsyncSession, ticker: str
-) -> list[tuple[date, float]] | None:
-    """The ticker's recent session closes, or None when too few to use."""
-    last_date = await market_data_repo.last_bar_date(session, ticker)
-    if last_date is None:
-        return None
-    since = datetime.combine(last_date - _PRICE_LOOKBACK, time.min, tzinfo=_EXCHANGE_TZ)
-    closes = await market_data_repo.daily_closes(session, ticker, since)
-    return closes if len(closes) >= ta.MIN_CLOSES else None
+    session: AsyncSession, tickers: list[str]
+) -> dict[str, list[tuple[date, float]]]:
+    """Each ticker's recent session closes; tickers with too few to use are absent.
+
+    Two statements whatever the ticker count: every newest bar date, then every
+    ticker's closes back from its own newest bar.
+    """
+    await market_data_repo.limit_statement_time(session, _PRICE_STATEMENT_TIMEOUT_MS)
+    last_dates = await market_data_repo.last_bar_dates(session, tickers)
+    since_by_ticker = {
+        ticker: datetime.combine(last_date - _PRICE_LOOKBACK, time.min, tzinfo=_EXCHANGE_TZ)
+        for ticker, last_date in last_dates.items()
+    }
+    closes_by_ticker = await market_data_repo.daily_closes(session, since_by_ticker)
+    return {
+        ticker: closes
+        for ticker, closes in closes_by_ticker.items()
+        if len(closes) >= ta.MIN_CLOSES
+    }
 
 
 async def indicators_for(tickers: list[str]) -> IndicatorsResponse:
@@ -230,8 +243,7 @@ async def indicators_for(tickers: list[str]) -> IndicatorsResponse:
     wanted = list(dict.fromkeys(normalize_tickers(tickers)))
     try:
         async with session_scope() as session:
-            closes_by_ticker = {ticker: await _closes_for(session, ticker) for ticker in wanted}
-        usable = {ticker: closes for ticker, closes in closes_by_ticker.items() if closes}
+            usable = await _closes_for(session, wanted)
         articles_by_ticker: dict[str, list[tuple[datetime, float]]] = {}
         if usable:
             async with news_session_scope() as news_session:
