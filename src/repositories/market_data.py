@@ -11,7 +11,7 @@ stored exchange date, not a timestamp converted in the client's timezone.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -97,6 +97,41 @@ async def loaded_tickers(session: AsyncSession) -> set[str]:
     """Every ticker with at least one bar: what this database can already run."""
     result = await session.execute(_DISTINCT_TICKERS_SQL)
     return {str(row[0]).strip().upper() for row in result if row[0]}
+
+
+# One close per New York session: the last bar inside 09:30-16:00, the same rule
+# the engine's historical loader uses, so dashboard indicators and backtests see
+# the same closes. The ticker and timestamp bounds keep this on the
+# (ticker, timestamp) index.
+_DAILY_CLOSES_SQL = text(
+    "SELECT DISTINCT ON ((\"timestamp\" AT TIME ZONE 'America/New_York')::date) "
+    "(\"timestamp\" AT TIME ZONE 'America/New_York')::date AS trade_date, close_price "
+    "FROM public.market_data "
+    "WHERE ticker = :ticker AND \"timestamp\" >= :since "
+    "AND close_price IS NOT NULL "
+    "AND (\"timestamp\" AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00' "
+    "ORDER BY (\"timestamp\" AT TIME ZONE 'America/New_York')::date, \"timestamp\" DESC"
+).bindparams(bindparam("ticker"), bindparam("since"))
+
+
+async def last_bar_date(session: AsyncSession, ticker: str) -> date | None:
+    """The stored exchange date of ``ticker``'s newest bar, or None with no bars."""
+    row = (await session.execute(_LATEST_BAR_SQL, {"ticker": ticker})).first()
+    return None if row is None else row[0]
+
+
+async def daily_closes(
+    session: AsyncSession, ticker: str, since: datetime
+) -> list[tuple[date, float]]:
+    """Session closes for ``ticker`` from ``since`` onward, oldest first.
+
+    Args:
+        session: An open async session.
+        ticker: The exact stored symbol.
+        since: Timezone-aware lower bound on the bar timestamp.
+    """
+    result = await session.execute(_DAILY_CLOSES_SQL, {"ticker": ticker, "since": since})
+    return [(row.trade_date, float(row.close_price)) for row in result]
 
 
 _INSERT_BARS_SQL = text(

@@ -24,11 +24,14 @@ looks right and fails in the browser or against the production database.
    same commit and say so in the commit message.
 3. **The database is the production MQS trading database.** Verified facts are
    in section 2 — trust them over any assumption. The app may **read**
-   `public.market_data` and **own** everything under the `app` schema. It must
-   never read or write `positions_book`, `cash_equity_book`, `pnl_book`,
-   `risk_book`, `portfolio_weights`, `trade_execution_logs`, `news_sentiment`,
-   `rbp_forecasts`, or `user_creds`. The credentials in `.env` are admin-level,
-   so nothing enforces this except this rule.
+   `public.market_data` and **own** everything under the `app` schema. It
+   reads `public.news_sentiment` for the dashboard's `/news` and `/indicators`,
+   always from the live database (`NEWS_POSTGRES_*`) over connections Postgres
+   itself holds read-only; it must never write it. It must never read or write
+   `positions_book`, `cash_equity_book`, `pnl_book`, `risk_book`,
+   `portfolio_weights`, `trade_execution_logs`, `rbp_forecasts`, or
+   `user_creds`. The credentials in `.env` are admin-level, so nothing enforces
+   this except this rule.
 4. **Never print, log, or commit credentials.** `.env` is gitignored; keep it
    that way. Config is read only via `src/core/config.py`.
 5. **When reality disagrees with this plan, reality wins** — then update this

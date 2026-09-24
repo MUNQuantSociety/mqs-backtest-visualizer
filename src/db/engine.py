@@ -80,13 +80,91 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
         await session.close()
 
 
+class NewsDatabaseNotConfigured(RuntimeError):
+    """NEWS_POSTGRES_* is blank, so there is no live news database to read."""
+
+
+# Postgres itself refuses writes on these connections: every transaction starts
+# read-only, so an INSERT or UPDATE fails at the server rather than relying on
+# the code never issuing one. The statement timeout bounds a slow query against
+# the live host so it cannot hold a dashboard request open.
+_NEWS_SERVER_SETTINGS = {
+    "default_transaction_read_only": "on",
+    "statement_timeout": "15000",
+}
+_NEWS_POOL_SIZE = 2
+_NEWS_MAX_OVERFLOW = 1
+
+_news_engine: AsyncEngine | None = None
+_news_session_factory: async_sessionmaker[AsyncSession] | None = None
+
+
+def get_news_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Sessions on the live news database. Created on first use.
+
+    Raises:
+        NewsDatabaseNotConfigured: NEWS_POSTGRES_* is blank.
+    """
+    global _news_engine, _news_session_factory
+    if _news_session_factory is None:
+        if not settings.news_database_configured:
+            raise NewsDatabaseNotConfigured(
+                "The live news database is not configured: set NEWS_POSTGRES_HOST, "
+                "NEWS_POSTGRES_USER and NEWS_POSTGRES_PASSWORD."
+            )
+        _news_engine = create_async_engine(
+            settings.news_database_url_async,
+            pool_pre_ping=True,
+            pool_size=_NEWS_POOL_SIZE,
+            max_overflow=_NEWS_MAX_OVERFLOW,
+            connect_args={
+                "server_settings": _NEWS_SERVER_SETTINGS,
+                "timeout": settings.db_connect_timeout_seconds,
+            },
+            future=True,
+        )
+        _news_session_factory = async_sessionmaker(
+            bind=_news_engine, expire_on_commit=False, autoflush=False
+        )
+    return _news_session_factory
+
+
+@asynccontextmanager
+async def news_session_scope() -> AsyncIterator[AsyncSession]:
+    """A read-only session on the live news database, always rolled back.
+
+    Never commits: there is nothing to commit, and ending every transaction
+    with a rollback means a write that somehow got past the server's read-only
+    mode could still never persist.
+
+    Raises:
+        NewsDatabaseNotConfigured: NEWS_POSTGRES_* is blank.
+    """
+    session = get_news_session_factory()()
+    try:
+        yield session
+    finally:
+        await session.rollback()
+        await session.close()
+
+
+async def dispose_news_engine() -> None:
+    """Close the news pool."""
+    global _news_engine, _news_session_factory
+    if _news_engine is not None:
+        await _news_engine.dispose()
+    _news_engine = None
+    _news_session_factory = None
+
+
 async def dispose_async_engine() -> None:
-    """Close the API pool. Called from a shutdown hook and by tests."""
+    """Close the API pools. Called from a shutdown hook and by tests."""
     global _async_engine, _async_session_factory
     if _async_engine is not None:
         await _async_engine.dispose()
     _async_engine = None
     _async_session_factory = None
+    await dispose_news_engine()
 
 
 @contextmanager
@@ -104,13 +182,14 @@ def detached_async_engine() -> Iterator[None]:
     The block is expected to dispose the engine it created before it returns;
     this only guarantees it cannot dispose one it did not.
     """
-    global _async_engine, _async_session_factory
-    saved_engine, saved_factory = _async_engine, _async_session_factory
+    global _async_engine, _async_session_factory, _news_engine, _news_session_factory
+    saved = (_async_engine, _async_session_factory, _news_engine, _news_session_factory)
     _async_engine, _async_session_factory = None, None
+    _news_engine, _news_session_factory = None, None
     try:
         yield
     finally:
-        _async_engine, _async_session_factory = saved_engine, saved_factory
+        _async_engine, _async_session_factory, _news_engine, _news_session_factory = saved
 
 
 def create_sync_engine() -> Engine:

@@ -221,10 +221,15 @@ all three. This handoff does not authorize bypassing these gates or merging main
 
 These are not silently included in the completed backtest work:
 
-- **Dashboard news and indicators:** `/api/news` and `/api/indicators` are not
-  implemented. The frontend market panels explicitly fall back to fixtures on
-  missing endpoints, even with backtest fixture mode disabled. Decide whether
-  to implement real feeds or clearly hide/label those panels in a separate task.
+- **Dashboard news and indicators:** `/api/news` reads `public.news_sentiment`
+  on the live database (`NEWS_POSTGRES_*`, read-only; 503 when unset, no
+  fallback to `POSTGRES_*`);
+  `/api/indicators` computes RSI(14), MACD(12,26,9) histogram, the SMA 50/200
+  regime and 20-session momentum from `public.market_data` session closes, with
+  7-day article sentiment. Both are read-only. Tickers with fewer than 200
+  sessions of closes are omitted from `/indicators`; a sentiment window with no
+  articles scores 0.0. Headlines are the start of the stored summary, because
+  the table keeps no separate title.
 - **Live trading pages:** `/api/live/*`, including portfolio and system/log
   views, return sample data. They are outside the backtest-only integration.
 - **Signal/sentiment overrides:** nonempty signal overrides and enabled
