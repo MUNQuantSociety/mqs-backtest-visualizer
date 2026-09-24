@@ -17,6 +17,8 @@ import threading
 import time
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from engine.data import yahoo
 from engine.data.fmp import FMPMarketData, FMPSymbolUnknown, fetch_daily_history, market_data_source
 from engine.data.fmp import FMPUnavailable as FMPUnavailable
@@ -28,6 +30,8 @@ from src.repositories import market_data as market_data_repo
 from src.repositories import reports as reports_repo
 from src.repositories import strategies as strategies_repo
 from src.schemas.market_data import (
+    ClosePoint,
+    TickerClosesResponse,
     CoverageResponse,
     SymbolMatch,
     SymbolSearchResponse,
@@ -70,6 +74,57 @@ _KNOWN_TTL_SECONDS = 300
 _KNOWN_RETRY_SECONDS = 30
 _known_tickers: tuple[float, dict[str, str]] | None = None
 _known_lock = threading.Lock()
+
+
+# A benchmark window as long as the dashboard's "max" period needs, and no more:
+# each extra year is ~252 more index probes.
+_CLOSES_MAX_SPAN = timedelta(days=366 * 15)
+# The same budget GET /indicators gives its closes query.
+_CLOSES_STATEMENT_TIMEOUT_MS = 15_000
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
+
+
+class MarketDataUnavailable(RuntimeError):
+    """The market-data database could not answer; the route turns this into a 503."""
+
+
+async def closes_between(ticker: str, start: date, end: date) -> TickerClosesResponse:
+    """A ticker's daily session closes from ``start`` to ``end`` (inclusive), oldest first.
+
+    Args:
+        ticker: One symbol, case-insensitive.
+        start: First New York trading date to include.
+        end: Last New York trading date to include.
+
+    Returns:
+        The closes found; a ticker with none in range has no points.
+
+    Raises:
+        ValueError: an invalid ticker, ``start`` after ``end``, or a window longer
+            than 15 years.
+        MarketDataUnavailable: the database failed or ran past its time budget.
+    """
+    (wanted,) = normalize_tickers([ticker])
+    if start > end:
+        raise ValueError("start must be on or before end.")
+    if end - start > _CLOSES_MAX_SPAN:
+        raise ValueError("Ask for at most 15 years of closes at a time.")
+    since = datetime.combine(start, datetime.min.time(), tzinfo=_EXCHANGE_TZ)
+    try:
+        async with session_scope() as session:
+            await market_data_repo.limit_statement_time(session, _CLOSES_STATEMENT_TIMEOUT_MS)
+            closes = await market_data_repo.daily_closes(session, {wanted: (since, end)})
+    except (SQLAlchemyError, OSError) as exc:
+        # The driver's message can carry connection details; the type is enough.
+        logger.error("Closes query failed for %s: %s", wanted, type(exc).__name__)
+        raise MarketDataUnavailable("Benchmark prices are unavailable. Please try again later.") from exc
+    return TickerClosesResponse(
+        ticker=wanted,
+        points=[
+            ClosePoint(date=day.isoformat(), close=close)
+            for day, close in closes.get(wanted, [])
+        ],
+    )
 
 
 def normalize_tickers(tickers: list[str]) -> list[str]:
