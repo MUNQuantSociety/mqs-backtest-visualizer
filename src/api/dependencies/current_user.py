@@ -78,3 +78,21 @@ async def _development_user(x_user_id: str | None) -> AuthUser:
 async def require_current_user(user: AuthUser = Depends(require_authenticated_user)) -> uuid.UUID:
     """All report and upload authorization uses this application UUID."""
     return user.id
+
+
+async def optional_current_user(
+    authorization: Annotated[str | None, Header()] = None,
+    x_user_id: Annotated[str | None, Header(alias=USER_ID_HEADER)] = None,
+) -> uuid.UUID | None:
+    """The caller's id when it can be established, otherwise None; never raises an auth error.
+
+    For open routes that only *label* data per caller, such as the strategy
+    catalogue's ``origin``. The catalogue must keep answering on an expired
+    token or an identity-provider outage; the worst case is an own strategy
+    labelled ``community``. Never use this to authorize anything.
+    """
+    try:
+        user = await require_authenticated_user(authorization, x_user_id)
+    except HTTPException:
+        return None
+    return user.id

@@ -192,6 +192,7 @@ def build_indicators(
     return TickerIndicators(
         ticker=ticker,
         last=prices[-1],
+        change1d=ta.momentum(prices, 1),
         rsi14=ta.relative_strength_index(prices),
         macd_histogram=ta.macd_histogram(prices),
         sma_regime=ta.sma_regime(prices),

@@ -19,13 +19,16 @@ class TickerIndicators(CamelModel):
 
     ticker: str
     last: float
+    # Last close against the session before, as a ratio: -0.012 is -1.2%.
+    change1d: float = Field(alias="change1d")
     rsi14: float = Field(ge=0, le=100)
     # MACD(12, 26, 9) histogram, in price units.
     macd_histogram: float
     sma_regime: Literal["above", "below"]
     # 20-session return as a ratio: 0.031 is +3.1%.
-    # Explicit aliases on these three: the camelCase generator capitalises a
-    # letter after a digit ("momentum20D"), which the client's schema rejects.
+    # Explicit aliases on these three and on change1d: the camelCase generator
+    # capitalises a letter after a digit ("momentum20D"), which the client's
+    # schema rejects.
     momentum20d: float = Field(alias="momentum20d")
     sentiment7d: float = Field(ge=-1, le=1, alias="sentiment7d")
     sentiment_delta7d: float = Field(alias="sentimentDelta7d")

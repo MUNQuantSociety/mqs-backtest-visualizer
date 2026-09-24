@@ -146,6 +146,7 @@ def registry_row(key, storage_key, class_path="example.Strategy"):
         storage_key=storage_key, enabled=True,
         # NULL, like every row not authored as a fragment.
         authoring=None,
+        kind="builtin", owner_id=None,
     ), 0, None, None, None)
 
 

@@ -24,7 +24,7 @@ from src.services import market_context
 
 # Copied from Backtest_Visualiser_FE/src/features/market/types.ts.
 FE_INDICATOR_KEYS = {
-    "ticker", "last", "rsi14", "macdHistogram", "smaRegime", "momentum20d",
+    "ticker", "last", "change1d", "rsi14", "macdHistogram", "smaRegime", "momentum20d",
     "sentiment7d", "sentimentDelta7d", "asOf",
 }
 FE_ARTICLE_KEYS = {
@@ -146,6 +146,14 @@ def test_indicators_are_computed_at_the_last_close():
     row = market_context.build_indicators("AAPL", _closes(250), [])
 
     assert (row.last, row.as_of) == (349.0, "2026-07-15")
+
+
+def test_daily_change_is_the_last_close_against_the_one_before():
+    closes = _closes(250)
+
+    row = market_context.build_indicators("AAPL", closes, [])
+
+    assert row.change1d == pytest.approx(closes[-1][1] / closes[-2][1] - 1.0)
 
 
 def test_indicators_are_none_below_200_closes():
