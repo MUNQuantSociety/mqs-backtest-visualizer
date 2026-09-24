@@ -84,3 +84,21 @@ class SymbolSearchResponse(CamelModel):
     # Set when every provider failed but known tickers still answered, so the
     # list is real but incomplete. None when the providers were reached.
     provider_error: str | None = None
+
+
+class ClosePoint(CamelModel):
+    """One session close: the New York trading date and the last bar's close."""
+
+    date: str
+    close: float
+
+
+class TickerClosesResponse(CamelModel):
+    """A ticker's daily closes over a window, oldest first.
+
+    The dashboard uses these as a benchmark line (SPY by default), rebased
+    alongside the runs it compares.
+    """
+
+    ticker: str
+    points: list[ClosePoint]
