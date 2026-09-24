@@ -7,13 +7,19 @@ Provider errors are reported separately from tickers with no history.
 from __future__ import annotations
 
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from src.api.dependencies.current_user import require_current_user
-from src.schemas.market_data import CoverageResponse, SymbolSearchResponse, TickerValidationResponse
+from src.schemas.market_data import (
+    CoverageResponse,
+    SymbolSearchResponse,
+    TickerClosesResponse,
+    TickerValidationResponse,
+)
 from src.services import market_data as market_data_service
-from src.services.market_data import FMPUnavailable
+from src.services.market_data import FMPUnavailable, MarketDataUnavailable
 
 router = APIRouter(prefix="/market-data", tags=["market-data"])
 
@@ -48,6 +54,26 @@ async def search_symbols(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except FMPUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
+@router.get("/closes", response_model=TickerClosesResponse)
+async def get_closes(
+    ticker: str = Query(max_length=20, description="One ticker symbol, e.g. SPY."),
+    start: date = Query(description="First New York trading date, YYYY-MM-DD."),
+    end: date = Query(description="Last New York trading date, YYYY-MM-DD (inclusive)."),
+    _owner_id: uuid.UUID = Depends(require_current_user),
+) -> TickerClosesResponse:
+    """A ticker's daily session closes, oldest first: the dashboard's benchmark line.
+
+    Read from the market-data store, not a provider, so it spends no quota. A
+    ticker with no closes in the window answers with no points.
+    """
+    try:
+        return await market_data_service.closes_between(ticker, start, end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except MarketDataUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
 
 
