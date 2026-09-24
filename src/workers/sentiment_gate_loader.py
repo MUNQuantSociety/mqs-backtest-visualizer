@@ -17,15 +17,15 @@ import logging
 
 from sqlalchemy import Engine, bindparam, text
 
-from engine.core.sentiment_gate import DATE_ONLY_EMBARGO, SENTIMENT_WINDOW, SentimentGate
+from engine.core.sentiment_gate import SENTIMENT_WINDOW, VENDOR_TIMEZONE_EMBARGO, SentimentGate
 from src.db.engine import create_news_sync_engine
 
 logger = logging.getLogger(__name__)
 
 # Articles that can influence a bar in [start, end]: the 7-day window before the
-# first bar, widened by the longest embargo so a late-available article is kept.
-_LOOKBACK = SENTIMENT_WINDOW + DATE_ONLY_EMBARGO
-_LOOKAHEAD = DATE_ONLY_EMBARGO
+# first bar, widened by the embargo so a late-available article is kept.
+_LOOKBACK = SENTIMENT_WINDOW + VENDOR_TIMEZONE_EMBARGO
+_LOOKAHEAD = VENDOR_TIMEZONE_EMBARGO
 
 # Per ticker, on the (ticker, published_at) index; only the two columns used.
 _SCORES_SQL = text(

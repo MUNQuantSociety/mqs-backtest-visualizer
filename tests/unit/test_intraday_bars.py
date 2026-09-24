@@ -30,7 +30,7 @@ from engine.data.intraday import (
     label_bar_close,
     parse_fmp_intraday_rows,
 )
-from engine.run_single import _reject_unsupported_bar_interval
+from engine.run_single import _market_data_resolution, _reject_unsupported_bar_interval
 
 NY = ZoneInfo("America/New_York")
 
@@ -311,6 +311,23 @@ def test_unsupported_bar_interval_fails_the_run():
         _reject_unsupported_bar_interval({"BAR_INTERVAL_SECONDS": 120}, "event")
 
 
+def test_resolution_is_daily_without_a_bar_interval():
+    assert _market_data_resolution({}, "event") == "daily"
+
+
+def test_resolution_is_daily_for_a_one_day_bar():
+    assert _market_data_resolution({"BAR_INTERVAL_SECONDS": 86_400}, "event") == "daily"
+
+
+@pytest.mark.parametrize(("seconds", "label"), [(60, "1min"), (300, "5min"), (3_600, "60min")])
+def test_resolution_reports_intraday_bars_in_minutes(seconds, label):
+    assert _market_data_resolution({"BAR_INTERVAL_SECONDS": seconds}, "event") == label
+
+
+def test_fast_mode_resolution_is_daily_whatever_the_config_says():
+    assert _market_data_resolution({"BAR_INTERVAL_SECONDS": 300}, "fast") == "daily"
+
+
 def test_session_bounds_are_half_open_new_york_midnights():
     lower, upper = intraday._session_bounds(date(2026, 8, 3), date(2026, 8, 3))
     assert lower == datetime(2026, 8, 3, tzinfo=NY)
@@ -352,6 +369,7 @@ def test_hourly_run_decides_on_every_bar_including_the_short_closing_bar(
     # day's 15:30-16:00 bar is the one a per-hour decision cadence would skip;
     # the last day's is recorded regardless, so one day would not show it.
     assert len(result.equity_curve) == 2 * 7 + 1
+    assert result.report_metadata["marketData"]["resolution"] == "60min"
 
 
 # --- open items: late starts, spacing samples, early size check, daily warmup --

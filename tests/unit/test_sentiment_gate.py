@@ -20,8 +20,8 @@ def test_an_article_counts_five_hours_after_publication():
     assert available_at(PUBLISHED) == AVAILABLE
 
 
-def test_a_date_only_article_counts_from_the_next_day():
-    assert available_at(datetime(2026, 7, 14)) == datetime(2026, 7, 15)
+def test_a_midnight_article_counts_five_hours_after_publication():
+    assert available_at(datetime(2026, 7, 14)) == datetime(2026, 7, 14, 5, 0)
 
 
 def test_an_article_is_excluded_at_the_exact_moment_it_becomes_available():

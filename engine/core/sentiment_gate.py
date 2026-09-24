@@ -13,8 +13,9 @@ Look-ahead rules, from the MQSMaster NLP look-ahead audit (D3):
 * ``published_at`` is stored naive and treated as UTC, but some vendors (FMP)
   send Eastern time, which makes an article look up to five hours older than
   it is. Every article is therefore embargoed for five hours.
-* Date-only sources are stored at exactly midnight. Such an article could have
-  appeared at any time that day, so it counts from the end of that day.
+* A midnight ``published_at`` gets the same five hours. The table records no
+  timestamp precision, so a midnight stamp cannot be told apart from a
+  date-only one, and no current scraper sends date-only values.
 
 A window with no available articles scores the neutral 0.0, the same rule the
 dashboard uses; with a threshold of at most 0 that never blocks.
@@ -25,19 +26,16 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 SENTIMENT_WINDOW = timedelta(days=7)
 VENDOR_TIMEZONE_EMBARGO = timedelta(hours=5)
-DATE_ONLY_EMBARGO = timedelta(days=1)
 THRESHOLD_MIN = -1.0
 THRESHOLD_MAX = 0.0
 
 
 def available_at(published_at: datetime) -> datetime:
     """When an article may first influence a bar, as naive UTC."""
-    if published_at.time() == time.min:
-        return published_at + DATE_ONLY_EMBARGO
     return published_at + VENDOR_TIMEZONE_EMBARGO
 
 

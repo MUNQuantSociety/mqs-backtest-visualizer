@@ -212,6 +212,17 @@ def _reject_oversized_intraday_window(
     check_intraday_size(len(config.get("TICKERS", [])), first, last, bar_minutes(bar_seconds))
 
 
+def _market_data_resolution(config: dict, mode: str) -> str:
+    """Bar size the run simulated on: ``"daily"`` or ``"<N>min"`` for intraday bars.
+
+    Fast mode always replays daily closes, whatever the configured bar size.
+    """
+    bar_seconds = config.get("BAR_INTERVAL_SECONDS", DAILY_BAR_SECONDS)
+    if mode == "fast" or not is_intraday(bar_seconds):
+        return "daily"
+    return f"{bar_minutes(bar_seconds)}min"
+
+
 def fast_mode_supported(strategy_class: type[BasePortfolio]) -> bool:
     """True when a vectorized adapter exists for this strategy class.
 
@@ -456,7 +467,12 @@ def run_single(request: RunRequest) -> RunResult:
             artifact_dir=artifact_dir,
             final_prices=final_prices,
             report_metadata={
-                "marketData": {"source": market_data_source(), "resolution": "daily"},
+                "marketData": {
+                    "source": market_data_source(),
+                    "resolution": _market_data_resolution(
+                        _strategy_config(strategy_class, request.params), mode
+                    ),
+                },
                 "execution": _execution_summary(
                     mode, fills, strategy_diagnostics, request.sentiment_gate
                 ),
