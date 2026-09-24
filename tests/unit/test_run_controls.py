@@ -68,6 +68,70 @@ def test_invalid_or_unsupported_controls_fail_explicitly(raw):
         split_controls(raw, ["AAPL"], "event")
 
 
+def test_custom_weights_become_the_run_allocation():
+    _, controls, universe = split_controls(
+        {"universe": ["AAPL", "MSFT"], "weights": {"aapl": 0.6, "MSFT": 0.3}},
+        ["AAPL", "MSFT"],
+        "event",
+    )
+    assert controls["weights"] == {"AAPL": 0.6, "MSFT": 0.3}
+    assert controls["TICKERS"] == universe
+    assert controls["WEIGHTS"] == {"AAPL": 0.6, "MSFT": 0.3}
+
+
+def test_custom_weights_apply_to_the_strategy_universe_when_it_is_unchanged():
+    _, controls, _ = split_controls({"weights": {"AAPL": 1.0}}, ["AAPL"], "event")
+    assert controls["TICKERS"] == ["AAPL"]
+    assert controls["WEIGHTS"] == {"AAPL": 1.0}
+
+
+def test_custom_weights_override_the_equal_split_of_a_changed_universe():
+    _, controls, _ = split_controls(
+        {"universe": ["MSFT", "NVDA"], "weights": {"MSFT": 0.8, "NVDA": 0.2}},
+        ["AAPL"],
+        "event",
+    )
+    assert controls["WEIGHTS"] == {"MSFT": 0.8, "NVDA": 0.2}
+
+
+def test_weights_may_leave_part_of_the_book_in_cash():
+    _, controls, _ = split_controls(
+        {"weights": {"AAPL": 0.5, "MSFT": 0.0}}, ["AAPL", "MSFT"], "event"
+    )
+    assert controls["WEIGHTS"] == {"AAPL": 0.5, "MSFT": 0.0}
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        {"AAPL": 0.7, "MSFT": 0.4},  # over 100%: leverage
+        {"AAPL": -0.1, "MSFT": 0.5},
+        {"AAPL": math.nan, "MSFT": 0.5},
+        {"AAPL": math.inf, "MSFT": 0.0},
+        {"AAPL": True, "MSFT": 0.5},
+        {"AAPL": "0.5", "MSFT": 0.5},
+        {"AAPL": 0.0, "MSFT": 0.0},  # nothing allocated
+        {"AAPL": 1.0},  # a universe ticker missing
+        {"AAPL": 0.5, "MSFT": 0.3, "NVDA": 0.2},  # not in the universe
+        {"AAPL": 0.5, "aapl": 0.3, "MSFT": 0.2},  # same ticker twice
+        ["AAPL", "MSFT"],
+        "AAPL=1",
+    ],
+)
+def test_invalid_weights_fail_explicitly(weights):
+    with pytest.raises(ValueError, match="weights"):
+        split_controls({"weights": weights}, ["AAPL", "MSFT"], "event")
+
+
+def test_weights_summing_to_one_within_rounding_are_accepted():
+    _, controls, _ = split_controls(
+        {"weights": {"AAPL": 0.1, "MSFT": 0.2, "NVDA": 0.7000000001}},
+        ["AAPL", "MSFT", "NVDA"],
+        "event",
+    )
+    assert sum(controls["WEIGHTS"].values()) == pytest.approx(1.0)
+
+
 def test_fast_rejects_per_share_commission():
     with pytest.raises(ValueError, match="event mode"):
         split_controls({"commissionPerShare": 0.005}, ["AAPL"], "fast")
@@ -92,13 +156,16 @@ def test_worker_converts_bps_and_keeps_control_keys_out_of_strategy(
             "universe": ["AAPL"],
             "slippageBps": 5,
             "commissionPerShare": 0.005,
+            "weights": {"AAPL": 1.0},
+            "WEIGHTS": {"AAPL": 1.0},
         },
     )
     heartbeat = SimpleNamespace(
         on_progress=lambda *args: None, should_cancel=lambda: False
     )
     request = worker._build_request(context, heartbeat)
-    assert request.params == {"LOOKBACK_DAYS": 30}
+    # The recorded choice is not a strategy parameter; the engine reads WEIGHTS.
+    assert request.params == {"LOOKBACK_DAYS": 30, "WEIGHTS": {"AAPL": 1.0}}
     assert request.slippage == pytest.approx(0.0005)
     assert request.commission_per_share == pytest.approx(0.005)
     assert "slippageBps" in context.params  # Persisted provenance is unchanged.

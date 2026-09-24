@@ -243,9 +243,9 @@ def _stub_price_reads(monkeypatch, last_dates, closes_by_ticker, calls=None):
         calls.append(("last_bar_dates", list(tickers)))
         return {ticker: day for ticker, day in last_dates.items() if ticker in tickers}
 
-    async def closes(_session, since_by_ticker):
-        calls.append(("daily_closes", dict(since_by_ticker)))
-        return {ticker: closes_by_ticker[ticker] for ticker in since_by_ticker}
+    async def closes(_session, window_by_ticker):
+        calls.append(("daily_closes", dict(window_by_ticker)))
+        return {ticker: closes_by_ticker[ticker] for ticker in window_by_ticker}
 
     monkeypatch.setattr(market_context.market_data_repo, "limit_statement_time", limit)
     monkeypatch.setattr(market_context.market_data_repo, "last_bar_dates", last_bars)
@@ -287,6 +287,26 @@ def test_indicators_read_prices_in_one_query_per_step_under_a_timeout(
     assert calls[1][1] == ["AAPL", "MSFT", "NEWCO"]
 
 
+def test_indicators_read_closes_up_to_each_tickers_own_last_session(
+    monkeypatch, stub_session
+):
+    earlier = LAST_SESSION - timedelta(days=3)
+    calls = _stub_price_reads(
+        monkeypatch,
+        {"AAPL": LAST_SESSION, "MSFT": earlier},
+        {"AAPL": _closes(250), "MSFT": _closes(250)},
+    )
+    monkeypatch.setattr(market_context.news_repo, "scores_between", _no_scores)
+
+    asyncio.run(market_context.indicators_for(["AAPL", "MSFT"]))
+
+    windows = calls[2][1]
+    assert {ticker: until for ticker, (_since, until) in windows.items()} == {
+        "AAPL": LAST_SESSION,
+        "MSFT": earlier,
+    }
+
+
 def test_indicators_look_back_from_each_tickers_own_last_bar(monkeypatch, stub_session):
     earlier = LAST_SESSION - timedelta(days=30)
     calls = _stub_price_reads(
@@ -298,9 +318,9 @@ def test_indicators_look_back_from_each_tickers_own_last_bar(monkeypatch, stub_s
 
     asyncio.run(market_context.indicators_for(["AAPL", "MSFT"]))
 
-    since_by_ticker = calls[2][1]
-    assert since_by_ticker["AAPL"].date() - since_by_ticker["MSFT"].date() == timedelta(days=30)
-    assert set(since_by_ticker) == {"AAPL", "MSFT"}
+    windows = calls[2][1]
+    assert windows["AAPL"][0].date() - windows["MSFT"][0].date() == timedelta(days=30)
+    assert set(windows) == {"AAPL", "MSFT"}
 
 
 def test_news_route_returns_items_envelope(monkeypatch, client):

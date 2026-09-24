@@ -113,21 +113,36 @@ _LATEST_BARS_SQL = text(
 
 # One close per New York session: the last bar inside 09:30-16:00, the same rule
 # the engine's historical loader uses, so dashboard indicators and backtests see
-# the same closes. Each ticker carries its own lower bound, and the join on
-# ticker and timestamp keeps every ticker's read on the (ticker, timestamp) index.
+# the same closes.
+#
+# Walked day by day, one index probe per ticker per calendar day, rather than
+# DISTINCT ON over every bar in the window. With intraday data that window is
+# hundreds of thousands of minute bars per ticker, and sorting them all ran past
+# the statement timeout in production (GET /indicators answered 503 after ~16s
+# every time). Each probe is a short backward scan of the (ticker, timestamp)
+# primary key that stops at the first bar, and a day with no bars — a weekend, a
+# holiday — simply returns no row. Same closes, including a null close being
+# skipped for the bar before it; checked against the previous query on synthetic
+# minute data before the switch.
 _DAILY_CLOSES_SQL = text(
-    "SELECT DISTINCT ON (bar.ticker, (bar.\"timestamp\" AT TIME ZONE 'America/New_York')::date) "
-    "bar.ticker, (bar.\"timestamp\" AT TIME ZONE 'America/New_York')::date AS trade_date, "
-    "bar.close_price "
-    "FROM unnest(CAST(:tickers AS text[]), CAST(:sinces AS timestamptz[])) "
-    "AS wanted(ticker, since) "
-    "JOIN public.market_data AS bar "
-    "ON bar.ticker = wanted.ticker AND bar.\"timestamp\" >= wanted.since "
-    "WHERE bar.close_price IS NOT NULL "
-    "AND (bar.\"timestamp\" AT TIME ZONE 'America/New_York')::time BETWEEN '09:30' AND '16:00' "
-    "ORDER BY bar.ticker, (bar.\"timestamp\" AT TIME ZONE 'America/New_York')::date, "
-    "bar.\"timestamp\" DESC"
-).bindparams(bindparam("tickers"), bindparam("sinces"))
+    "SELECT wanted.ticker, day.trade_date, bar.close_price "
+    "FROM unnest(CAST(:tickers AS text[]), CAST(:sinces AS timestamptz[]), "
+    "CAST(:untils AS date[])) AS wanted(ticker, since, until) "
+    "CROSS JOIN LATERAL generate_series("
+    "(wanted.since AT TIME ZONE 'America/New_York')::date, wanted.until, interval '1 day'"
+    ") AS day_start "
+    "CROSS JOIN LATERAL (SELECT day_start::date AS trade_date) AS day "
+    "CROSS JOIN LATERAL ("
+    "  SELECT close_price FROM public.market_data "
+    "  WHERE ticker = wanted.ticker "
+    "  AND \"timestamp\" >= GREATEST(wanted.since, "
+    "(day.trade_date + time '09:30') AT TIME ZONE 'America/New_York') "
+    "  AND \"timestamp\" <= (day.trade_date + time '16:00') AT TIME ZONE 'America/New_York' "
+    "  AND close_price IS NOT NULL "
+    "  ORDER BY \"timestamp\" DESC LIMIT 1"
+    ") AS bar "
+    "ORDER BY wanted.ticker, day.trade_date"
+).bindparams(bindparam("tickers"), bindparam("sinces"), bindparam("untils"))
 
 # Transaction-local, so the limit ends with the caller's transaction and never
 # leaks onto a pooled connection.
@@ -155,22 +170,27 @@ async def last_bar_dates(session: AsyncSession, tickers: list[str]) -> dict[str,
 
 
 async def daily_closes(
-    session: AsyncSession, since_by_ticker: dict[str, datetime]
+    session: AsyncSession, window_by_ticker: dict[str, tuple[datetime, date]]
 ) -> dict[str, list[tuple[date, float]]]:
-    """Session closes per ticker from its own lower bound onward, oldest first.
+    """Session closes per ticker inside its own window, oldest first.
 
     Tickers with no closes in range are absent from the result.
 
     Args:
         session: An open async session.
-        since_by_ticker: Exact stored symbol to its timezone-aware lower bound
-            on the bar timestamp.
+        window_by_ticker: Exact stored symbol to ``(since, until)``: a
+            timezone-aware lower bound on the bar timestamp, and the last New
+            York session date to read (its newest bar's date).
     """
-    if not since_by_ticker:
+    if not window_by_ticker:
         return {}
     result = await session.execute(
         _DAILY_CLOSES_SQL,
-        {"tickers": list(since_by_ticker), "sinces": list(since_by_ticker.values())},
+        {
+            "tickers": list(window_by_ticker),
+            "sinces": [since for since, _ in window_by_ticker.values()],
+            "untils": [until for _, until in window_by_ticker.values()],
+        },
     )
     closes: dict[str, list[tuple[date, float]]] = {}
     for row in result:

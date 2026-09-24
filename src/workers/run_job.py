@@ -565,6 +565,8 @@ def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest
     # The selected universe is retained for reporting; validated TICKERS and
     # WEIGHTS overlays are present only when it differs from the strategy.
     universe = params.pop("universe", None)
+    # Recorded for reporting like the universe; the engine reads WEIGHTS.
+    params.pop("weights", None)
     gate_control = params.pop("sentimentGate", None)
     sentiment_gate = None
     if isinstance(gate_control, dict) and gate_control.get("enabled"):

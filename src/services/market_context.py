@@ -216,11 +216,14 @@ async def _closes_for(
     """
     await market_data_repo.limit_statement_time(session, _PRICE_STATEMENT_TIMEOUT_MS)
     last_dates = await market_data_repo.last_bar_dates(session, tickers)
-    since_by_ticker = {
-        ticker: datetime.combine(last_date - _PRICE_LOOKBACK, time.min, tzinfo=_EXCHANGE_TZ)
+    window_by_ticker = {
+        ticker: (
+            datetime.combine(last_date - _PRICE_LOOKBACK, time.min, tzinfo=_EXCHANGE_TZ),
+            last_date,
+        )
         for ticker, last_date in last_dates.items()
     }
-    closes_by_ticker = await market_data_repo.daily_closes(session, since_by_ticker)
+    closes_by_ticker = await market_data_repo.daily_closes(session, window_by_ticker)
     return {
         ticker: closes
         for ticker, closes in closes_by_ticker.items()
