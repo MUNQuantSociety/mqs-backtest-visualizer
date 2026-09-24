@@ -165,7 +165,8 @@ The API separates these reserved browser controls from strategy parameters in
 | `slippageBps` | `RunRequest.slippage = slippageBps / 10000`; 5 bps is `0.0005`. Event fills buy above/sell below the observed price. No legacy `CostModel` replaces this explicit request value. |
 | `commissionPerShare` | `RunRequest.commission_per_share`; cash commission per filled share on **both** buys and sells. Event mode reserves affordability for fees and records them separately as fill `fees`. |
 | `universe` | The same registry ticker set preserves configured weights. An explicitly changed set becomes `TICKERS` with equal `WEIGHTS`; coverage is checked against that requested universe. |
-| `signals`, `sentimentGate` | Empty `signals: []` and a gate with `enabled: false` are accepted. Nonempty signal overrides and enabled sentiment are unsupported and rejected. |
+| `signals` | Empty `signals: []` is accepted. Nonempty signal overrides are unsupported and rejected. |
+| `sentimentGate` | `{enabled: false}` stores nothing. `{enabled: true, threshold}` with `threshold` in [-1, 0] needs event mode and `NEWS_POSTGRES_*` (else 422). The worker loads the universe's scores from the live `news_sentiment` table read-only into `RunRequest.sentiment_gate`; a load failure fails the run. At each bar, a target that would add long exposure is capped at the current long (or flat when short) while the ticker's 7-day mean score of articles available strictly before the bar is below the threshold. An article is available 5 hours after `published_at`, or the next day for a date-only (midnight) stamp; no articles scores 0.0. `reportMetadata.sentimentGate` records `enabled`, `threshold`, `window`, `blockedEntryCount` and per-ticker `coverage` (`articleCount`, `firstAvailable`); an ungated run records `{enabled: false}`. |
 
 Omitting cost controls preserves the engine's legacy zero defaults. The browser
 form sends 5 bps and $0.005/share unless changed; explicit zero is respected.

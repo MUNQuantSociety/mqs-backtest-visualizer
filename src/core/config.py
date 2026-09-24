@@ -320,6 +320,19 @@ class Settings:
         )
 
     @property
+    def news_database_url_sync(self) -> URL:
+        """psycopg2 URL for the live news database, used by backtest workers."""
+        return URL.create(
+            "postgresql+psycopg2",
+            username=self.news_postgres_user,
+            password=self.news_postgres_password,
+            host=self.news_postgres_host,
+            port=self.news_postgres_port,
+            database=self.news_postgres_db,
+            query={"sslmode": self.news_postgres_sslmode},
+        )
+
+    @property
     def news_database_configured(self) -> bool:
         """False when the NEWS_POSTGRES_* block is missing."""
         return bool(self.news_postgres_host and self.news_postgres_user and self.news_postgres_db)

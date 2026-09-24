@@ -250,6 +250,21 @@ async def list_example_backtests(
     return BacktestListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
+async def list_live_backtests(*, owner_id: uuid.UUID) -> list[BacktestSummary]:
+    """This owner's runs still queued or running; empty when no worker pool runs.
+
+    Without a job manager nothing can be in flight, so an empty list is the
+    truth rather than an outage to report.
+    """
+    from src.workers.job_manager import get_job_manager
+
+    try:
+        manager = get_job_manager()
+    except RuntimeError:
+        return []
+    return await asyncio.to_thread(manager.live_summaries, owner_id)
+
+
 async def get_backtest(run_id: str, *, owner_id: uuid.UUID | None = None) -> BacktestDetail | None:
     """Poll transient execution or retrieve this owner's completed JSON report."""
     from src.workers.job_manager import get_job_manager

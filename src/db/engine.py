@@ -192,6 +192,43 @@ def detached_async_engine() -> Iterator[None]:
         _async_engine, _async_session_factory, _news_engine, _news_session_factory = saved
 
 
+# A gated backtest reads years of articles per ticker in one go; that is a
+# bigger read than a dashboard poll, so it gets a longer (still bounded) limit.
+_NEWS_WORKER_STATEMENT_TIMEOUT_MS = 60_000
+
+
+def create_news_sync_engine() -> Engine:
+    """A fresh read-only synchronous engine on the live news database.
+
+    For backtest workers, which load a run's article scores before it starts.
+    Same read-only guarantee as the API's news sessions: Postgres refuses any
+    write. Not cached, for the reason given on :func:`create_sync_engine`; the
+    caller disposes it.
+
+    Raises:
+        NewsDatabaseNotConfigured: NEWS_POSTGRES_* is blank.
+    """
+    if not settings.news_database_configured:
+        raise NewsDatabaseNotConfigured(
+            "The live news database is not configured: set NEWS_POSTGRES_HOST, "
+            "NEWS_POSTGRES_USER and NEWS_POSTGRES_PASSWORD."
+        )
+    return create_engine(
+        settings.news_database_url_sync,
+        pool_pre_ping=True,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={
+            "connect_timeout": settings.db_connect_timeout_seconds,
+            "options": (
+                "-c default_transaction_read_only=on "
+                f"-c statement_timeout={_NEWS_WORKER_STATEMENT_TIMEOUT_MS}"
+            ),
+        },
+        future=True,
+    )
+
+
 def create_sync_engine() -> Engine:
     """A fresh synchronous engine for a worker, script, or schema creation.
 

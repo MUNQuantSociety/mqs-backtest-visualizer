@@ -32,8 +32,9 @@ The frontend reads the equivalent JSON report, not a separate mock dataset.
 
 The first browser attempt exposed reserved form controls being treated as
 strategy parameters. The fix explicitly separates/validates universe and costs.
-Unknown parameters remain errors. Unsupported signal overrides and sentiment
-gating are disabled in the form and rejected by the backend when enabled.
+Unknown parameters remain errors. Unsupported signal overrides are disabled in
+the form and rejected by the backend. The sentiment gate is supported in event
+mode (see the report contract).
 
 ## Fresh upload and S3
 

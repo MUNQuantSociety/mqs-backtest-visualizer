@@ -72,6 +72,19 @@ async def list_example_backtests(
     )
 
 
+@router.get("/active", response_model=list[BacktestSummary])
+async def list_live_backtests(
+    owner_id: uuid.UUID = Depends(require_current_user),
+) -> list[BacktestSummary]:
+    """This user's runs still queued or running, newest first.
+
+    History holds saved reports only, so this is how a browser that did not
+    submit a run can show it before it finishes. Declared before
+    ``/{backtest_id}`` so ``active`` is never read as a run id.
+    """
+    return await backtests_service.list_live_backtests(owner_id=owner_id)
+
+
 @router.post(
     "",
     response_model=BacktestSummary,

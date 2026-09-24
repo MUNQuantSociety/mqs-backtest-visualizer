@@ -43,6 +43,7 @@ from engine.contracts import (
     RunResult,
 )
 from engine.core.backtest_engine import BacktestEngine
+from engine.core.sentiment_gate import SentimentGate
 from engine.data.db_adapter import EngineDBAdapter
 from engine.data.fmp import FMPDataAdapter, market_data_source
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
@@ -223,7 +224,9 @@ def _fast_mode_perf(engine: BacktestEngine) -> pd.DataFrame | None:
     return frame
 
 
-def _execution_summary(mode: str, fills: list, diagnostics: dict | None) -> dict:
+def _execution_summary(
+    mode: str, fills: list, diagnostics: dict | None, gate: SentimentGate | None = None
+) -> dict:
     """Explain recorded fills without treating vector positions as no trades."""
     if mode == "fast":
         message = (
@@ -250,6 +253,11 @@ def _execution_summary(mode: str, fills: list, diagnostics: dict | None) -> dict
                 )
                 if not diagnostics.get("bullishSignalCount", 0):
                     message += " No ticker exceeded the strategy's bullish entry threshold."
+        if gate is not None and gate.blocked_entry_count:
+            message += (
+                f" The sentiment gate blocked {gate.blocked_entry_count} long "
+                "entries while recent news was below its threshold."
+            )
         message += " Trade metrics that require executed or closed trades are unavailable."
     return {"fillCount": len(fills), "message": message}
 
@@ -279,6 +287,8 @@ def run_single(request: RunRequest) -> RunResult:
                 "Fast mode does not support per-share commission; use event mode "
                 "or explicitly set commission_per_share to zero."
             )
+        if mode == "fast" and request.sentiment_gate is not None:
+            raise EngineError("Fast mode does not support the sentiment gate; use event mode.")
         strategy_class = load_strategy_class(request.class_path)
         if mode == "fast":
             # Checked here, before the engine loads a single bar: a student who
@@ -305,6 +315,7 @@ def run_single(request: RunRequest) -> RunResult:
             # A legacy CostModel would replace that slippage inside the executor.
             cost_model=None,
             commission_per_share=commission_per_share,
+            sentiment_gate=request.sentiment_gate,
             backtest_mode=mode,
         )
 
@@ -396,7 +407,14 @@ def run_single(request: RunRequest) -> RunResult:
             final_prices=final_prices,
             report_metadata={
                 "marketData": {"source": market_data_source(), "resolution": "daily"},
-                "execution": _execution_summary(mode, fills, strategy_diagnostics),
+                "execution": _execution_summary(
+                    mode, fills, strategy_diagnostics, request.sentiment_gate
+                ),
+                "sentimentGate": (
+                    request.sentiment_gate.report()
+                    if request.sentiment_gate is not None
+                    else {"enabled": False}
+                ),
                 **({"strategyDiagnostics": strategy_diagnostics} if strategy_diagnostics is not None else {}),
                 "executionCosts": {
                     "slippageFraction": slippage,

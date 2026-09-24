@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Callable, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
+
+if TYPE_CHECKING:
+    from engine.core.sentiment_gate import SentimentGate
 
 # The metrics dictionary is keyed exactly like the ``app.run_metrics`` columns
 # so persistence is a straight column-by-column write with no translation
@@ -80,6 +83,9 @@ class RunRequest:
     # Cash charged per filled share, on both buys and sells. Kept separate
     # from fractional slippage and from the strategy's parameter dictionary.
     commission_per_share: float = 0.0
+    # Optional news gate on long entries, with its article scores already
+    # loaded by the worker (engine/core/sentiment_gate.py). None is ungated.
+    sentiment_gate: "SentimentGate | None" = None
 
 
 @dataclass

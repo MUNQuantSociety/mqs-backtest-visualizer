@@ -1,11 +1,13 @@
 import logging
 import math
 from collections import namedtuple
+from datetime import datetime
 from typing import Dict, List
 
 import pandas as pd
 
 from engine.core.cost_model import CostModel
+from engine.core.sentiment_gate import SentimentGate
 
 # Result of the default sizing model: the share quantity to trade, the signed
 # desired notional (its sign drives BUY vs SELL settlement), and the execution
@@ -29,8 +31,13 @@ class BacktestExecutor:
         adv_lookup: Dict[str, float] | None = None,
         sigma_lookup: Dict[str, float] | None = None,
         commission_per_share: float = 0.0,
+        sentiment_gate: SentimentGate | None = None,
     ):
         self.logger = logging.getLogger(self.__class__.__name__)
+        # VISUALIZER: optional news gate on long entries. The runner stamps
+        # current_time on every bar so the gate reads only news available then.
+        self.sentiment_gate: SentimentGate | None = sentiment_gate
+        self.current_time: datetime | None = None
         self.tickers = tickers
         self.leverage = leverage
         self.slippage = slippage
@@ -203,6 +210,9 @@ class BacktestExecutor:
         # can need a SELL even after a BUY signal (and vice versa for shorts).
         if target_weight is None and signal_type == "SELL":
             target_notional *= -1
+        target_notional = self._apply_sentiment_gate(
+            ticker, target_notional, current_quantity * arrival_price
+        )
         execution_side = (
             "BUY" if target_notional > current_quantity * arrival_price else "SELL"
         )
@@ -272,6 +282,31 @@ class BacktestExecutor:
             return Sizing(0, desired_trade_notional, exec_price)
 
         return Sizing(quantity_to_trade, desired_trade_notional, exec_price)
+
+    def _apply_sentiment_gate(
+        self, ticker: str, target_notional: float, current_notional: float
+    ) -> float:
+        """Cap a target so it adds no long exposure while the gate is shut.
+
+        The ceiling is the current long, or flat when short: an existing long
+        can be held or trimmed and a short can be covered, but a gated ticker
+        can never end the trade longer than it started.
+        """
+        if self.sentiment_gate is None or self.current_time is None:
+            return target_notional
+        ceiling = max(current_notional, 0.0)
+        if target_notional <= ceiling:
+            return target_notional
+        if not self.sentiment_gate.blocks_long_entry(ticker, self.current_time):
+            return target_notional
+        self.sentiment_gate.record_block()
+        self.logger.debug(
+            "Sentiment gate: %s long entry capped at %.2f (target %.2f)",
+            ticker,
+            ceiling,
+            target_notional,
+        )
+        return ceiling
 
     def _commission_quantity_limit(
         self, exec_price, side, portfolio_equity, *, current_quantity=0.0

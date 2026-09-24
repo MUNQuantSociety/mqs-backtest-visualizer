@@ -11,6 +11,7 @@ import pandas as pd
 from engine.analytics.reporting import generate_backtest_report
 from engine.contracts.errors import NoMarketData, RunCancelled
 from engine.core.executor import BacktestExecutor
+from engine.core.sentiment_gate import SentimentGate
 from engine.core.utils import fetch_historical_data
 from engine.data.fmp import FMPDataAdapter
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
@@ -39,6 +40,7 @@ class BacktestRunner:
         output_dir: str | None = None,
         strict: bool = False,
         commission_per_share: float = 0.0,
+        sentiment_gate: SentimentGate | None = None,
     ):
         """
         Initializes the BacktestRunner.
@@ -79,6 +81,8 @@ class BacktestRunner:
         self.slippage: float = slippage
         self.cost_model: Any = cost_model
         self.commission_per_share = commission_per_share
+        # VISUALIZER: optional news gate on long entries (engine/core/sentiment_gate.py).
+        self.sentiment_gate: SentimentGate | None = sentiment_gate
 
         lookback_days = getattr(self.portfolio, "lookback_days", 365)
         self.strategy_lookback_window = pd.Timedelta(days=lookback_days)
@@ -165,6 +169,7 @@ class BacktestRunner:
             slippage=self.slippage,
             cost_model=self.cost_model,
             commission_per_share=self.commission_per_share,
+            sentiment_gate=self.sentiment_gate,
         )
         # Thread the OMS through the portfolio so it reaches StrategyContext
         # (the single shared seam, same as live); None keeps the direct path.
@@ -235,6 +240,9 @@ class BacktestRunner:
                 current_data_chunk = data_groups.get_group(current_timestamp)
             except KeyError:
                 continue  # Should not happen, but safe to check
+
+            # VISUALIZER: the sentiment gate reads only news available before this bar.
+            self.executor.current_time = current_timestamp.to_pydatetime()
 
             price_updates = dict(
                 zip(current_data_chunk["ticker"], current_data_chunk["close_price"])

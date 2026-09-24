@@ -10,6 +10,12 @@ import math
 import re
 from typing import Any
 
+from src.core.config import settings
+
+# The run form's slider range; mirrors engine/core/sentiment_gate.py.
+SENTIMENT_THRESHOLD_MIN = -1.0
+SENTIMENT_THRESHOLD_MAX = 0.0
+
 CONTROL_KEYS = frozenset(
     {"universe", "slippageBps", "commissionPerShare", "signals", "sentimentGate"}
 )
@@ -67,7 +73,39 @@ def split_controls(
             "Signal overrides are not supported. Indicators are defined by the strategy code."
         )
     if "sentimentGate" in raw:
-        gate = raw["sentimentGate"]
-        if not isinstance(gate, dict) or gate.get("enabled") is not False:
-            raise ValueError("The sentiment gate is not supported; keep it disabled.")
+        gate = _validated_sentiment_gate(raw["sentimentGate"], mode)
+        if gate is not None:
+            controls["sentimentGate"] = gate
     return params, controls, universe
+
+
+def _validated_sentiment_gate(raw: Any, mode: str) -> dict[str, Any] | None:
+    """The gate to store with the run, or None when it is off.
+
+    Refused up front rather than inside the worker: fast mode has no orders to
+    gate, and without the live news database the run could only fail later or,
+    worse, run ungated while the report said otherwise.
+    """
+    if not isinstance(raw, dict) or not isinstance(raw.get("enabled"), bool):
+        raise ValueError("sentimentGate must be an object with a boolean 'enabled'.")
+    if not raw["enabled"]:
+        return None
+    threshold = raw.get("threshold")
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(threshold)
+        or not SENTIMENT_THRESHOLD_MIN <= threshold <= SENTIMENT_THRESHOLD_MAX
+    ):
+        raise ValueError(
+            f"sentimentGate threshold must be a number from {SENTIMENT_THRESHOLD_MIN:g} "
+            f"to {SENTIMENT_THRESHOLD_MAX:g}."
+        )
+    if mode == "fast":
+        raise ValueError("The sentiment gate requires event mode.")
+    if not settings.news_database_configured:
+        raise ValueError(
+            "The sentiment gate needs the live news database, which this server "
+            "has not been configured to reach."
+        )
+    return {"enabled": True, "threshold": float(threshold)}
