@@ -47,6 +47,18 @@ class StrategyStatus(str, Enum):
     ARCHIVED = "archived"
 
 
+class StrategyOrigin(str, Enum):
+    """Who a strategy belongs to, relative to the caller.
+
+    Computed per request so the owner's id never leaves the server: the
+    client learns only whether a row is its own.
+    """
+
+    OWN = "own"
+    COMMUNITY = "community"
+    BUILTIN = "builtin"
+
+
 class ParameterSpec(CamelModel):
     """One tunable input, described well enough to render a form control."""
 
@@ -87,6 +99,9 @@ class Strategy(CamelModel):
     indicators: list[str] = []
     validation_state: str | None = None
     validation_run_id: str | None = None
+    # Relative to the caller: an anonymous caller sees every upload as
+    # ``community``, including its own.
+    origin: StrategyOrigin = StrategyOrigin.COMMUNITY
 
 
 class StrategyListResponse(CamelModel):

@@ -211,3 +211,93 @@ def test_existing_fast_report_remains_readable_and_exportable():
     assert exported["equityCurve"] == [
         {"date": "2026-03-04", "equity": 100.0, "benchmark": None}
     ]
+
+
+def test_daily_bar_interval_is_recorded_without_an_engine_overlay():
+    _, controls, _ = split_controls({"barIntervalSeconds": 86400}, ["AAPL"], "event")
+    assert controls == {"barIntervalSeconds": 86400}
+
+
+def test_intraday_bar_interval_sets_bar_size_and_a_decision_on_every_bar():
+    params, controls, _ = split_controls({"barIntervalSeconds": 3600}, ["AAPL"], "event")
+    assert params == {}
+    assert controls == {
+        "barIntervalSeconds": 3600,
+        "BAR_INTERVAL_SECONDS": 3600,
+        "INTERVAL": 0,
+    }
+
+
+@pytest.mark.parametrize("value", [0, 59, 90, 86401, True, "300", None, math.nan])
+def test_unsupported_bar_interval_is_refused(value):
+    with pytest.raises(ValueError, match="Bar interval must be one of"):
+        split_controls({"barIntervalSeconds": value}, ["AAPL"], "event")
+
+
+def test_fast_mode_refuses_intraday_bar_interval():
+    with pytest.raises(ValueError, match="Intraday bars require event mode"):
+        split_controls({"barIntervalSeconds": 60}, ["AAPL"], "fast")
+
+
+def test_fast_mode_accepts_a_daily_bar_interval():
+    _, controls, _ = split_controls({"barIntervalSeconds": 86400}, ["AAPL"], "fast")
+    assert controls == {"barIntervalSeconds": 86400}
+
+
+def test_worker_keeps_bar_interval_label_out_of_the_engine_overlay(tmp_path, monkeypatch):
+    from src.workers import run_job as worker
+
+    monkeypatch.setattr(worker, "settings", SimpleNamespace(artifact_dir=tmp_path))
+    context = worker._RunContext(
+        run_id=uuid4(),
+        strategy_key="sample",
+        class_path="sample:Strategy",
+        start_date=date(2026, 3, 2),
+        end_date=date(2026, 3, 6),
+        initial_capital=100_000,
+        mode="event",
+        params={"barIntervalSeconds": 300, "BAR_INTERVAL_SECONDS": 300, "INTERVAL": 0},
+    )
+    heartbeat = SimpleNamespace(on_progress=lambda *args: None, should_cancel=lambda: False)
+    request = worker._build_request(context, heartbeat)
+    assert request.params == {"BAR_INTERVAL_SECONDS": 300, "INTERVAL": 0}
+
+
+def test_oversized_intraday_submission_is_refused_before_queueing(monkeypatch):
+    import asyncio
+    from src.schemas.backtests import BacktestRunRequest
+    from src.services import backtests
+
+    strategy = backtests._RunnableStrategy("sample", ["AAPL"], [])
+    monkeypatch.setattr(backtests, "_load_runnable_strategy", AsyncMock(return_value=strategy))
+    create = AsyncMock()
+    monkeypatch.setattr(backtests, "create_backtest_run", create)
+    request = BacktestRunRequest(
+        name="too big",
+        strategy_key="sample",
+        # 10 tickers x ~270 weekdays x 390 one-minute bars is past the limit.
+        start_date="2025-07-01",
+        end_date="2026-07-15",
+        initial_capital=100_000,
+        params={"universe": [f"T{i}" for i in range(10)], "barIntervalSeconds": 60},
+    )
+    with pytest.raises(backtests.RunSubmissionError, match="would load about"):
+        asyncio.run(backtests.submit_backtest_run(request))
+    create.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("params", "label"),
+    [
+        ({}, "1d"),
+        ({"barIntervalSeconds": 86400}, "1d"),
+        ({"barIntervalSeconds": 60}, "1m"),
+        ({"barIntervalSeconds": 3600}, "1h"),
+        ({"barIntervalSeconds": True}, "1d"),
+        ({"barIntervalSeconds": [60]}, "1d"),
+    ],
+)
+def test_timeframe_label_names_the_run_bar_size(params, label):
+    from src.services.run_controls import timeframe_label
+
+    assert timeframe_label(params) == label

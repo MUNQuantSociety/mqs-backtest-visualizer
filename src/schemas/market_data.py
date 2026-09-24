@@ -60,3 +60,27 @@ class TickerValidationResponse(CamelModel):
 
     tickers: list[TickerValidation]
     unknown: list[str]
+
+
+class SymbolMatch(CamelModel):
+    """One symbol offered while a ticker is being typed."""
+
+    symbol: str
+    # Read tolerantly from the provider: a row without them is still a symbol.
+    name: str | None = None
+    exchange: str | None = None
+    # Where it came from. ``database`` has bars loaded, ``run`` has been
+    # backtested before; both are answered from memory. ``fmp`` and ``yahoo``
+    # cost a provider call, and only ``fmp`` is the provider validation trusts.
+    source: Literal["database", "run", "fmp", "yahoo"]
+
+
+class SymbolSearchResponse(CamelModel):
+    """Suggestions for a prefix: known tickers first, then the provider's."""
+
+    matches: list[SymbolMatch]
+    # True when there was more than fit; the caller should keep typing.
+    truncated: bool
+    # Set when every provider failed but known tickers still answered, so the
+    # list is real but incomplete. None when the providers were reached.
+    provider_error: str | None = None

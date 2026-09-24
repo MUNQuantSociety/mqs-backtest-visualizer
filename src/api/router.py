@@ -10,13 +10,22 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from src.api.routes import auth, backtests, market_data, portfolios, strategies, system
+from src.api.routes import (
+    auth,
+    backtests,
+    market_context,
+    market_data,
+    portfolios,
+    strategies,
+    system,
+)
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
 api_router.include_router(backtests.router)
 api_router.include_router(strategies.router)
 api_router.include_router(market_data.router)
+api_router.include_router(market_context.router)
 api_router.include_router(portfolios.router)
 api_router.include_router(system.router)
 

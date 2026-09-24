@@ -1,4 +1,3 @@
-from logging import Logger
 from math import isfinite
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -11,8 +10,15 @@ import pandas as pd
 from engine.analytics.reporting import generate_backtest_report
 from engine.contracts.errors import NoMarketData, RunCancelled
 from engine.core.executor import BacktestExecutor
+from engine.core.sentiment_gate import SentimentGate
 from engine.core.utils import fetch_historical_data
 from engine.data.fmp import FMPDataAdapter
+from engine.data.bar_interval import bar_minutes, check_intraday_size, is_intraday
+from engine.data.intraday import (
+    IntradayHistoryStartsLate,
+    fetch_intraday_bars,
+    late_starting_tickers,
+)
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
 # Define the exchange timezone
@@ -39,6 +45,7 @@ class BacktestRunner:
         output_dir: str | None = None,
         strict: bool = False,
         commission_per_share: float = 0.0,
+        sentiment_gate: SentimentGate | None = None,
     ):
         """
         Initializes the BacktestRunner.
@@ -79,6 +86,8 @@ class BacktestRunner:
         self.slippage: float = slippage
         self.cost_model: Any = cost_model
         self.commission_per_share = commission_per_share
+        # VISUALIZER: optional news gate on long entries (engine/core/sentiment_gate.py).
+        self.sentiment_gate: SentimentGate | None = sentiment_gate
 
         lookback_days = getattr(self.portfolio, "lookback_days", 365)
         self.strategy_lookback_window = pd.Timedelta(days=lookback_days)
@@ -133,7 +142,7 @@ class BacktestRunner:
             )
 
         self.on_progress(0, "loading data")
-        df = fetch_historical_data(self.portfolio, self.start_date, self.end_date)
+        df = self._fetch_bars()
         if df.empty:
             self.logger.error("No historical data found for the specified criteria.")
             # VISUALIZER: an empty frame used to abort quietly and report
@@ -157,6 +166,32 @@ class BacktestRunner:
             self.logger.exception(f"Error during data preparation: {e}", exc_info=True)
             return False
 
+    def _fetch_bars(self) -> pd.DataFrame:
+        """Daily bars through the cached loader, or intraday bars of the run's size.
+
+        VISUALIZER: intraday windows are size-checked, lookback included,
+        before a single request is made.
+        """
+        bar_seconds = getattr(self.portfolio, "bar_interval_seconds", None)
+        if bar_seconds is None or not is_intraday(bar_seconds):
+            return fetch_historical_data(self.portfolio, self.start_date, self.end_date)
+        minutes = bar_minutes(bar_seconds)
+        tickers = list(getattr(self.portfolio, "tickers", []))
+        check_intraday_size(len(tickers), self.start_date.date(), self.end_date.date(), minutes)
+        self.logger.info(
+            "Loading %d-minute bars for %d ticker(s) from %s to %s.",
+            minutes, len(tickers), self.start_date.date(), self.end_date.date(),
+        )
+        frame = fetch_intraday_bars(
+            self.portfolio.db, tickers, self.start_date, self.end_date, minutes,
+            require_all=self.strict,
+        )
+        if self.strict and self.backtest_loop_start_date is not None:
+            late = late_starting_tickers(frame, tickers, self.backtest_loop_start_date.date())
+            if late:
+                raise IntradayHistoryStartsLate(late, minutes)
+        return frame
+
     def _setup_executor(self) -> None:
         """Sets up the new unified BacktestExecutor."""
         self.executor = BacktestExecutor(
@@ -165,6 +200,7 @@ class BacktestRunner:
             slippage=self.slippage,
             cost_model=self.cost_model,
             commission_per_share=self.commission_per_share,
+            sentiment_gate=self.sentiment_gate,
         )
         # Thread the OMS through the portfolio so it reaches StrategyContext
         # (the single shared seam, same as live); None keeps the direct path.
@@ -235,6 +271,9 @@ class BacktestRunner:
                 current_data_chunk = data_groups.get_group(current_timestamp)
             except KeyError:
                 continue  # Should not happen, but safe to check
+
+            # VISUALIZER: the sentiment gate reads only news available before this bar.
+            self.executor.current_time = current_timestamp.to_pydatetime()
 
             price_updates = dict(
                 zip(current_data_chunk["ticker"], current_data_chunk["close_price"])

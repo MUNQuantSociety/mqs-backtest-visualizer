@@ -56,13 +56,14 @@ from typing import Any, Sequence
 from sqlalchemy import Engine, delete, func, insert, select, update
 
 from engine.contracts import METRIC_KEYS, EquityPoint, RunRequest, RunResult
-from engine.run_single import run_single
+from engine.run_single import load_strategy_class, run_single, strategy_tickers
 from src.core.config import settings
 from src.db.engine import create_sync_engine
 from src.db.init import init_database
 from src.models import BacktestRun, RunEquityPoint, RunMetrics, RunTrade, Strategy
 from src.services.trade_pairing import TradeRow, pair_fills
 from src.services.reporting import calculation_metadata, daily_metrics, open_positions
+from src.workers.sentiment_gate_loader import load_sentiment_gate
 
 logger = logging.getLogger(__name__)
 
@@ -546,6 +547,11 @@ def _remove_workdir(workdir: Path | None) -> None:
     shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _strategy_universe(context: _RunContext) -> list[str]:
+    """The strategy's own tickers, for a run stored before ``universe`` was kept."""
+    return strategy_tickers(load_strategy_class(context.class_path), context.params)
+
+
 def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest:
     """Assemble the engine request — inside the worker, where it has to be."""
     artifact_dir = Path(settings.artifact_dir) / str(context.run_id)
@@ -554,9 +560,21 @@ def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest
     params = dict(context.params)
     slippage = float(params.pop("slippageBps", 0.0)) / 10_000.0
     commission = float(params.pop("commissionPerShare", 0.0))
+    # Recorded for reporting; the engine reads the BAR_INTERVAL_SECONDS overlay.
+    params.pop("barIntervalSeconds", None)
     # The selected universe is retained for reporting; validated TICKERS and
     # WEIGHTS overlays are present only when it differs from the strategy.
-    params.pop("universe", None)
+    universe = params.pop("universe", None)
+    gate_control = params.pop("sentimentGate", None)
+    sentiment_gate = None
+    if isinstance(gate_control, dict) and gate_control.get("enabled"):
+        # Raises on any failure, which fails the run: never run ungated.
+        sentiment_gate = load_sentiment_gate(
+            threshold=float(gate_control["threshold"]),
+            tickers=list(universe or _strategy_universe(context)),
+            start_date=context.start_date,
+            end_date=context.end_date,
+        )
 
     return RunRequest(
         run_id=str(context.run_id),
@@ -569,6 +587,7 @@ def _build_request(context: _RunContext, heartbeat: _RunHeartbeat) -> RunRequest
         params=params,
         slippage=slippage,
         commission_per_share=commission,
+        sentiment_gate=sentiment_gate,
         artifact_dir=str(artifact_dir),
         on_progress=heartbeat.on_progress,
         should_cancel=heartbeat.should_cancel,

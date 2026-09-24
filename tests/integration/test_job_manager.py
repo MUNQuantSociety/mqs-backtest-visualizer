@@ -146,10 +146,21 @@ def _cleanup_run(engine, run_id: uuid.UUID) -> None:
 
 
 @pytest.fixture(scope="module")
-def completed_run(db_engine, strategy_key: str):
-    """One real backtest, taken from ``queued`` to ``completed`` by ``run_job``."""
+def completed_run(
+    db_engine, strategy_key: str, tmp_path_factory: pytest.TempPathFactory
+):
+    """One real backtest, taken from ``queued`` to ``completed`` by ``run_job``.
+
+    The run gets an empty parquet cache of its own. The shared
+    ``data/backfill_cache`` is checked only by its first and last timestamp, so
+    one filled from another source (a different database, FMP) is taken as
+    covering this window, and the run trades those prices instead of
+    ``market_data``'s — no round trip, no Sharpe.
+    """
     run_id = _insert_run(db_engine, strategy_key)
-    outcome = run_job(str(run_id))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("MARKET_CACHE_DIR", str(tmp_path_factory.mktemp("market_cache")))
+        outcome = run_job(str(run_id))
     try:
         yield run_id, outcome
     finally:

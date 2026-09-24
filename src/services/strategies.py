@@ -36,6 +36,7 @@ from src.schemas.strategies import (
     StrategyCheckRequest,
     StrategyCheckResult,
     StrategyListResponse,
+    StrategyOrigin,
     StrategyStatus,
     StrategySubmission,
     StrategySubmissionResult,
@@ -126,8 +127,18 @@ def _row_indicators(strategy) -> list[str]:
     return []
 
 
-def to_schema(row: StrategyRow) -> Strategy:
-    """ORM row plus aggregates → the frontend's ``Strategy``."""
+def _origin(strategy, viewer_id: uuid.UUID | None) -> StrategyOrigin:
+    """Built-in by ``kind``, not by a NULL owner: an upload older than the
+    owner column can still be unowned, and it is not a built-in."""
+    if strategy.kind != "user":
+        return StrategyOrigin.BUILTIN
+    if viewer_id is not None and strategy.owner_id == viewer_id:
+        return StrategyOrigin.OWN
+    return StrategyOrigin.COMMUNITY
+
+
+def to_schema(row: StrategyRow, viewer_id: uuid.UUID | None = None) -> Strategy:
+    """ORM row plus aggregates → the frontend's ``Strategy``, labelled for ``viewer_id``."""
     strategy = row.strategy
     return Strategy(
         id=strategy.key,
@@ -148,6 +159,7 @@ def to_schema(row: StrategyRow) -> Strategy:
             str(getattr(strategy, "validation_job_id", None) or strategy.validation_run_id)
             if (getattr(strategy, "validation_job_id", None) or strategy.validation_run_id) else None
         ),
+        origin=_origin(strategy, viewer_id),
     )
 
 
@@ -162,7 +174,9 @@ def _generate_key(name: str) -> str:
     return f"user-{slug}-{uuid.uuid4().hex[:8]}"
 
 
-async def list_strategies(include_disabled: bool = False) -> StrategyListResponse:
+async def list_strategies(
+    include_disabled: bool = False, viewer_id: uuid.UUID | None = None
+) -> StrategyListResponse:
     """Registered strategies and aggregates, backed by complete S3 packages.
 
     The registry remains the validation/ownership catalogue: arbitrary S3
@@ -208,12 +222,12 @@ async def list_strategies(include_disabled: bool = False) -> StrategyListRespons
             missing,
         )
     rows = [row for row, exists in zip(rows, present) if exists]
-    items = [to_schema(row) for row in rows]
+    items = [to_schema(row, viewer_id) for row in rows]
     logger.info("CATALOGUE | Returning %d strategies: %s; elapsed_ms=%.0f", len(items), [item.id for item in items], (time.perf_counter() - started) * 1000)
     return StrategyListResponse(items=items, total=len(items))
 
 
-async def get_strategy(key: str) -> Strategy | None:
+async def get_strategy(key: str, viewer_id: uuid.UUID | None = None) -> Strategy | None:
     """One strategy by key, including ones the catalogue hides.
 
     This is the endpoint behind "is my upload done yet?": a validating or
@@ -223,7 +237,7 @@ async def get_strategy(key: str) -> Strategy | None:
     await ensure_schema()
     async with session_scope() as session:
         row = await strategies_repo.get_strategy_row(session, key)
-    return to_schema(row) if row is not None else None
+    return to_schema(row, viewer_id) if row is not None else None
 
 
 def strategy_template() -> StrategyTemplate:

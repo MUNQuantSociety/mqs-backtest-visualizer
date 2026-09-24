@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
-from datetime import date
+from dataclasses import replace
+from datetime import date, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -84,6 +85,15 @@ def test_window_is_the_intersection_not_the_union(stub_repo) -> None:
     assert result.end == "2025-11-07", "TLT ends earliest"
     assert result.missing == []
     assert len(result.tickers) == 3
+
+
+@pytest.fixture(autouse=True)
+def no_backfill(monkeypatch: pytest.MonkeyPatch):
+    """These tests are about the intersection; the backfill has its own below."""
+    monkeypatch.setattr(
+        market_data_service, "settings",
+        replace(market_data_service.settings, market_data_backfill_enabled=False),
+    )
 
 
 def test_a_ticker_with_no_bars_removes_the_window(stub_repo) -> None:
@@ -225,3 +235,169 @@ def test_an_empty_universe_is_skipped_not_guessed_at(stub_coverage) -> None:
     asyncio.run(
         backtests_service._validated_coverage([], date(2025, 1, 2), date(2026, 1, 2))
     )
+
+
+# ---------------------------------------------------------------------------
+# Automatic backfill of a ticker the table has never seen (database mode)
+# ---------------------------------------------------------------------------
+
+
+def _bars(ticker: str, days: list[date]):
+    import pandas as pd
+
+    return pd.DataFrame([
+        {"ticker": ticker, "timestamp": pd.Timestamp(day).tz_localize("America/New_York") + pd.Timedelta(hours=16),
+         "open_price": 10.0, "high_price": 11.0, "low_price": 9.0, "close_price": 10.5, "volume": 1000}
+        for day in days
+    ])
+
+
+@pytest.fixture
+def backfill_on(monkeypatch: pytest.MonkeyPatch, stub_repo):
+    """Database mode with the backfill switched on, the provider and the insert stubbed."""
+    monkeypatch.setattr(
+        market_data_service, "settings",
+        replace(market_data_service.settings, market_data_backfill_enabled=True),
+    )
+    # The exchange lookup constructs the provider client, which refuses
+    # without a key; the transport itself is stubbed below.
+    monkeypatch.setenv("FMP_API_KEY", "test-secret-key")
+    state = {"spans": {}, "fetched": [], "inserted": []}
+
+    def install(spans):
+        state["spans"] = dict(spans)
+        stub_repo(state["spans"])
+
+        async def fake_coverage(_session, tickers):
+            return {ticker: state["spans"].get(ticker) for ticker in tickers}
+
+        def fake_fetch(tickers, start, end, *, require_all=True):
+            (ticker,) = tickers
+            state["fetched"].append((ticker, start, end))
+            days = [start + timedelta(days=i) for i in range(3)]
+            return _bars(ticker, days)
+
+        async def fake_insert(_session, rows):
+            state["inserted"].extend(rows)
+            # The table now has the ticker: the re-read must see it.
+            if rows:
+                state["spans"][rows[0]["ticker"]] = (rows[0]["date"], rows[-1]["date"])
+            return len(rows)
+
+        monkeypatch.setattr(market_data_repo, "ticker_coverage", fake_coverage)
+        monkeypatch.setattr(market_data_service, "fetch_daily_history", fake_fetch)
+        monkeypatch.setattr(market_data_repo, "insert_daily_bars", fake_insert)
+        # The provider places NEWCO on the NYSE; anything else it does not know.
+        monkeypatch.setattr(
+            market_data_service.FMPMarketData, "search_symbols",
+            lambda self, query, limit=100: (
+                [{"symbol": "NEWCO", "exchange": "NYSE"}] if query == "NEWCO" else []
+            ),
+        )
+        return state
+
+    return install
+
+
+def test_a_missing_ticker_is_backfilled_over_the_universes_window_and_coverage_rereads(backfill_on) -> None:
+    state = backfill_on({"AAPL": (date(2024, 1, 2), date(2026, 7, 15)), "NEWCO": None})
+
+    result = asyncio.run(market_data_service.coverage_for(["AAPL", "NEWCO"]))
+
+    assert state["fetched"] == [("NEWCO", date(2024, 1, 2), date(2026, 7, 15))]
+    assert result.missing == []
+    reported = {item.ticker: item for item in result.tickers}
+    assert reported["NEWCO"].first_bar == "2024-01-02"
+    row = state["inserted"][0]
+    # The venue is the provider's, not invented: the history endpoint does not
+    # say where a bar traded, and the table's column is NOT NULL.
+    assert row["ticker"] == "NEWCO" and row["exchange"] == "NYSE"
+    assert row["timestamp"].hour == 16 and row["date"] == date(2024, 1, 2)
+    assert set(row) == {"ticker", "timestamp", "date", "exchange", "open_price", "high_price",
+                        "low_price", "close_price", "volume"}
+
+
+def test_a_symbol_the_provider_does_not_place_falls_back_to_the_seeds_exchange(backfill_on) -> None:
+    state = backfill_on({"AAPL": (date(2024, 1, 2), date(2026, 7, 15)), "OTHER": None})
+
+    asyncio.run(market_data_service.coverage_for(["AAPL", "OTHER"]))
+
+    assert state["inserted"][0]["exchange"] == "NASDAQ"
+
+
+def test_the_backfill_is_off_unless_a_deployment_turns_it_on() -> None:
+    # Settings are read once at import, so this checks the default the test
+    # process imported with — MARKET_DATA_BACKFILL_ENABLED unset — and that
+    # the default is not derived from APP_ENV, which itself defaults to
+    # "development": an unconfigured process must never write the live table.
+    import os
+
+    from src.core.config import settings
+
+    assert "MARKET_DATA_BACKFILL_ENABLED" not in os.environ
+    assert settings.app_env == "development"
+    assert settings.market_data_backfill_enabled is False
+
+
+def test_with_nothing_to_anchor_to_the_backfill_takes_the_last_two_years(backfill_on) -> None:
+    state = backfill_on({"NEWCO": None})
+
+    asyncio.run(market_data_service.coverage_for(["NEWCO"]))
+
+    ((_, start, end),) = state["fetched"]
+    assert (end - start).days == 730 and end < date.today()
+
+
+def test_a_ticker_the_provider_has_nothing_for_stays_missing_without_a_second_read(backfill_on, monkeypatch) -> None:
+    state = backfill_on({"AAPL": (date(2024, 1, 2), date(2026, 7, 15)), "NOPE": None})
+    monkeypatch.setattr(
+        market_data_service, "fetch_daily_history",
+        lambda tickers, start, end, *, require_all=True: _bars("NOPE", []),
+    )
+
+    result = asyncio.run(market_data_service.coverage_for(["AAPL", "NOPE"]))
+
+    assert result.missing == ["NOPE"] and state["inserted"] == []
+
+
+def test_a_provider_outage_during_backfill_is_not_a_coverage_error(backfill_on, monkeypatch) -> None:
+    from src.services.market_data import FMPUnavailable
+
+    def down(tickers, start, end, *, require_all=True):
+        raise FMPUnavailable("FMP is down")
+
+    backfill_on({"AAPL": (date(2024, 1, 2), date(2026, 7, 15)), "NEWCO": None})
+    monkeypatch.setattr(market_data_service, "fetch_daily_history", down)
+
+    result = asyncio.run(market_data_service.coverage_for(["AAPL", "NEWCO"]))
+
+    assert result.missing == ["NEWCO"]
+
+
+def test_the_backfill_never_runs_when_switched_off(backfill_on, monkeypatch) -> None:
+    state = backfill_on({"NEWCO": None})
+    monkeypatch.setattr(
+        market_data_service, "settings",
+        replace(market_data_service.settings, market_data_backfill_enabled=False),
+    )
+
+    result = asyncio.run(market_data_service.coverage_for(["NEWCO"]))
+
+    assert state["fetched"] == [] and result.missing == ["NEWCO"]
+
+
+def test_the_backfill_never_runs_in_fmp_mode(backfill_on, monkeypatch) -> None:
+    state = backfill_on({"NEWCO": None})
+    monkeypatch.setenv("MARKET_DATA_SOURCE", "fmp")
+    monkeypatch.setattr(market_data_service, "_fmp_coverage", _async_return({"NEWCO": None}))
+
+    asyncio.run(market_data_service.coverage_for(["NEWCO"]))
+
+    assert state["fetched"] == []
+
+
+def _async_return(value):
+    async def call(_tickers):
+        return value
+
+    return call

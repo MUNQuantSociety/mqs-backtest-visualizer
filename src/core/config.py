@@ -102,6 +102,21 @@ class Settings:
     auth_cognito_client_id: str = os.getenv("AUTH_COGNITO_CLIENT_ID", "").strip()
     # Never honored outside development/test or when Cognito is configured.
     auth_allow_dev_identity: bool = _env_bool("AUTH_ALLOW_DEV_IDENTITY", False)
+
+    # Ticker suggestions fall back to Yahoo Finance's unofficial search when
+    # FMP cannot answer. Suggestions only: a chosen symbol is still verified
+    # with FMP. Off when an unsupported third-party call is unwelcome.
+    symbol_search_yahoo_fallback: bool = _env_bool("SYMBOL_SEARCH_YAHOO_FALLBACK", True)
+
+    # In database mode, a universe ticker with no bars in the window is
+    # backfilled from FMP as daily 16:00 New York bars — the port of
+    # MQSMaster's specific backfill, at the granularity a backtest reads. It
+    # writes public.market_data, the live trading table, so it is off unless
+    # a deployment says otherwise. Not derived from APP_ENV: that defaults to
+    # "development", so an unconfigured process pointed at the live table
+    # would otherwise be allowed to write it. compose.yaml turns it on for
+    # the dev stack, whose table is the developer's own.
+    market_data_backfill_enabled: bool = _env_bool("MARKET_DATA_BACKFILL_ENABLED", False)
     temporary_user_id: str = os.getenv("TEMPORARY_USER_ID", "").strip()
 
     repo_root: Path = REPO_ROOT
@@ -127,6 +142,21 @@ class Settings:
     postgres_sslmode: str = _env_first(
         "POSTGRES_SSLMODE", "MARKET_DATA_SSLMODE", default="prefer"
     )
+
+    # ------------------------------------------------------------------
+    # PostgreSQL — live MQS news sentiment (read-only)
+    # ------------------------------------------------------------------
+    # The dashboard's news and sentiment always come from the live trading
+    # database's ``public.news_sentiment``, even when POSTGRES_* points at the
+    # local Docker database, which has no such table. Deliberately no fallback
+    # to POSTGRES_*: a blank block means "not configured", never "use whatever
+    # database is set". Every session opened with these runs read-only.
+    news_postgres_host: str = os.getenv("NEWS_POSTGRES_HOST", "").strip()
+    news_postgres_port: int = _env_int("NEWS_POSTGRES_PORT", 25060)
+    news_postgres_db: str = os.getenv("NEWS_POSTGRES_DB", "mqsdb").strip()
+    news_postgres_user: str = os.getenv("NEWS_POSTGRES_USER", "").strip()
+    news_postgres_password: str = os.getenv("NEWS_POSTGRES_PASSWORD", "").strip()
+    news_postgres_sslmode: str = os.getenv("NEWS_POSTGRES_SSLMODE", "prefer").strip()
 
     # The API holds a handful of connections; the heavy lifting happens in
     # worker processes with their own short-lived sync connections.
@@ -275,6 +305,37 @@ class Settings:
     def database_configured(self) -> bool:
         """False when the ``.env`` block is missing, so callers can say so."""
         return bool(self.postgres_host and self.postgres_user and self.postgres_db)
+
+    @property
+    def news_database_url_async(self) -> URL:
+        """asyncpg URL for the live news database. See ``database_url_async`` on ``ssl``."""
+        return URL.create(
+            "postgresql+asyncpg",
+            username=self.news_postgres_user,
+            password=self.news_postgres_password,
+            host=self.news_postgres_host,
+            port=self.news_postgres_port,
+            database=self.news_postgres_db,
+            query={"ssl": self.news_postgres_sslmode},
+        )
+
+    @property
+    def news_database_url_sync(self) -> URL:
+        """psycopg2 URL for the live news database, used by backtest workers."""
+        return URL.create(
+            "postgresql+psycopg2",
+            username=self.news_postgres_user,
+            password=self.news_postgres_password,
+            host=self.news_postgres_host,
+            port=self.news_postgres_port,
+            database=self.news_postgres_db,
+            query={"sslmode": self.news_postgres_sslmode},
+        )
+
+    @property
+    def news_database_configured(self) -> bool:
+        """False when the NEWS_POSTGRES_* block is missing."""
+        return bool(self.news_postgres_host and self.news_postgres_user and self.news_postgres_db)
 
 
 settings = Settings()

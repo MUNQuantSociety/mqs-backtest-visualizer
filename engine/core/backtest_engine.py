@@ -28,6 +28,7 @@ from engine.analytics.vector_strategy_adapters import (
 from engine.analytics.vectorized_backtest import VectorBacktester
 from engine.core.cost_model import CostModel
 from engine.core.runner import BacktestRunner
+from engine.core.sentiment_gate import SentimentGate
 from engine.data.fmp import FMPDataAdapter
 from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 
@@ -70,6 +71,7 @@ class BacktestEngine:
         self.slippage: float = 0.0
         self.cost_model: CostModel | None = None
         self.commission_per_share: float = 0.0
+        self.sentiment_gate: SentimentGate | None = None
         self.backtest_mode: str = "event"
         # VISUALIZER: task-4 seams. Callables default to no-ops so the
         # engine stays usable from a plain script.
@@ -148,6 +150,7 @@ class BacktestEngine:
         fast_years_back: int | None = None,
         fast_benchmark_label: str | None = None,
         commission_per_share: float = 0.0,
+        sentiment_gate: SentimentGate | None = None,
     ):
         """
         Configures the backtest with the necessary parameters.
@@ -167,6 +170,10 @@ class BacktestEngine:
                 "Fast mode does not support per-share commission; use event mode "
                 "or explicitly set commission_per_share to zero."
             )
+        # VISUALIZER: the gate acts on individual orders; fast mode has none.
+        if self.backtest_mode == "fast" and sentiment_gate is not None:
+            raise ValueError("Fast mode does not support the sentiment gate; use event mode.")
+        self.sentiment_gate = sentiment_gate
         self.fast_config = self._normalize_fast_config(
             fast_config,
             fast_years_back=fast_years_back,
@@ -781,6 +788,7 @@ class BacktestEngine:
                         slippage=self.slippage,
                         cost_model=self.cost_model,
                         commission_per_share=self.commission_per_share,
+                        sentiment_gate=self.sentiment_gate,
                         order_manager=order_manager,
                         # VISUALIZER: per-run seams (task 4).
                         on_progress=self.on_progress,

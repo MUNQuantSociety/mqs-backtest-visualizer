@@ -23,6 +23,7 @@ Two things to know before editing:
 from collections.abc import Iterator
 from datetime import date
 from functools import partial
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -45,6 +46,11 @@ from src.schemas.strategies import (
 )
 
 
+# Every request in this module runs as this user; the seeded run belongs to
+# them too, since a user backtest cannot be created without an owner.
+CONTRACT_OWNER = UUID("00000000-0000-0000-0000-000000000001")
+
+
 @pytest.fixture(scope="module")
 def client() -> Iterator[TestClient]:
     """A client whose requests all share one event loop.
@@ -55,10 +61,9 @@ def client() -> Iterator[TestClient]:
     context manager keeps one loop for the whole module.
     """
     from src.api.dependencies.current_user import require_current_user
-    from uuid import UUID
     with pytest.MonkeyPatch.context() as patch:
         patch.setitem(app.dependency_overrides, require_current_user,
-                      lambda: UUID("00000000-0000-0000-0000-000000000001"))
+                      lambda: CONTRACT_OWNER)
         with TestClient(app) as test_client:
             yield test_client
             test_client.portal.call(dispose_async_engine)
@@ -100,12 +105,15 @@ def seeded_run(
             symbol="MULTI",
             engine_version="test",
             params={"LOOKBACK_DAYS": 30},
+            owner_id=CONTRACT_OWNER,
         )
     )
     try:
         yield summary
     finally:
-        client.portal.call(partial(backtests_service.delete_backtest, summary.id))
+        client.portal.call(
+            partial(backtests_service.delete_backtest, summary.id, owner_id=CONTRACT_OWNER)
+        )
 
 
 def _aliases(model: type) -> set[str]:
