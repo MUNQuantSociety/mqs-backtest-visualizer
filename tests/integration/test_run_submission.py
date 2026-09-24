@@ -34,13 +34,14 @@ from server import app
 from src.core.config import settings
 from src.db.engine import create_sync_engine, dispose_async_engine
 from src.db.init import init_database
-from src.models import BacktestRun, Strategy
+from src.models import BacktestReport, BacktestRun, Strategy
 from src.schemas.backtests import BacktestSummary
 from src.workers.run_job import CANCELLED_MESSAGE
 
 pytestmark = pytest.mark.db
 
 _RUNS = BacktestRun.__table__
+_REPORTS = BacktestReport.__table__
 _STRATEGIES = Strategy.__table__
 
 DUMMY_CLASS_PATH = "engine.strategies.portfolio_dummy.strategy:CrossoverRmiStrategy"
@@ -122,6 +123,8 @@ def runnable_key(db_engine) -> Iterator[str]:
     finally:
         with db_engine.begin() as connection:
             connection.execute(delete(_RUNS).where(_RUNS.c.strategy_key == key))
+            # Saved reports hold the strategy key ON DELETE RESTRICT.
+            connection.execute(delete(_REPORTS).where(_REPORTS.c.strategy_key == key))
             connection.execute(delete(_STRATEGIES).where(_STRATEGIES.c.key == key))
 
 
@@ -138,17 +141,27 @@ def validating_key(db_engine) -> Iterator[str]:
 
 
 @pytest.fixture(scope="module")
-def client() -> Iterator[TestClient]:
+def client(
+    integration_user_headers: dict[str, str], tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[TestClient]:
     """The real app, lifespan and worker pool included.
 
     ``TestClient`` used as a context manager rather than bare: entering it runs
     the lifespan (which is what creates the process pool that executes these
     runs at all) and keeps one event loop for the whole module, so the asyncpg
     pool is not left bound to a loop that has already closed.
+
+    Signed in as the integration user, with an empty parquet cache of its own:
+    the shared ``data/backfill_cache`` may hold another source's prices for
+    this window. Set before the client opens, because the lifespan's spawned
+    workers copy the environment when they start.
     """
-    with TestClient(app) as test_client:
-        yield test_client
-        test_client.portal.call(dispose_async_engine)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("MARKET_CACHE_DIR", str(tmp_path_factory.mktemp("market_cache")))
+        with TestClient(app) as test_client:
+            test_client.headers.update(integration_user_headers)
+            yield test_client
+            test_client.portal.call(dispose_async_engine)
 
 
 def _submit(client: TestClient, strategy_key: str, **overrides) -> dict:
@@ -473,33 +486,26 @@ def test_deleting_a_queued_run_removes_it(client, db_engine, runnable_key) -> No
 # ---------------------------------------------------------------------------
 
 
-def test_a_refused_dispatch_fails_the_run_instead_of_stranding_it(
-    client, db_engine, runnable_key, monkeypatch
+def test_a_refused_dispatch_is_a_503_and_leaves_nothing_in_flight(
+    client, runnable_key, monkeypatch
 ) -> None:
-    """A pool that will not take the job must not leave the row ``queued``.
+    """A pool that will not take the job must not leave the run ``queued``.
 
     Queued-forever is indistinguishable from queued-behind-someone-else in the
-    UI, so the run is marked failed with the reason and reported that way in
-    the 202 the client caches.
+    UI. Since reports are saved only on success, the refusal is answered at
+    once with a 503 carrying the reason, and the job is failed rather than
+    listed as still in flight.
     """
     from src.workers import job_manager
 
-    class _BrokenManager:
-        def submit(self, run_id):
-            raise RuntimeError("the pool is shut down")
+    def refuse(*args, **kwargs):
+        raise RuntimeError("the pool is shut down")
 
-    monkeypatch.setattr(job_manager, "get_job_manager", lambda: _BrokenManager())
+    monkeypatch.setattr(job_manager.get_job_manager()._pool, "submit", refuse)
 
     response = _submit(client, runnable_key)
-    assert response.status_code == 202, response.text
-    body = response.json()
-    run_id = body["id"]
 
-    try:
-        assert body["status"] == "failed"
-
-        detail = client.get(f"/api/backtests/{run_id}").json()
-        assert detail["status"] == "failed"
-        assert "shut down" in detail["errorMessage"]
-    finally:
-        _delete_run(db_engine, run_id)
+    assert response.status_code == 503, response.text
+    assert "shut down" in response.json()["detail"]
+    in_flight = client.get("/api/backtests/active").json()
+    assert all(run["strategyId"] != runnable_key for run in in_flight)

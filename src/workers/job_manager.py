@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
@@ -19,7 +20,7 @@ from src.core.config import settings
 from src.db.engine import create_sync_engine
 from src.models import BacktestReport, Strategy
 from src.repositories import reports
-from src.schemas.backtests import BacktestDetail
+from src.schemas.backtests import BacktestDetail, BacktestSummary
 from src.workers.report_job import RunSpec, execute_report
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,38 @@ class JobManager:
     def cancel_internal(self, run_id):
         job = self._lookup(run_id)
         return self.cancel(run_id, job.spec.owner_id) if job else "not_found"
+
+    def live_summaries(self, owner_id: uuid.UUID) -> list[BacktestSummary]:
+        """This owner's history runs still queued or running, newest first.
+
+        History lists saved reports only, so this is the one place a browser
+        that did not submit a run can learn it exists before it finishes.
+        Validation runs are left out: they never become history.
+
+        Args:
+            owner_id: The signed-in user; other owners' jobs are never listed.
+
+        Returns:
+            One summary per unfinished job, carrying its live status.
+        """
+        with self._lock:
+            self._prune()
+            owned = [
+                job for job in self._jobs.values()
+                if job.spec.owner_id == owner_id and job.spec.purpose == "user"
+            ]
+        live = []
+        for job in owned:
+            with job.lock:
+                if job.finished_at is not None or job.saved:
+                    continue
+                state = dict(job.state)
+            detail = job.spec.empty_detail(state["status"], state["progress_pct"])
+            live.append((job.spec.created_at, BacktestSummary.model_validate(
+                {name: getattr(detail, name) for name in BacktestSummary.model_fields}
+            )))
+        live.sort(key=lambda entry: entry[0], reverse=True)
+        return [summary for _, summary in live]
 
     def submitted_run_ids(self):
         with self._lock:

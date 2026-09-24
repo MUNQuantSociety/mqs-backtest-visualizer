@@ -16,7 +16,8 @@ from typing import Any
 # A constant, not the engine: ``engine/__init__.py`` imports nothing, so
 # stamping a run with the code that will execute it costs no pandas import.
 from engine import ENGINE_VERSION
-from engine.data.fmp import FMPUnavailable
+from engine.data.fmp import FMPUnavailable as FMPUnavailable  # re-exported to the API routes
+from engine.data.bar_interval import IntradayWindowTooLarge, bar_minutes, check_intraday_size
 from src.core.config import settings
 from src.db.engine import session_scope
 from src.db.init import ensure_schema
@@ -250,6 +251,21 @@ async def list_example_backtests(
     return BacktestListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
+async def list_live_backtests(*, owner_id: uuid.UUID) -> list[BacktestSummary]:
+    """This owner's runs still queued or running; empty when no worker pool runs.
+
+    Without a job manager nothing can be in flight, so an empty list is the
+    truth rather than an outage to report.
+    """
+    from src.workers.job_manager import get_job_manager
+
+    try:
+        manager = get_job_manager()
+    except RuntimeError:
+        return []
+    return await asyncio.to_thread(manager.live_summaries, owner_id)
+
+
 async def get_backtest(run_id: str, *, owner_id: uuid.UUID | None = None) -> BacktestDetail | None:
     """Poll transient execution or retrieve this owner's completed JSON report."""
     from src.workers.job_manager import get_job_manager
@@ -292,6 +308,9 @@ async def delete_backtest(run_id: str, *, owner_id: uuid.UUID | None = None) -> 
         if outcome == "cancel_requested":
             return DeleteOutcome.CANCEL_REQUESTED
         if outcome == "deleted":
+            # A failed or cancelled job saved no report, but its worker may
+            # have written artifacts; nothing else will ever remove them.
+            _remove_artifacts(parsed)
             return DeleteOutcome.DELETED
     if owner_id is None:
         return DeleteOutcome.NOT_FOUND
@@ -444,6 +463,23 @@ def _validated_window(request: BacktestRunRequest) -> tuple[date, date]:
             "Pick a shorter range."
         )
     return start, end
+
+
+def _validated_intraday_size(
+    controls: dict[str, Any], universe: list[str], start: date, end: date
+) -> None:
+    """Refuse an intraday window too large to run, before it is queued.
+
+    The engine repeats the check with the strategy's lookback included; this
+    one catches the common case while the student is still on the form.
+    """
+    bar_seconds = controls.get("BAR_INTERVAL_SECONDS")
+    if bar_seconds is None:
+        return
+    try:
+        check_intraday_size(len(universe), start, end, bar_minutes(bar_seconds))
+    except IntradayWindowTooLarge as exc:
+        raise RunSubmissionError(str(exc)) from None
 
 
 async def _validated_coverage(universe: list[str], start: date, end: date) -> None:
@@ -657,6 +693,7 @@ async def submit_backtest_run(
     except ValueError as exc:
         raise RunSubmissionError(str(exc)) from None
     params = _validated_params(strategy, strategy_params)
+    _validated_intraday_size(controls, universe, start_date, end_date)
     logger.info("SUBMIT | Settings validated; strategy=%s tickers=%s slippage_bps=%s commission_per_share=%s", strategy.key, universe, controls.get("slippageBps", 0), controls.get("commissionPerShare", 0))
     # Check the selected universe, not the registry's defaults.
     await _validated_coverage(universe, start_date, end_date)

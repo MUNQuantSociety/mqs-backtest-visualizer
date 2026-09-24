@@ -11,7 +11,7 @@ import uuid
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import ValidationError
 
-from src.api.dependencies.current_user import require_current_user
+from src.api.dependencies.current_user import optional_current_user, require_current_user
 from src.schemas.strategies import (
     MAX_BODY_BYTES,
     MAX_SOURCE_BYTES,
@@ -38,14 +38,19 @@ router = APIRouter(prefix="/strategies", tags=["strategies"])
 
 
 @router.get("", response_model=StrategyListResponse)
-async def list_strategies() -> StrategyListResponse:
+async def list_strategies(
+    viewer_id: uuid.UUID | None = Depends(optional_current_user),
+) -> StrategyListResponse:
     """Every enabled strategy, with its run aggregates computed in SQL.
 
     Disabled rows are hidden: a strategy is disabled either because it is a
     pipeline test harness or because an upload has not passed validation, and
     neither is something to offer a student.
+
+    Open to anonymous callers; a signed-in caller additionally gets its own
+    uploads labelled ``origin: own``.
     """
-    return await strategies_service.list_strategies()
+    return await strategies_service.list_strategies(viewer_id=viewer_id)
 
 
 @router.post(
@@ -391,7 +396,9 @@ async def delete_strategy(
 # Declared last on purpose: a path parameter would otherwise swallow
 # ``/template``, ``/check`` and ``/upload`` above it.
 @router.get("/{key}", response_model=Strategy)
-async def get_strategy(key: str) -> Strategy:
+async def get_strategy(
+    key: str, viewer_id: uuid.UUID | None = Depends(optional_current_user)
+) -> Strategy:
     """One strategy, **including the ones the catalogue hides**.
 
     ``GET /strategies`` shows only enabled rows, so an upload that is still
@@ -401,7 +408,7 @@ async def get_strategy(key: str) -> Strategy:
     ``validationRunId`` is the backtest to open for progress or the failure
     reason. ``status`` stays within the client's enum (``draft`` until active).
     """
-    strategy = await strategies_service.get_strategy(key)
+    strategy = await strategies_service.get_strategy(key, viewer_id)
     if strategy is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

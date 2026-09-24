@@ -221,14 +221,29 @@ all three. This handoff does not authorize bypassing these gates or merging main
 
 These are not silently included in the completed backtest work:
 
-- **Dashboard news and indicators:** `/api/news` and `/api/indicators` are not
-  implemented. The frontend market panels explicitly fall back to fixtures on
-  missing endpoints, even with backtest fixture mode disabled. Decide whether
-  to implement real feeds or clearly hide/label those panels in a separate task.
+- **Run news and dashboard indicators:** `/api/news?tickers=&start=&end=`
+  reads `public.news_sentiment` (`NEWS_POSTGRES_*`, read-only; 503 when unset,
+  no fallback to `POSTGRES_*`) for one backtest run's universe and dates, in
+  whole New York days. The table is a fixed historical dataset, not a live
+  feed, so there is no "latest news": the dashboard has no news card, and each
+  run's detail page shows its own window's articles.
+  `/api/indicators` computes RSI(14), MACD(12,26,9) histogram, the SMA 50/200
+  regime and 20-session momentum from `public.market_data` session closes, with
+  7-day article sentiment. Both are read-only. Tickers with fewer than 200
+  sessions of closes are omitted from `/indicators`; a sentiment window with no
+  articles scores 0.0. Headlines are the start of the stored summary, because
+  the table keeps no separate title.
 - **Live trading pages:** `/api/live/*`, including portfolio and system/log
   views, return sample data. They are outside the backtest-only integration.
-- **Signal/sentiment overrides:** nonempty signal overrides and enabled
-  sentiment gating are rejected; corresponding run controls are disabled.
+- **Signal overrides:** nonempty signal overrides are rejected; the control is
+  disabled.
+- **Sentiment gate:** event mode only. Live `news_sentiment` coverage starts
+  in late 2025 / early 2026 with multi-week gaps, so for most historical windows
+  the gate sees no articles, scores neutral and blocks nothing; the run report's
+  `sentimentGate.coverage` says so per ticker. Articles are embargoed 5 hours
+  (vendor timezone skew) or to the next day (date-only stamps), but the table
+  has no ingestion time, so late-backfilled articles can still leak, and
+  rescoring means a rerun can differ.
 - **Fast mode:** limited to supported adapters, approximates strategy behavior,
   emits no executed fills/final position marks, and rejects nonzero per-share
   commission. Use event mode for the verified student workflow.

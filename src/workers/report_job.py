@@ -14,6 +14,7 @@ from pathlib import Path
 from src.models import BacktestRun, RunEquityPoint, RunMetrics, RunTrade
 from src.repositories.runs import RunListRow
 from src.schemas.backtests import BacktestDetail
+from src.services.run_controls import timeframe_label
 from src.workers import run_job as reporting
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,8 @@ class RunSpec:
         return BacktestRun(
             id=self.id, owner_id=self.owner_id, name=self.name,
             strategy_key=self.strategy_key, purpose=self.purpose, status=status,
-            start_date=self.start_date, end_date=self.end_date, timeframe="1d",
+            start_date=self.start_date, end_date=self.end_date,
+            timeframe=timeframe_label(self.params),
             initial_capital=self.initial_capital, symbol=self.symbol,
             engine_version=self.engine_version, params=dict(self.params),
             created_at=self.created_at, progress_pct=0,

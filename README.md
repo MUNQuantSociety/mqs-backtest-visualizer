@@ -318,8 +318,10 @@ are the browser form defaults; omitted controls retain legacy zero costs and
 explicit zero is respected. Fast mode requires zero per-share commission.
 The same `universe` ticker set preserves configured weights; an explicitly
 changed set gets equal weights and its own coverage validation. Empty `signals`
-and disabled `sentimentGate` are accepted; nonempty signals or enabled sentiment
-are rejected. See [Execution controls](docs/REPORT_CONTRACT.md#execution-controls)
+are accepted and nonempty signals are rejected. An enabled `sentimentGate`
+(`threshold` in [-1, 0], event mode only, needs `NEWS_POSTGRES_*`) stops the run
+adding long exposure to a ticker while its point-in-time 7-day mean article
+score from the live `news_sentiment` table is below the threshold. See [Execution controls](docs/REPORT_CONTRACT.md#execution-controls)
 for the engine mapping and cost metadata.
 
 Every 422 carries `detail` as a **single sentence string**, not FastAPI's usual

@@ -166,3 +166,29 @@ def test_history_does_not_list_transient_jobs(monkeypatch):
     monkeypatch.setattr(backtests, "ensure_schema", Mock(side_effect=AssertionError("no query needed")))
     history = asyncio.run(backtests.list_backtests(owner_id=uuid.uuid4(), status="running"))
     assert history.total == 0 and history.items == []
+
+
+def _delete_with_manager_answer(monkeypatch, tmp_path, answer):
+    """Delete one run whose job manager answers ``answer``; return outcome and its directory."""
+    from src.services import backtests
+    run_id = uuid.uuid4()
+    artifact_dir = tmp_path / str(run_id)
+    artifact_dir.mkdir()
+    monkeypatch.setattr(backtests, "settings", SimpleNamespace(artifact_dir=tmp_path))
+    monkeypatch.setattr(jobs, "get_job_manager", lambda: SimpleNamespace(cancel=Mock(return_value=answer)))
+    outcome = asyncio.run(backtests.delete_backtest(str(run_id), owner_id=uuid.uuid4()))
+    return outcome, artifact_dir
+
+
+def test_deleting_a_finished_unsaved_job_removes_its_artifacts(monkeypatch, tmp_path):
+    from src.services.backtests import DeleteOutcome
+    outcome, artifact_dir = _delete_with_manager_answer(monkeypatch, tmp_path, "deleted")
+    assert outcome is DeleteOutcome.DELETED
+    assert not artifact_dir.exists()
+
+
+def test_cancelling_a_running_job_leaves_its_artifacts_to_the_worker(monkeypatch, tmp_path):
+    from src.services.backtests import DeleteOutcome
+    outcome, artifact_dir = _delete_with_manager_answer(monkeypatch, tmp_path, "cancel_requested")
+    assert outcome is DeleteOutcome.CANCEL_REQUESTED
+    assert artifact_dir.exists()
