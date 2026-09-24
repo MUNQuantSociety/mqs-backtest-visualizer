@@ -25,8 +25,12 @@ CONTROL_KEYS = frozenset(
         "signals",
         "sentimentGate",
         "barIntervalSeconds",
+        "weights",
     }
 )
+
+# Rounding room for weights typed as percentages: 33.33 + 33.33 + 33.34.
+_WEIGHT_SUM_TOLERANCE = 1e-6
 
 # The API's ``timeframe`` label for each bar size the run form offers.
 _TIMEFRAME_LABELS = {60: "1m", 300: "5m", 900: "15m", 1800: "30m", 3600: "1h", 86400: "1d"}
@@ -74,6 +78,12 @@ def split_controls(
             controls["TICKERS"] = universe
             controls["WEIGHTS"] = {ticker: 1.0 / len(universe) for ticker in universe}
 
+    if "weights" in raw:
+        weights = _validated_weights(raw["weights"], universe)
+        controls["weights"] = weights
+        controls["TICKERS"] = universe
+        controls["WEIGHTS"] = dict(weights)
+
     for key, maximum in (("slippageBps", 1000.0), ("commissionPerShare", 100.0)):
         if key not in raw:
             continue
@@ -103,6 +113,53 @@ def split_controls(
         if gate is not None:
             controls["sentimentGate"] = gate
     return params, controls, universe
+
+
+def _validated_weights(raw: Any, universe: list[str]) -> dict[str, float]:
+    """The run's allocation: one weight per universe ticker, as a fraction.
+
+    Every ticker must be named, so a typo cannot silently leave one at zero.
+    Weights may add up to less than 1 — the rest stays in cash, which is how
+    the engine and the benchmark already read a partial allocation — but not
+    to more: nothing here models leverage. They are never renormalised.
+
+    Raises:
+        ValueError: anything else, with a message naming ``weights``.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("weights must be an object mapping each ticker to a fraction.")
+    weights: dict[str, float] = {}
+    for key, value in raw.items():
+        ticker = str(key).strip().upper()
+        if ticker in weights:
+            raise ValueError(f"weights names {ticker} more than once.")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"weights for {ticker} must be a finite number of 0 or more.")
+        weights[ticker] = float(value)
+    if set(weights) != set(universe):
+        missing = sorted(set(universe) - set(weights))
+        extra = sorted(set(weights) - set(universe))
+        detail = "; ".join(
+            part
+            for part in (
+                f"missing {', '.join(missing)}" if missing else "",
+                f"not in the universe: {', '.join(extra)}" if extra else "",
+            )
+            if part
+        )
+        raise ValueError(f"weights must name every universe ticker exactly ({detail}).")
+    total = sum(weights.values())
+    if total <= 0:
+        raise ValueError("weights must allocate something; every weight is 0.")
+    if total > 1 + _WEIGHT_SUM_TOLERANCE:
+        raise ValueError(f"weights add up to {total:.4g}; they must add up to 1 or less.")
+    # In universe order, so the stored run reads the way the form showed it.
+    return {ticker: weights[ticker] for ticker in universe}
 
 
 def _validated_sentiment_gate(raw: Any, mode: str) -> dict[str, Any] | None:
