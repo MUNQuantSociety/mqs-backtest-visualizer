@@ -88,6 +88,65 @@ class MarketDataUnavailable(RuntimeError):
     """The market-data database could not answer; the route turns this into a 503."""
 
 
+# How far the stored closes may fall short of a window's edges, or leave a hole
+# inside it, before FMP is asked to fill in: a long weekend plus a holiday.
+_CLOSES_EDGE_SLACK = timedelta(days=4)
+_CLOSES_MAX_HOLE = timedelta(days=7)
+# FMP fills per (ticker, start, end): a dashboard reload must not cost a call.
+_CLOSES_FILL_TTL_SECONDS = 3600
+_CLOSES_FILL_CACHE_SIZE = 64
+_closes_fill_cache: OrderedDict[tuple[str, date, date], tuple[float, dict[date, float]]] = (
+    OrderedDict()
+)
+_closes_fill_lock = threading.Lock()
+
+
+def _closes_cover(days: list[date], start: date, end: date) -> bool:
+    """Whether stored closes span the window: its edges and no long hole inside."""
+    if not days:
+        return False
+    if days[0] - start > _CLOSES_EDGE_SLACK or end - days[-1] > _CLOSES_EDGE_SLACK:
+        return False
+    return all(later - earlier <= _CLOSES_MAX_HOLE for earlier, later in zip(days, days[1:]))
+
+
+async def _fmp_closes(ticker: str, start: date, end: date) -> dict[date, float]:
+    """FMP's daily closes for the window, cached; empty when FMP is unavailable.
+
+    The market-data store is filled by the trading system, which does not ingest
+    every ticker a benchmark needs (SPY among them), so its history can stop
+    short of a backtest window. FMP fills the gap rather than leaving the
+    benchmark line cut off.
+    """
+    key = (ticker, start, end)
+    with _closes_fill_lock:
+        cached = _closes_fill_cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            _closes_fill_cache.move_to_end(key)
+            return cached[1]
+    try:
+        frame = await asyncio.to_thread(fetch_daily_history, [ticker], start, end, require_all=False)
+    except FMPUnavailable as exc:
+        # Degrade to what the database has; the benchmark is a reference line.
+        logger.warning("CLOSES | FMP fill for %s skipped; provider unavailable: %s", ticker, exc)
+        return {}
+    closes = (
+        {}
+        if frame.empty
+        else {
+            row.timestamp.date(): float(row.close_price)
+            for row in frame.itertuples()
+            if row.close_price is not None
+        }
+    )
+    with _closes_fill_lock:
+        _closes_fill_cache[key] = (time.monotonic() + _CLOSES_FILL_TTL_SECONDS, closes)
+        _closes_fill_cache.move_to_end(key)
+        while len(_closes_fill_cache) > _CLOSES_FILL_CACHE_SIZE:
+            _closes_fill_cache.popitem(last=False)
+    return closes
+
+
 async def closes_between(ticker: str, start: date, end: date) -> TickerClosesResponse:
     """A ticker's daily session closes from ``start`` to ``end`` (inclusive), oldest first.
 
@@ -97,7 +156,9 @@ async def closes_between(ticker: str, start: date, end: date) -> TickerClosesRes
         end: Last New York trading date to include.
 
     Returns:
-        The closes found; a ticker with none in range has no points.
+        The closes found; a ticker with none in range has no points. Where the
+        stored closes do not span the window, FMP's fill the gaps; a stored
+        close wins over FMP's for the same day.
 
     Raises:
         ValueError: an invalid ticker, ``start`` after ``end``, or a window longer
@@ -118,11 +179,14 @@ async def closes_between(ticker: str, start: date, end: date) -> TickerClosesRes
         # The driver's message can carry connection details; the type is enough.
         logger.error("Closes query failed for %s: %s", wanted, type(exc).__name__)
         raise MarketDataUnavailable("Benchmark prices are unavailable. Please try again later.") from exc
+    stored = dict(closes.get(wanted, []))
+    if not _closes_cover(sorted(stored), start, end):
+        merged = {**await _fmp_closes(wanted, start, end), **stored}
+        stored = {day: close for day, close in merged.items() if start <= day <= end}
     return TickerClosesResponse(
         ticker=wanted,
         points=[
-            ClosePoint(date=day.isoformat(), close=close)
-            for day, close in closes.get(wanted, [])
+            ClosePoint(date=day.isoformat(), close=close) for day, close in sorted(stored.items())
         ],
     )
 
