@@ -123,7 +123,10 @@ _BUILTINS: list[dict[str, Any]] = [
             "ATR-based stops and confidence-weighted sizing."
         ),
         "tags": ["regime", "adaptive", "cross-asset"],
-        "enabled": True,
+        # Held back: it has no published package, and its universe's history is
+        # incomplete (TLT is stored only to 2025-11-07). Re-enable when the data
+        # is backfilled and scripts/publish_builtin_strategies.py has published it.
+        "enabled": False,
     },
     {
         "key": "portfolio_dummy",

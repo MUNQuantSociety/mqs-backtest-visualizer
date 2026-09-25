@@ -126,7 +126,9 @@ def test_no_simulation_history_fails_instead_of_successful_flat_fallback(monkeyp
         artifact_dir=str(tmp_path),
     ))
     assert result.status == "failed"
-    assert result.error.startswith("NoMarketData:")
+    # NoMarketData, in its own words: the empty window and what to check.
+    assert "Check the ticker coverage" in result.error
+    assert not result.error.startswith("NoMarketData")
     assert result.equity_curve == []
     assert result.final_equity is None
     assert len(calls) == 1

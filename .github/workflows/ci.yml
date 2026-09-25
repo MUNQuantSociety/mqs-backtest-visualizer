@@ -121,8 +121,10 @@ jobs:
           MARKET_CACHE_DIR: ${{ runner.temp }}/postgres/cache
           ARTIFACT_DIR: ${{ runner.temp }}/postgres/artifacts
         # Fixture-owned data; never run the live-data integration suite here.
+        # test_daily_closes_sql runs the closes query on fixture rows only.
         run: >-
-          python -m pytest tests/integration/test_ci_pipeline.py -q
+          python -m pytest tests/integration/test_ci_pipeline.py
+          tests/unit/test_daily_closes_sql.py -q
           -p no:cacheprovider --durations=10
           --basetemp="$RUNNER_TEMP/postgres-pytest"
           --junitxml="$RUNNER_TEMP/postgres-tests.xml"

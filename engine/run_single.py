@@ -58,6 +58,21 @@ from engine.strategies.portfolio_BASE.strategy import BasePortfolio
 logger = logging.getLogger(__name__)
 
 
+def failure_message(exc: BaseException) -> str:
+    """What a failed run tells the student.
+
+    The engine's own errors (``EngineError`` and subclasses such as
+    ``NoMarketData``) are written to be read: "no market data for [AAPL]
+    between ..." needs no class name in front, and one only adds noise. Any
+    other exception is unexpected, so it keeps its class name: "KeyError:
+    'close_price'" reads as the internal bug it is.
+    """
+    text = str(exc)
+    if isinstance(exc, EngineError):
+        return text or type(exc).__name__
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 def load_strategy_class(class_path: str) -> type[BasePortfolio]:
     """Import and return the strategy class named by ``class_path``.
 
@@ -517,13 +532,12 @@ def run_single(request: RunRequest) -> RunResult:
             artifact_dir=artifact_dir,
         )
     except Exception as exc:
-        # The class name is part of the message on purpose: "NoMarketData: ..."
-        # tells a student their window is empty, while a bare message would
-        # look like an internal bug.
+        # The engine's own errors read as written; anything else keeps its
+        # class name so it reads as the internal bug it is.
         logger.exception("Run %s failed: %s", request.run_id, exc)
         return RunResult(
             status="failed",
-            error=f"{type(exc).__name__}: {exc}",
+            error=failure_message(exc),
             artifact_dir=artifact_dir,
         )
     finally:

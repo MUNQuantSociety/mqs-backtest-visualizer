@@ -165,7 +165,8 @@ def test_unknown_ticker_fails_and_names_it(tmp_path: Path) -> None:
     assert result.status == "failed"
     assert result.error is not None
     assert fake in result.error
-    assert "NoMarketData" in result.error
+    # NoMarketData, in its own words rather than its class name.
+    assert "Check the ticker coverage" in result.error
     assert result.equity_curve == []
     assert result.final_equity is None
 

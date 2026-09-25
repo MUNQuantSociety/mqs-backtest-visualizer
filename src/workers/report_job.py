@@ -153,7 +153,9 @@ def execute_report(spec: RunSpec, state) -> dict:
         return {"report": build_report(spec, context, result).model_dump(mode="json", by_alias=True)}
     except Exception as exc:
         logger.exception("Run %s failed before a report could be saved", spec.id)
-        return {"error": f"{type(exc).__name__}: {exc}"[:2000]}
+        from engine.run_single import failure_message
+
+        return {"error": failure_message(exc)[:2000]}
     finally:
         if context is not None:
             reporting._remove_workdir(context.workdir)

@@ -93,7 +93,9 @@ def test_seeded_strategies_are_present_and_enabled_correctly() -> None:
     assert SEEDED_KEYS <= keys, "run scripts/seed_strategies.py first"
 
     enabled_keys = {row.strategy.key for row in enabled}
-    assert {"portfolio_1", "portfolio_2", "portfolio_3"} <= enabled_keys
+    assert {"portfolio_1", "portfolio_2"} <= enabled_keys
+    # Seeded but held back until its data is backfilled and it is published.
+    assert "portfolio_3" not in enabled_keys
     assert "portfolio_dummy" not in enabled_keys
 
     builtin = next(row for row in everything if row.strategy.key == "portfolio_1")
