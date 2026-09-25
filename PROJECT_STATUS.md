@@ -225,8 +225,11 @@ These are not silently included in the completed backtest work:
   reads `public.news_sentiment` (`NEWS_POSTGRES_*`, read-only; 503 when unset,
   no fallback to `POSTGRES_*`) for one backtest run's universe and dates, in
   whole New York days. The table is a fixed historical dataset, not a live
-  feed, so there is no "latest news": the dashboard has no news card, and each
-  run's detail page shows its own window's articles.
+  feed, so there is no "latest news". Each run's detail page shows its own
+  window's articles, and the dashboard's "News — scored" card shows the
+  articles for its runs' tickers over the same window as its charts: back from
+  the runs' latest end date by the chosen period, never before the earliest
+  run began.
   `/api/indicators` computes RSI(14), MACD(12,26,9) histogram, the SMA 50/200
   regime and 20-session momentum from `public.market_data` session closes, with
   7-day article sentiment. Both are read-only. Tickers with fewer than 200
