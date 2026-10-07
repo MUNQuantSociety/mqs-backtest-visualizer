@@ -30,7 +30,9 @@ from src.repositories import market_data as market_data_repo
 from src.repositories import reports as reports_repo
 from src.repositories import strategies as strategies_repo
 from src.schemas.market_data import (
+    Candle,
     ClosePoint,
+    TickerCandlesResponse,
     TickerClosesResponse,
     CoverageResponse,
     SymbolMatch,
@@ -189,6 +191,71 @@ async def closes_between(ticker: str, start: date, end: date) -> TickerClosesRes
             ClosePoint(date=day.isoformat(), close=close) for day, close in sorted(stored.items())
         ],
     )
+
+
+# Candles for the Build tab's chart, straight from FMP. Keyed per window so
+# flicking between ranges is free after the first look; short-lived because
+# the latest session's bar is still moving while the market is open.
+_CANDLES_TTL_SECONDS = 900
+_CANDLES_CACHE_SIZE = 64
+_candles_cache: OrderedDict[tuple[str, date, date], tuple[float, list[Candle]]] = OrderedDict()
+_candles_lock = threading.Lock()
+
+
+def _fmp_candles(ticker: str, start: date, end: date) -> list[Candle]:
+    """FMP's daily bars for the window, oldest first, cached by window."""
+    key = (ticker, start, end)
+    with _candles_lock:
+        cached = _candles_cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            _candles_cache.move_to_end(key)
+            return cached[1]
+    # The same provider cap the symbol lookups share.
+    with _symbol_requests:
+        rows = FMPMarketData().get_historical_data([ticker], start, end)
+    candles = [
+        Candle(
+            date=row["date"].isoformat(),
+            open=row["open_price"],
+            high=row["high_price"],
+            low=row["low_price"],
+            close=row["close_price"],
+            volume=row["volume"],
+        )
+        for row in sorted(rows, key=lambda row: row["date"])
+    ]
+    with _candles_lock:
+        _candles_cache[key] = (time.monotonic() + _CANDLES_TTL_SECONDS, candles)
+        _candles_cache.move_to_end(key)
+        while len(_candles_cache) > _CANDLES_CACHE_SIZE:
+            _candles_cache.popitem(last=False)
+    return candles
+
+
+async def candles_between(ticker: str, start: date, end: date) -> TickerCandlesResponse:
+    """A ticker's daily OHLCV candles from ``start`` to ``end`` (inclusive), oldest first.
+
+    Args:
+        ticker: One symbol, case-insensitive.
+        start: First New York trading date to include.
+        end: Last New York trading date to include.
+
+    Returns:
+        FMP's bars for the window; a window before the listing has no candles.
+
+    Raises:
+        ValueError: an invalid ticker, ``start`` after ``end``, or a window longer
+            than 15 years.
+        FMPSymbolUnknown: FMP has no such symbol.
+        FMPUnavailable: the provider could not answer.
+    """
+    (wanted,) = normalize_tickers([ticker])
+    if start > end:
+        raise ValueError("start must be on or before end.")
+    if end - start > _CLOSES_MAX_SPAN:
+        raise ValueError("Ask for at most 15 years of candles at a time.")
+    candles = await asyncio.to_thread(_fmp_candles, wanted, start, end)
+    return TickerCandlesResponse(ticker=wanted, candles=candles)
 
 
 def normalize_tickers(tickers: list[str]) -> list[str]:

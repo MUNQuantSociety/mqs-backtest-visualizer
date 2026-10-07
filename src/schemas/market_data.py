@@ -102,3 +102,21 @@ class TickerClosesResponse(CamelModel):
 
     ticker: str
     points: list[ClosePoint]
+
+
+class Candle(CamelModel):
+    """One daily OHLCV bar, dated by its New York trading session."""
+
+    date: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class TickerCandlesResponse(CamelModel):
+    """A ticker's daily candles over a window, oldest first: the Build chart."""
+
+    ticker: str
+    candles: list[Candle]
