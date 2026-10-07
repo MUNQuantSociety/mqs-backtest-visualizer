@@ -354,6 +354,8 @@ async def submit_draft(
             "body": submission.body,
             "indicators": [spec.model_dump() for spec in submission.indicators],
             "state": dict(submission.state),
+            # Present only for a builder-made strategy, so it reopens as rules.
+            **({"rules": submission.rules} if submission.rules is not None else {}),
         },
         owner_id=owner_id,
     )
@@ -603,6 +605,7 @@ async def get_strategy_source(key: str, *, owner_id: uuid.UUID) -> StrategySourc
             else None
         ),
         state=authored.get("state"),
+        rules=authored.get("rules"),
     )
 
 

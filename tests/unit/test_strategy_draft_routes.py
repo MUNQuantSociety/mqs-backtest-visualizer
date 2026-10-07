@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from src.api.dependencies.current_user import require_current_user
 from src.api.routes.strategies import router
-from src.schemas.strategies import MAX_BODY_BYTES, StrategySubmissionResult
+from src.schemas.strategies import MAX_BODY_BYTES, MAX_RULES_BYTES, StrategySubmissionResult
 from src.services import strategies as strategies_service
 
 OWNER = uuid.UUID(int=1)
@@ -170,6 +170,49 @@ class TestSubmitDraft:
         assert sent.name == "Mine"
         # The draft is attributed to its author exactly as an upload is.
         assert submit.await_args.kwargs["owner_id"] == OWNER
+
+    def test_builder_rules_are_kept_for_reopening(self, api, monkeypatch):
+        submit = AsyncMock(
+            return_value=StrategySubmissionResult(
+                id="user-x-1", name="Mine", status="draft", message="queued",
+                validation_run_id=None,
+            )
+        )
+        monkeypatch.setattr(strategies_service, "submit_strategy", submit)
+        rules = {"buy": {"match": "all", "conditions": []}, "stopLossPercent": 7}
+
+        response = api.post(
+            "/api/strategies/draft",
+            json={"name": "Mine", "body": GOOD_BODY, "rules": rules},
+        )
+
+        assert response.status_code == 201
+        assert submit.await_args.kwargs["authoring"]["rules"] == rules
+        # The rules are an editing aid; what runs is still the checked body.
+        assert GOOD_BODY.splitlines()[0] in submit.await_args.args[0].source
+
+    def test_a_hand_written_draft_stores_no_rules(self, api, monkeypatch):
+        submit = AsyncMock(
+            return_value=StrategySubmissionResult(
+                id="user-x-1", name="Mine", status="draft", message="queued",
+                validation_run_id=None,
+            )
+        )
+        monkeypatch.setattr(strategies_service, "submit_strategy", submit)
+
+        api.post("/api/strategies/draft", json={"name": "Mine", "body": GOOD_BODY})
+
+        assert "rules" not in submit.await_args.kwargs["authoring"]
+
+    def test_oversized_rules_are_refused(self, api):
+        rules = {"padding": "x" * (MAX_RULES_BYTES + 1)}
+
+        response = api.post(
+            "/api/strategies/draft",
+            json={"name": "Mine", "body": GOOD_BODY, "rules": rules},
+        )
+
+        assert response.status_code == 422
 
     def test_a_nameless_draft_is_refused(self, api):
         assert api.post("/api/strategies/draft", json={"body": GOOD_BODY}).status_code == 422

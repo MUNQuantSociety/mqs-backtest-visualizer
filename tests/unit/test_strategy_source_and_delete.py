@@ -104,6 +104,7 @@ class TestGetSource:
             "body": None,
             "indicators": None,
             "state": None,
+            "rules": None,
         }
         store.get.assert_called_once_with("strategies/user-momentum-abc12345/", "strategy.py")
 
@@ -262,3 +263,21 @@ class TestFragmentAuthoredSource:
         assert payload["state"] == {"last_price": {}}
         # The assembled file is still there — it is what actually runs.
         assert "class MyStrategy" in payload["source"]
+        # Written as code, not with the builder: no rules to reopen.
+        assert payload["rules"] is None
+
+    def test_builder_rules_come_back_with_the_fragment(self, api, store, monkeypatch):
+        row = _row("strategies/user-momentum-abc12345/")
+        rules = {"buy": {"match": "all", "conditions": []}, "stopLossPercent": 7}
+        row.strategy.authoring = {
+            "body": "for ticker in self.tickers:\n    pass",
+            "indicators": [],
+            "state": {"previous": {}},
+            "rules": rules,
+        }
+        _with_row(monkeypatch, row)
+        store.get.return_value = "class MyStrategy(BasePortfolio):\n    pass\n"
+
+        payload = api.get(f"/strategies/{KEY}/source").json()
+
+        assert payload["rules"] == rules
