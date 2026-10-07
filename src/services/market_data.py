@@ -255,7 +255,25 @@ async def candles_between(ticker: str, start: date, end: date) -> TickerCandlesR
     if end - start > _CLOSES_MAX_SPAN:
         raise ValueError("Ask for at most 15 years of candles at a time.")
     candles = await asyncio.to_thread(_fmp_candles, wanted, start, end)
+    if not candles and not await _symbol_known(wanted):
+        # FMP answers a made-up symbol's history with an empty list, which
+        # reads as "nothing in this range". Say what is actually wrong.
+        raise FMPSymbolUnknown(f"FMP has no symbol {wanted}. Check the ticker.")
     return TickerCandlesResponse(ticker=wanted, candles=candles)
+
+
+async def _symbol_known(ticker: str) -> bool:
+    """Whether FMP lists ``ticker``, asked only when its history came back empty.
+
+    Uses the run form's cached exact lookup. A lookup that cannot answer is
+    taken as "known": an empty chart is a fair reply, a false "no such symbol"
+    is not.
+    """
+    try:
+        return await asyncio.to_thread(_fmp_symbol_exists, ticker)
+    except FMPUnavailable as exc:
+        logger.warning("CANDLES | Symbol lookup for %s skipped; provider unavailable: %s", ticker, exc)
+        return True
 
 
 def normalize_tickers(tickers: list[str]) -> list[str]:
