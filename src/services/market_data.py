@@ -697,6 +697,7 @@ async def coverage_for(tickers: list[str]) -> CoverageResponse:
         start=_iso(max(starts)) if have_window else None,
         end=_iso(min(ends)) if have_window else None,
         missing=missing,
+        max_window_days=settings.max_backtest_window_days,
     )
 
 

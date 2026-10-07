@@ -44,6 +44,10 @@ class CoverageResponse(CamelModel):
     end: str | None = None
     # Tickers with no bars at all. Empty is the normal case.
     missing: list[str] = []
+    # The longest window a run accepts, in days of `end - start`. Served here,
+    # beside the dates the form offers, so the form's presets follow the
+    # deployment's MAX_BACKTEST_WINDOW_DAYS instead of a copy of its default.
+    max_window_days: int | None = None
 
 
 class TickerValidation(CamelModel):
