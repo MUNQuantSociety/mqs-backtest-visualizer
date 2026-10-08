@@ -1,13 +1,25 @@
+import os
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import jwt
+from jwt.exceptions import InvalidTokenError
 
-# TODO: Move to .env
-SECRET_KEY = "09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7"
-ALGORITHM = "HS256"
 
-ACCESS_TOKEN_EXPIRE_MINUTES = 5
-REFRESH_TOKEN_EXPIRE_DAYS = 30
+SECRET_KEY = os.environ["SECRET_KEY"]
+ALGORITHM = os.environ["ALGORITHM"]
+
+ACCESS_TOKEN_EXPIRE_MINUTES = int(
+    os.environ["ACCESS_TOKEN_EXPIRE_MINUTES"]
+)
+
+TEMP_TOKEN_EXPIRE_MINUTES = int(
+    os.environ["TEMP_TOKEN_EXPIRE_MINUTES"]
+)
+
+REFRESH_TOKEN_EXPIRE_DAYS = int(
+    os.environ["REFRESH_TOKEN_EXPIRE_DAYS"]
+)
 
 
 """
@@ -20,11 +32,21 @@ always spit out a token for whatever user_id was provided
 
 
 def create_access_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
 
-    payload = {"sub": user_id, "type": "access", "exp": expire}
+    payload = {
+        "sub": user_id,
+        "type": "access",
+        "exp": expire,
+    }
 
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
 
 
 """
@@ -37,17 +59,30 @@ always spit out a token for whatever user_id was provided
 
 
 def create_refresh_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    expire = datetime.now(timezone.utc) + timedelta(
+        days=REFRESH_TOKEN_EXPIRE_DAYS
+    )
 
-    payload = {"sub": user_id, "type": "refresh", "exp": expire}
+    jti = str(uuid4())
 
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    payload = {
+        "sub": user_id,
+        "type": "refresh",
+        "exp": expire,
+        "jti": jti,
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
 
 
 """
 @params: user_id as string
 @returns: access and refresh token
-Intentional kept boring because why not!
+Intentionally kept boring because why not!
 """
 
 
@@ -58,5 +93,111 @@ def obtain_token_pair(user_id: str) -> dict[str, str]:
     }
 
 
-def verify_accesss_token(access_token: str) -> bool:
-    return False
+def decode_token(token: str) -> dict | None:
+    try:
+        return jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+            options={
+                "require": ["sub", "exp", "type"],
+            },
+        )
+
+    except InvalidTokenError:
+        return None
+
+
+def verify_access_token(
+    access_token: str,
+) -> dict | None:
+    payload = decode_token(access_token)
+
+    if payload is None:
+        return None
+
+    if payload["type"] != "access":
+        return None
+
+    if not payload["sub"]:
+        return None
+
+    return {
+        "user_id": payload["sub"],
+    }
+
+
+# TODO: Replace with database-backed refresh token revocation.
+# This in-memory set is only for development/v0.
+# It resets when the server restarts and is not shared between workers.
+refresh_blacklist: set[str] = set()
+
+
+def verify_refresh_token(
+    refresh_token: str,
+) -> dict | None:
+    payload = decode_token(refresh_token)
+
+    if payload is None:
+        return None
+
+    if payload["type"] != "refresh":
+        return None
+
+    if not payload.get("jti"):
+        return None
+
+    if payload["jti"] in refresh_blacklist:
+        return None
+
+    return {
+        "user_id": payload["sub"],
+        "jti": payload["jti"],
+    }
+
+
+# TODO: Replace with database-backed refresh token revocation.
+def blacklist_refresh_token(jti: str) -> None:
+    refresh_blacklist.add(jti)
+
+
+def create_discord_temp_token(
+    discord_user_id: str,
+    roles: list[str],
+) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(
+        minutes=TEMP_TOKEN_EXPIRE_MINUTES
+    )
+
+    payload = {
+        "sub": discord_user_id,
+        "roles": roles,
+        "type": "discord_registration",
+        "exp": expire,
+    }
+
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def verify_discord_temp_token(
+    discord_temp_token: str,
+) -> dict | None:
+    payload = decode_token(discord_temp_token)
+
+    if payload is None:
+        return None
+
+    if payload["type"] != "discord_registration":
+        return None
+
+    if not payload["sub"]:
+        return None
+
+    return {
+        "discord_user_id": payload["sub"],
+        "roles": payload.get("roles", []),
+    }
