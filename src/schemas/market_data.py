@@ -124,3 +124,46 @@ class TickerCandlesResponse(CamelModel):
 
     ticker: str
     candles: list[Candle]
+
+
+class FmpIndicatorInfo(CamelModel):
+    """One FMP indicator a strategy can register as ``FmpIndicator``.
+
+    ``name`` is the value ``FmpIndicator`` and ``/indicator-series`` take.
+    ``pane`` says where a chart draws it: ``price`` lines share the candles'
+    scale, ``separate`` ones need their own panel. ``min_value``/``max_value``
+    bound a threshold a rule compares it with; null means unbounded.
+    """
+
+    name: str
+    label: str
+    short_label: str
+    pane: Literal["price", "separate"]
+    default_period: int
+    min_period: int
+    max_period: int
+    min_value: float | None = None
+    max_value: float | None = None
+
+
+class FmpIndicatorCatalogue(CamelModel):
+    items: list[FmpIndicatorInfo]
+
+
+class IndicatorPoint(CamelModel):
+    """One indicator value, dated by its New York trading session."""
+
+    date: str
+    value: float
+
+
+class TickerIndicatorSeriesResponse(CamelModel):
+    """One FMP indicator for one ticker over a window, oldest first.
+
+    The same values a backtest's ``FmpIndicator`` reads for those days.
+    """
+
+    ticker: str
+    indicator: str
+    period: int
+    points: list[IndicatorPoint]
