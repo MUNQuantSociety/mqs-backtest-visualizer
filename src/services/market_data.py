@@ -22,6 +22,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from engine.data import yahoo
 from engine.data.fmp import FMPMarketData, FMPSymbolUnknown, fetch_daily_history, market_data_source
 from engine.data.fmp import FMPUnavailable as FMPUnavailable
+from engine.data.fmp import (
+    TECHNICAL_INDICATOR_MAX_PERIOD,
+    TECHNICAL_INDICATOR_MIN_PERIOD,
+    TECHNICAL_INDICATORS,
+)
+from engine.indicators.fmp_indicator import load_series
 
 from src.core.config import settings
 from src.db.engine import session_scope
@@ -30,7 +36,13 @@ from src.repositories import market_data as market_data_repo
 from src.repositories import reports as reports_repo
 from src.repositories import strategies as strategies_repo
 from src.schemas.market_data import (
+    Candle,
     ClosePoint,
+    FmpIndicatorCatalogue,
+    FmpIndicatorInfo,
+    IndicatorPoint,
+    TickerCandlesResponse,
+    TickerIndicatorSeriesResponse,
     TickerClosesResponse,
     CoverageResponse,
     SymbolMatch,
@@ -189,6 +201,177 @@ async def closes_between(ticker: str, start: date, end: date) -> TickerClosesRes
             ClosePoint(date=day.isoformat(), close=close) for day, close in sorted(stored.items())
         ],
     )
+
+
+# Candles for the Build tab's chart, straight from FMP. Keyed per window so
+# flicking between ranges is free after the first look; short-lived because
+# the latest session's bar is still moving while the market is open.
+_CANDLES_TTL_SECONDS = 900
+_CANDLES_CACHE_SIZE = 64
+_candles_cache: OrderedDict[tuple[str, date, date], tuple[float, list[Candle]]] = OrderedDict()
+_candles_lock = threading.Lock()
+
+
+def _fmp_candles(ticker: str, start: date, end: date) -> list[Candle]:
+    """FMP's daily bars for the window, oldest first, cached by window."""
+    key = (ticker, start, end)
+    with _candles_lock:
+        cached = _candles_cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            _candles_cache.move_to_end(key)
+            return cached[1]
+    # The same provider cap the symbol lookups share.
+    with _symbol_requests:
+        rows = FMPMarketData().get_historical_data([ticker], start, end)
+    candles = [
+        Candle(
+            date=row["date"].isoformat(),
+            open=row["open_price"],
+            high=row["high_price"],
+            low=row["low_price"],
+            close=row["close_price"],
+            volume=row["volume"],
+        )
+        for row in sorted(rows, key=lambda row: row["date"])
+    ]
+    with _candles_lock:
+        _candles_cache[key] = (time.monotonic() + _CANDLES_TTL_SECONDS, candles)
+        _candles_cache.move_to_end(key)
+        while len(_candles_cache) > _CANDLES_CACHE_SIZE:
+            _candles_cache.popitem(last=False)
+    return candles
+
+
+async def candles_between(ticker: str, start: date, end: date) -> TickerCandlesResponse:
+    """A ticker's daily OHLCV candles from ``start`` to ``end`` (inclusive), oldest first.
+
+    Args:
+        ticker: One symbol, case-insensitive.
+        start: First New York trading date to include.
+        end: Last New York trading date to include.
+
+    Returns:
+        FMP's bars for the window; a window before the listing has no candles.
+
+    Raises:
+        ValueError: an invalid ticker, ``start`` after ``end``, or a window longer
+            than 15 years.
+        FMPSymbolUnknown: FMP has no such symbol.
+        FMPUnavailable: the provider could not answer.
+    """
+    (wanted,) = normalize_tickers([ticker])
+    if start > end:
+        raise ValueError("start must be on or before end.")
+    if end - start > _CLOSES_MAX_SPAN:
+        raise ValueError("Ask for at most 15 years of candles at a time.")
+    candles = await asyncio.to_thread(_fmp_candles, wanted, start, end)
+    if not candles and not await _symbol_known(wanted):
+        # FMP answers a made-up symbol's history with an empty list, which
+        # reads as "nothing in this range". Say what is actually wrong.
+        raise FMPSymbolUnknown(f"FMP has no symbol {wanted}. Check the ticker.")
+    return TickerCandlesResponse(ticker=wanted, candles=candles)
+
+
+async def _symbol_known(ticker: str) -> bool:
+    """Whether FMP lists ``ticker``, asked only when its history came back empty.
+
+    Uses the run form's cached exact lookup. A lookup that cannot answer is
+    taken as "known": an empty chart is a fair reply, a false "no such symbol"
+    is not.
+    """
+    try:
+        return await asyncio.to_thread(_fmp_symbol_exists, ticker)
+    except FMPUnavailable as exc:
+        logger.warning("CANDLES | Symbol lookup for %s skipped; provider unavailable: %s", ticker, exc)
+        return True
+
+
+# How each FMP indicator is labelled and drawn. Keyed exactly like
+# engine.data.fmp.TECHNICAL_INDICATORS, which decides what can be fetched.
+_FMP_INDICATOR_INFO = {
+    "sma": ("Simple moving average", "SMA", "price", 50, None, None),
+    "ema": ("Exponential moving average", "EMA", "price", 20, None, None),
+    "wma": ("Weighted moving average", "WMA", "price", 20, None, None),
+    "dema": ("Double exponential moving average", "DEMA", "price", 20, None, None),
+    "tema": ("Triple exponential moving average", "TEMA", "price", 20, None, None),
+    "rsi": ("Relative strength index", "RSI", "separate", 14, 0.0, 100.0),
+    "standarddeviation": ("Standard deviation", "Std dev", "separate", 20, 0.0, None),
+    "williams": ("Williams %R", "%R", "separate", 14, -100.0, 0.0),
+    "adx": ("Average directional index", "ADX", "separate", 14, 0.0, 100.0),
+}
+
+
+def fmp_indicator_catalogue() -> FmpIndicatorCatalogue:
+    """Every FMP indicator a strategy can register, in display order."""
+    return FmpIndicatorCatalogue(items=[
+        FmpIndicatorInfo(
+            name=name, label=label, short_label=short, pane=pane, default_period=default,
+            min_period=TECHNICAL_INDICATOR_MIN_PERIOD, max_period=TECHNICAL_INDICATOR_MAX_PERIOD,
+            min_value=low, max_value=high,
+        )
+        for name, (label, short, pane, default, low, high) in _FMP_INDICATOR_INFO.items()
+    ])
+
+
+# Same lifetime and size reasoning as the candles cache above.
+_SERIES_TTL_SECONDS = 900
+_SERIES_CACHE_SIZE = 128
+_series_cache: OrderedDict[tuple[str, str, int, date, date], tuple[float, list[IndicatorPoint]]] = OrderedDict()
+_series_lock = threading.Lock()
+
+
+def _fmp_indicator_series(ticker: str, name: str, period: int, start: date, end: date) -> list[IndicatorPoint]:
+    """FMP's indicator values for the window, oldest first, cached by request.
+
+    Fetched with the backtest indicator's own warmed-up loader, so a chart
+    line and a backtest read the same number for the same day.
+    """
+    key = (ticker, name, period, start, end)
+    with _series_lock:
+        cached = _series_cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            _series_cache.move_to_end(key)
+            return cached[1]
+    with _symbol_requests:
+        values = load_series(FMPMarketData(), ticker, name, period, start, end)
+    points = [IndicatorPoint(date=day.isoformat(), value=value) for day, value in sorted(values.items())]
+    with _series_lock:
+        _series_cache[key] = (time.monotonic() + _SERIES_TTL_SECONDS, points)
+        _series_cache.move_to_end(key)
+        while len(_series_cache) > _SERIES_CACHE_SIZE:
+            _series_cache.popitem(last=False)
+    return points
+
+
+async def indicator_series_between(
+    ticker: str, indicator: str, period: int, start: date, end: date
+) -> TickerIndicatorSeriesResponse:
+    """One FMP indicator for one ticker from ``start`` to ``end`` (inclusive).
+
+    Raises:
+        ValueError: an invalid ticker, an unknown indicator, a period outside
+            the supported range, ``start`` after ``end``, or more than 15 years.
+        FMPSymbolUnknown: FMP has no such symbol.
+        FMPUnavailable: the provider could not answer.
+    """
+    (wanted,) = normalize_tickers([ticker])
+    name = indicator.strip().lower()
+    if name not in TECHNICAL_INDICATORS:
+        raise ValueError(
+            f"Unknown indicator {indicator!r}. Use one of: {', '.join(TECHNICAL_INDICATORS)}."
+        )
+    if not TECHNICAL_INDICATOR_MIN_PERIOD <= period <= TECHNICAL_INDICATOR_MAX_PERIOD:
+        raise ValueError(
+            f"period must be {TECHNICAL_INDICATOR_MIN_PERIOD}-{TECHNICAL_INDICATOR_MAX_PERIOD}."
+        )
+    if start > end:
+        raise ValueError("start must be on or before end.")
+    if end - start > _CLOSES_MAX_SPAN:
+        raise ValueError("Ask for at most 15 years of indicator values at a time.")
+    points = await asyncio.to_thread(_fmp_indicator_series, wanted, name, period, start, end)
+    if not points and not await _symbol_known(wanted):
+        raise FMPSymbolUnknown(f"FMP has no symbol {wanted}. Check the ticker.")
+    return TickerIndicatorSeriesResponse(ticker=wanted, indicator=name, period=period, points=points)
 
 
 def normalize_tickers(tickers: list[str]) -> list[str]:
@@ -630,6 +813,7 @@ async def coverage_for(tickers: list[str]) -> CoverageResponse:
         start=_iso(max(starts)) if have_window else None,
         end=_iso(min(ends)) if have_window else None,
         missing=missing,
+        max_window_days=settings.max_backtest_window_days,
     )
 
 

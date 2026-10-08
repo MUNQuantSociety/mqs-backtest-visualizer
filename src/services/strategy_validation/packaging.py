@@ -45,18 +45,22 @@ LOOKBACK_PARAM_SPEC: dict[str, Any] = {
 }
 
 
-def build_config(strategy_key_value: str) -> dict[str, Any]:
+def build_config(strategy_key_value: str, tickers: list[str] | None = None) -> dict[str, Any]:
     """The ``config.json`` stored beside an upload's source.
 
     Same shape as a built-in portfolio's config, because the engine reads it
     with the same code: ``BasePortfolio`` pulls PORTFOLIO_ID, TICKERS, WEIGHTS,
     INTERVAL, LOOKBACK_DAYS and DATA_FEEDS straight out of this dictionary.
+
+    ``tickers`` is the universe the author chose (already normalised); without
+    one the strategy trades ``DEFAULT_TICKERS``. Weights are always equal.
     """
-    weight = round(1.0 / len(DEFAULT_TICKERS), 6)
+    universe = list(tickers) if tickers else list(DEFAULT_TICKERS)
+    weight = round(1.0 / len(universe), 6)
     return {
         "PORTFOLIO_ID": strategy_key_value,
-        "TICKERS": list(DEFAULT_TICKERS),
-        "WEIGHTS": {ticker: weight for ticker in DEFAULT_TICKERS},
+        "TICKERS": universe,
+        "WEIGHTS": {ticker: weight for ticker in universe},
         "INTERVAL": DEFAULT_INTERVAL_SECONDS,
         "LOOKBACK_DAYS": DEFAULT_LOOKBACK_DAYS,
         "DATA_FEEDS": list(DEFAULT_DATA_FEEDS),

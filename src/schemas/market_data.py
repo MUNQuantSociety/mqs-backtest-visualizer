@@ -44,6 +44,10 @@ class CoverageResponse(CamelModel):
     end: str | None = None
     # Tickers with no bars at all. Empty is the normal case.
     missing: list[str] = []
+    # The longest window a run accepts, in days of `end - start`. Served here,
+    # beside the dates the form offers, so the form's presets follow the
+    # deployment's MAX_BACKTEST_WINDOW_DAYS instead of a copy of its default.
+    max_window_days: int | None = None
 
 
 class TickerValidation(CamelModel):
@@ -102,3 +106,64 @@ class TickerClosesResponse(CamelModel):
 
     ticker: str
     points: list[ClosePoint]
+
+
+class Candle(CamelModel):
+    """One daily OHLCV bar, dated by its New York trading session."""
+
+    date: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class TickerCandlesResponse(CamelModel):
+    """A ticker's daily candles over a window, oldest first: the Build chart."""
+
+    ticker: str
+    candles: list[Candle]
+
+
+class FmpIndicatorInfo(CamelModel):
+    """One FMP indicator a strategy can register as ``FmpIndicator``.
+
+    ``name`` is the value ``FmpIndicator`` and ``/indicator-series`` take.
+    ``pane`` says where a chart draws it: ``price`` lines share the candles'
+    scale, ``separate`` ones need their own panel. ``min_value``/``max_value``
+    bound a threshold a rule compares it with; null means unbounded.
+    """
+
+    name: str
+    label: str
+    short_label: str
+    pane: Literal["price", "separate"]
+    default_period: int
+    min_period: int
+    max_period: int
+    min_value: float | None = None
+    max_value: float | None = None
+
+
+class FmpIndicatorCatalogue(CamelModel):
+    items: list[FmpIndicatorInfo]
+
+
+class IndicatorPoint(CamelModel):
+    """One indicator value, dated by its New York trading session."""
+
+    date: str
+    value: float
+
+
+class TickerIndicatorSeriesResponse(CamelModel):
+    """One FMP indicator for one ticker over a window, oldest first.
+
+    The same values a backtest's ``FmpIndicator`` reads for those days.
+    """
+
+    ticker: str
+    indicator: str
+    period: int
+    points: list[IndicatorPoint]

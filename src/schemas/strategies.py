@@ -7,6 +7,7 @@ a backtest is one test of it.
 from __future__ import annotations
 
 from enum import Enum
+import json
 import keyword
 from typing import Any, Literal
 
@@ -23,6 +24,10 @@ MAX_SOURCE_BYTES = 256 * 1024
 # purpose: an OnData body is a method, and 64 KB of it is already far past
 # anything the editor is for. The assembled file still faces MAX_SOURCE_BYTES.
 MAX_BODY_BYTES = 64 * 1024
+
+# The no-code builder's rules, as JSON. Ample for five conditions a side; the
+# cap keeps an editing aid from becoming free storage on the registry row.
+MAX_RULES_BYTES = 16 * 1024
 
 # Indicator rows per draft. One instance per ticker is built for each, so this
 # is generous for anything the editor is for and still bounds the file size.
@@ -121,6 +126,9 @@ class StrategySubmission(CamelModel):
     description: str = Field(default="", max_length=500)
     source: str = Field(min_length=1)
     filename: str | None = None
+    # The universe the strategy trades; omitted means the default pair. Checked
+    # in the service, not here, so a bad symbol is one readable 422 sentence.
+    tickers: list[str] | None = None
 
     @field_validator("name", "description", mode="before")
     @classmethod
@@ -245,6 +253,8 @@ class StrategySource(CamelModel):
     body: str | None = None
     indicators: list["IndicatorSpec"] | None = None
     state: dict[str, Any] | None = None
+    # The no-code builder's rules, for a strategy built with it. Null otherwise.
+    rules: dict[str, Any] | None = None
 
 
 class IndicatorSpec(CamelModel):
@@ -359,6 +369,20 @@ class StrategyDraftSubmission(StrategyDraftRequest):
 
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=500)
+    # The no-code builder's rules this fragment was generated from, kept only
+    # so the builder can reopen them. Never read to decide what runs: the body
+    # above is checked, stored and executed exactly as a hand-written one.
+    rules: dict[str, Any] | None = None
+    # The universe the strategy trades, e.g. the Build tab's charted ticker.
+    # Omitted means the default pair. Checked in the service (one 422 sentence).
+    tickers: list[str] | None = None
+
+    @field_validator("rules")
+    @classmethod
+    def _rules_fit(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is not None and len(json.dumps(value)) > MAX_RULES_BYTES:
+            raise ValueError(f"rules are larger than {MAX_RULES_BYTES} bytes.")
+        return value
 
 
 class StrategyCheckResult(CamelModel):

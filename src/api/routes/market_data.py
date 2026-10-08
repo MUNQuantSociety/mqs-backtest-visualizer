@@ -14,12 +14,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from src.api.dependencies.current_user import require_current_user
 from src.schemas.market_data import (
     CoverageResponse,
+    FmpIndicatorCatalogue,
     SymbolSearchResponse,
+    TickerCandlesResponse,
+    TickerIndicatorSeriesResponse,
     TickerClosesResponse,
     TickerValidationResponse,
 )
 from src.services import market_data as market_data_service
-from src.services.market_data import FMPUnavailable, MarketDataUnavailable
+from src.services.market_data import FMPSymbolUnknown, FMPUnavailable, MarketDataUnavailable
 
 router = APIRouter(prefix="/market-data", tags=["market-data"])
 
@@ -74,6 +77,64 @@ async def get_closes(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
+@router.get("/candles", response_model=TickerCandlesResponse)
+async def get_candles(
+    ticker: str = Query(max_length=20, description="One FMP ticker symbol, e.g. AAPL."),
+    start: date = Query(description="First New York trading date, YYYY-MM-DD."),
+    end: date = Query(description="Last New York trading date, YYYY-MM-DD (inclusive)."),
+    _owner_id: uuid.UUID = Depends(require_current_user),
+) -> TickerCandlesResponse:
+    """A ticker's daily OHLCV candles, oldest first: the Build tab's chart.
+
+    Read from FMP, so it is gated like the other routes that spend provider
+    quota. An unknown symbol is a 404; a provider failure is a 503.
+    """
+    try:
+        return await market_data_service.candles_between(ticker, start, end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except FMPSymbolUnknown as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except FMPUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
+@router.get("/fmp-indicators", response_model=FmpIndicatorCatalogue)
+async def get_fmp_indicators() -> FmpIndicatorCatalogue:
+    """The FMP indicators a strategy can register as ``FmpIndicator``.
+
+    A fixed list with labels, chart placement, period limits and threshold
+    bounds, so the Build tab offers what the engine can fetch instead of a
+    copy of its own. Spends no provider quota, so it is not gated.
+    """
+    return market_data_service.fmp_indicator_catalogue()
+
+
+@router.get("/indicator-series", response_model=TickerIndicatorSeriesResponse)
+async def get_indicator_series(
+    ticker: str = Query(max_length=20, description="One FMP ticker symbol, e.g. AAPL."),
+    indicator: str = Query(max_length=32, description="An FMP indicator name from /fmp-indicators, e.g. rsi."),
+    period: int = Query(description="The indicator's period, e.g. 14."),
+    start: date = Query(description="First New York trading date, YYYY-MM-DD."),
+    end: date = Query(description="Last New York trading date, YYYY-MM-DD (inclusive)."),
+    _owner_id: uuid.UUID = Depends(require_current_user),
+) -> TickerIndicatorSeriesResponse:
+    """One FMP indicator's daily values, oldest first: a line on the Build chart.
+
+    The same values a backtest's ``FmpIndicator`` reads. Gated like the other
+    routes that spend provider quota. An unknown symbol is a 404; a provider
+    failure is a 503.
+    """
+    try:
+        return await market_data_service.indicator_series_between(ticker, indicator, period, start, end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except FMPSymbolUnknown as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except FMPUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
 
 
