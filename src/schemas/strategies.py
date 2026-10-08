@@ -126,6 +126,9 @@ class StrategySubmission(CamelModel):
     description: str = Field(default="", max_length=500)
     source: str = Field(min_length=1)
     filename: str | None = None
+    # The universe the strategy trades; omitted means the default pair. Checked
+    # in the service, not here, so a bad symbol is one readable 422 sentence.
+    tickers: list[str] | None = None
 
     @field_validator("name", "description", mode="before")
     @classmethod
@@ -370,6 +373,9 @@ class StrategyDraftSubmission(StrategyDraftRequest):
     # so the builder can reopen them. Never read to decide what runs: the body
     # above is checked, stored and executed exactly as a hand-written one.
     rules: dict[str, Any] | None = None
+    # The universe the strategy trades, e.g. the Build tab's charted ticker.
+    # Omitted means the default pair. Checked in the service (one 422 sentence).
+    tickers: list[str] | None = None
 
     @field_validator("rules")
     @classmethod

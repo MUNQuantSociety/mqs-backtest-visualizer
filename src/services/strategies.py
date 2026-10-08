@@ -43,6 +43,7 @@ from src.schemas.strategies import (
     StrategySource,
     StrategyTemplate,
 )
+from src.services import market_data as market_data_service
 from src.services import strategy_validation
 from src.services.strategy_validation import authoring
 from src.services.strategy_validation.scanning import declared_indicators
@@ -346,6 +347,7 @@ async def submit_draft(
             description=submission.description,
             source=assembled.source,
             filename=submission.filename,
+            tickers=submission.tickers,
         ),
         # Recorded so the editor can reopen this as the fragment it was, rather
         # than as the assembled file. Without it, editing a draft would hand
@@ -463,8 +465,9 @@ async def submit_strategy(
     # migration needs no startup hook of its own.
     await strategy_validation.migrate_staged_sources()
 
+    tickers = await _checked_universe(submission.tickers)
     key = _generate_key(submission.name)
-    config = strategy_validation.build_config(key)
+    config = strategy_validation.build_config(key, tickers)
     storage_key = await asyncio.to_thread(
         strategy_validation.store_strategy_source, key, submission.source, config
     )
@@ -504,6 +507,33 @@ async def submit_strategy(
         message=message,
         validation_run_id=run_id,
     )
+
+
+async def _checked_universe(tickers: list[str] | None) -> list[str] | None:
+    """The author's tickers, normalised and confirmed with FMP; None keeps the default.
+
+    Checked before anything is stored, so a typo leaves nothing behind. When
+    FMP cannot answer, the tickers are accepted: the validation run reports a
+    symbol with no history plainly, and refusing an upload because the
+    provider is down would be the worse failure.
+    """
+    if tickers is None:
+        return None
+    try:
+        wanted = market_data_service.normalize_tickers(tickers)
+    except ValueError as exc:
+        raise strategy_validation.StrategyValidationError(str(exc)) from None
+    try:
+        result = await market_data_service.validate_tickers(wanted)
+    except market_data_service.FMPUnavailable as exc:
+        logger.warning("UPLOAD | Ticker check skipped; provider unavailable: %s", exc)
+        return wanted
+    if result.unknown:
+        raise strategy_validation.StrategyValidationError(
+            f"FMP does not recognise {', '.join(result.unknown)}. Check the "
+            f"ticker{'s' if len(result.unknown) > 1 else ''} and try again."
+        )
+    return wanted
 
 
 async def _begin_validation(
