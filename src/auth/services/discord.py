@@ -2,8 +2,9 @@ import os
 
 import requests
 
+from src.auth.db import transaction
 from src.auth.jwt import create_discord_temp_token
-
+from src.auth.repository import get_mapped_roles
 
 # ------------------------------------------------------------------
 # CONFIGURATION
@@ -11,36 +12,6 @@ from src.auth.jwt import create_discord_temp_token
 
 DISCORD_REDIRECT_URI = os.environ["DISCORD_REDIRECT_URI"]
 
-
-# ------------------------------------------------------------------
-# DUMMY DATA
-# TODO: Replace with DiscordRoleMapping database table
-#
-# Future idea:
-#
-# DiscordRoleMapping
-# ------------------
-# discord_role_id
-# role_id
-#
-# The role_id would reference our application's Role table.
-# ------------------------------------------------------------------
-
-discord_role_mappings = {
-    "1280966301019410442": {
-        "discord_role_id": "1280966301019410442",
-        "role_name": "admin",
-    },
-    "1280966637583077438": {
-        "discord_role_id": "1280966637583077438",
-        "role_name": "developer",
-    },
-}
-
-
-# ------------------------------------------------------------------
-# DISCORD CLIENT
-# ------------------------------------------------------------------
 
 class DiscordAPIError(Exception):
     pass
@@ -153,22 +124,6 @@ discord_client = DiscordClient(
 )
 
 
-# ------------------------------------------------------------------
-# DUMMY ROLE HELPERS
-# ------------------------------------------------------------------
-
-def get_mapped_role(
-    discord_role_id: str,
-) -> dict | None:
-    return discord_role_mappings.get(
-        discord_role_id
-    )
-
-
-# ------------------------------------------------------------------
-# DISCORD REGISTRATION FLOW
-# ------------------------------------------------------------------
-
 def handle_discord_callback(code: str) -> str:
     token_response = discord_client.exchange_code(
         code,
@@ -177,29 +132,14 @@ def handle_discord_callback(code: str) -> str:
 
     discord_access_token = token_response["access_token"]
 
-    discord_user = discord_client.get_current_user(
-        discord_access_token
-    )
+    discord_user = discord_client.get_current_user(discord_access_token)
 
-    guild_member = discord_client.get_guild_member(
-        discord_access_token
-    )
+    guild_member = discord_client.get_guild_member(discord_access_token)
 
     discord_roles = guild_member["roles"]
 
-    print(discord_roles)
-
-    mapped_roles: list[str] = []
-
-    for discord_role_id in discord_roles:
-        role_mapping = get_mapped_role(
-            discord_role_id
-        )
-
-        if role_mapping is not None:
-            mapped_roles.append(
-                role_mapping["role_name"]
-            )
+    with transaction() as connection:
+        mapped_roles = get_mapped_roles(connection, discord_roles)
 
     return create_discord_temp_token(
         discord_user_id=discord_user["id"],

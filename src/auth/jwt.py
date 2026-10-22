@@ -5,36 +5,20 @@ from uuid import uuid4
 import jwt
 from jwt.exceptions import InvalidTokenError
 
+from src.auth import config 
 
 SECRET_KEY = os.environ["SECRET_KEY"]
 ALGORITHM = os.environ["ALGORITHM"]
 
-ACCESS_TOKEN_EXPIRE_MINUTES = int(
-    os.environ["ACCESS_TOKEN_EXPIRE_MINUTES"]
-)
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ["ACCESS_TOKEN_EXPIRE_MINUTES"])
 
-TEMP_TOKEN_EXPIRE_MINUTES = int(
-    os.environ["TEMP_TOKEN_EXPIRE_MINUTES"]
-)
+TEMP_TOKEN_EXPIRE_MINUTES = int(os.environ["TEMP_TOKEN_EXPIRE_MINUTES"])
 
-REFRESH_TOKEN_EXPIRE_DAYS = int(
-    os.environ["REFRESH_TOKEN_EXPIRE_DAYS"]
-)
-
-
-"""
-@params: user_id as string
-Note this function does not care if the user_id is valid and will
-always spit out a token for whatever user_id was provided
-
-@return: access_token for the user_id provided as string
-"""
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.environ["REFRESH_TOKEN_EXPIRE_DAYS"])
 
 
 def create_access_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-    )
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
     payload = {
         "sub": user_id,
@@ -49,19 +33,8 @@ def create_access_token(user_id: str) -> str:
     )
 
 
-"""
-@params: user_id as string
-Note this function does not care if the user_id is valid and will
-always spit out a token for whatever user_id was provided
-
-@return: refresh_token for the user_id provided as string
-"""
-
-
 def create_refresh_token(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(
-        days=REFRESH_TOKEN_EXPIRE_DAYS
-    )
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
 
     jti = str(uuid4())
 
@@ -77,13 +50,6 @@ def create_refresh_token(user_id: str) -> str:
         SECRET_KEY,
         algorithm=ALGORITHM,
     )
-
-
-"""
-@params: user_id as string
-@returns: access and refresh token
-Intentionally kept boring because why not!
-"""
 
 
 def obtain_token_pair(user_id: str) -> dict[str, str]:
@@ -127,12 +93,6 @@ def verify_access_token(
     }
 
 
-# TODO: Replace with database-backed refresh token revocation.
-# This in-memory set is only for development/v0.
-# It resets when the server restarts and is not shared between workers.
-refresh_blacklist: set[str] = set()
-
-
 def verify_refresh_token(
     refresh_token: str,
 ) -> dict | None:
@@ -144,30 +104,26 @@ def verify_refresh_token(
     if payload["type"] != "refresh":
         return None
 
-    if not payload.get("jti"):
+    if not isinstance(payload.get("jti"), str) or not payload["jti"]:
         return None
 
-    if payload["jti"] in refresh_blacklist:
+    try:
+        payload["expires_at"] = datetime.fromtimestamp(payload["exp"], timezone.utc)
+    except (ValueError, TypeError, OverflowError, OSError):
         return None
 
     return {
         "user_id": payload["sub"],
         "jti": payload["jti"],
+        "expires_at": payload["expires_at"],
     }
-
-
-# TODO: Replace with database-backed refresh token revocation.
-def blacklist_refresh_token(jti: str) -> None:
-    refresh_blacklist.add(jti)
 
 
 def create_discord_temp_token(
     discord_user_id: str,
     roles: list[str],
 ) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=TEMP_TOKEN_EXPIRE_MINUTES
-    )
+    expire = datetime.now(timezone.utc) + timedelta(minutes=TEMP_TOKEN_EXPIRE_MINUTES)
 
     payload = {
         "sub": discord_user_id,
