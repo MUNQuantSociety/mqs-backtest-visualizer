@@ -26,9 +26,34 @@ from engine.contracts.errors import EngineError, NoMarketData
 logger = logging.getLogger(__name__)
 ENDPOINT = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 SYMBOL_ENDPOINT = "https://financialmodelingprep.com/stable/search-symbol"
+TREASURY_ENDPOINT = "https://financialmodelingprep.com/stable/treasury-rates"
+# FMP's Treasury yield fields, shortest maturity first, with each one's length in years.
+TREASURY_MATURITIES = (
+    ("month1", 1 / 12), ("month2", 2 / 12), ("month3", 3 / 12), ("month6", 6 / 12),
+    ("year1", 1), ("year2", 2), ("year3", 3), ("year5", 5), ("year7", 7),
+    ("year10", 10), ("year20", 20), ("year30", 30),
+)
 NAME_ENDPOINT = "https://financialmodelingprep.com/stable/search-name"
 INTRADAY_ENDPOINT = "https://financialmodelingprep.com/stable/historical-chart/{interval}"
 INTRADAY_INTERVALS = frozenset({"1min", "5min", "15min", "30min", "1hour"})
+TECHNICAL_INDICATOR_ENDPOINT = "https://financialmodelingprep.com/stable/technical-indicators/{name}"
+# FMP's indicator name -> the row field its value arrives in.
+TECHNICAL_INDICATORS = {
+    "sma": "sma",
+    "ema": "ema",
+    "wma": "wma",
+    "dema": "dema",
+    "tema": "tema",
+    "rsi": "rsi",
+    "standarddeviation": "standardDeviation",
+    "williams": "williams",
+    "adx": "adx",
+}
+TECHNICAL_INDICATOR_MIN_PERIOD = 2
+TECHNICAL_INDICATOR_MAX_PERIOD = 250
+# FMP answers at most ~1,253 daily rows per request and silently drops the
+# oldest beyond that. A response this long may be truncated, so it is refused.
+TECHNICAL_INDICATOR_MAX_ROWS = 1250
 SYMBOL_SEARCH_LIMIT = 100
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
@@ -154,6 +179,32 @@ class FMPMarketData:
             raise FMPUnavailable(f"FMP returned invalid symbol metadata for {query}. Retry shortly.")
         return rows
 
+    def get_treasury_rates(self, start: date, end: date) -> list[dict]:
+        """US Treasury yields in percent for each day from ``start`` to ``end``, newest first.
+
+        Each row has a ``date`` and the ``TREASURY_MATURITIES`` fields. A field
+        FMP leaves out or answers with a non-number is dropped from its row
+        rather than failing the request: one missing maturity still leaves the
+        rest of the curve usable.
+        """
+        rows = self._request_list(
+            TREASURY_ENDPOINT, {"from": start.isoformat(), "to": end.isoformat()},
+            label="Treasury rates",
+        )
+        curves = []
+        for row in rows:
+            try:
+                day = date.fromisoformat(str(row["date"])[:10])
+            except (KeyError, ValueError):
+                raise FMPUnavailable("FMP returned an invalid Treasury rate row. Retry shortly.") from None
+            curve = {"date": day}
+            for field, _years in TREASURY_MATURITIES:
+                value = row.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    curve[field] = float(value)
+            curves.append(curve)
+        return sorted(curves, key=lambda curve: curve["date"], reverse=True)
+
     def symbol_exists(self, ticker: str) -> bool:
         """Recognize an exact provider symbol independently of its daily history."""
         rows = self.search_symbols(ticker)
@@ -183,6 +234,66 @@ class FMPMarketData:
             {"symbol": ticker, "from": start.isoformat(), "to": end.isoformat()},
             label=f"{interval} history for {ticker}",
         )
+
+    def get_technical_indicator(
+        self, ticker: str, name: str, period: int, start: date, end: date
+    ) -> list[tuple[date, float]]:
+        """One daily indicator series from FMP, oldest first, both dates inclusive.
+
+        FMP seeds the calculation near ``start``, so EMA-style values (EMA,
+        RSI, ADX, ...) only settle some time after it: callers that need the
+        same number from two requests must start both well before the dates
+        they read (see ``engine.indicators.fmp_indicator``). Rows FMP leaves
+        empty (the first ``period`` sessions after a listing) are skipped.
+
+        Raises:
+            ValueError: unknown ``name``, a period outside the supported range,
+                or ``start`` after ``end``.
+            FMPUnavailable: the provider failed, answered garbage, or returned
+                so many rows that the window may have been truncated.
+        """
+        field = TECHNICAL_INDICATORS.get(name)
+        if field is None:
+            raise ValueError(
+                f"Unknown FMP indicator {name!r}; expected one of {', '.join(TECHNICAL_INDICATORS)}."
+            )
+        if not TECHNICAL_INDICATOR_MIN_PERIOD <= period <= TECHNICAL_INDICATOR_MAX_PERIOD:
+            raise ValueError(
+                f"Indicator period must be {TECHNICAL_INDICATOR_MIN_PERIOD}-"
+                f"{TECHNICAL_INDICATOR_MAX_PERIOD}, got {period}."
+            )
+        start, end = _day(start), _day(end)
+        if start > end:
+            raise ValueError("FMP indicator start must be on or before end.")
+
+        label = f"{name}({period}) for {ticker}"
+        payload = self._request_list(
+            TECHNICAL_INDICATOR_ENDPOINT.format(name=name),
+            {"symbol": ticker, "periodLength": period, "timeframe": "1day",
+             "from": start.isoformat(), "to": end.isoformat()},
+            label=label,
+        )
+        if len(payload) >= TECHNICAL_INDICATOR_MAX_ROWS:
+            raise FMPUnavailable(
+                f"FMP {label} returned {len(payload)} rows, which may be truncated. "
+                "Request a shorter window."
+            )
+        series = {}
+        for raw in payload:
+            value = raw.get(field)
+            if value is None:
+                continue
+            try:
+                day = date.fromisoformat(str(raw["date"])[:10])
+                number = float(value)
+                if not math.isfinite(number):
+                    raise ValueError("non-finite value")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                raise FMPUnavailable(f"FMP returned an invalid {label} value. Retry shortly.") from None
+            if start <= day <= end:
+                series[day] = number
+        logger.info("FMP | Fetched indicator; %s window=%s..%s rows=%d", label, start, end, len(series))
+        return sorted(series.items())
 
     def get_historical_data(self, tickers, from_date, to_date) -> list[dict]:
         """Daily OHLCV records for each symbol; both exchange dates inclusive."""
