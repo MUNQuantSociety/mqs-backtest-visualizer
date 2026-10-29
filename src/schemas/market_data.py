@@ -167,3 +167,20 @@ class TickerIndicatorSeriesResponse(CamelModel):
     indicator: str
     period: int
     points: list[IndicatorPoint]
+
+
+class TreasuryYield(CamelModel):
+    """One maturity on the US Treasury yield curve."""
+
+    # Short label for a button, e.g. "3M" or "10Y".
+    term: str
+    years: float
+    # A yearly rate in percent, as FMP gives it: 4.25 means 4.25%.
+    rate_percent: float
+
+
+class TreasuryRatesResponse(CamelModel):
+    """The latest Treasury yield curve: a real rate for the financial calculator."""
+
+    date: str
+    yields: list[TreasuryYield]

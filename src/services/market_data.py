@@ -21,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from engine.data import yahoo
 from engine.data.fmp import FMPMarketData, FMPSymbolUnknown, fetch_daily_history, market_data_source
+from engine.data.fmp import TREASURY_MATURITIES
 from engine.data.fmp import FMPUnavailable as FMPUnavailable
 from engine.data.fmp import (
     TECHNICAL_INDICATOR_MAX_PERIOD,
@@ -42,6 +43,8 @@ from src.schemas.market_data import (
     FmpIndicatorInfo,
     IndicatorPoint,
     TickerCandlesResponse,
+    TreasuryRatesResponse,
+    TreasuryYield,
     TickerIndicatorSeriesResponse,
     TickerClosesResponse,
     CoverageResponse,
@@ -240,6 +243,56 @@ def _fmp_candles(ticker: str, start: date, end: date) -> list[Candle]:
         while len(_candles_cache) > _CANDLES_CACHE_SIZE:
             _candles_cache.popitem(last=False)
     return candles
+
+
+# The Treasury curve for the calculator. Rates move once a day, so an hour's
+# cache keeps every visit after the first free. Two weeks back covers a long
+# weekend plus FMP publishing a day or two late.
+_TREASURY_TTL_SECONDS = 3600
+_TREASURY_LOOKBACK = timedelta(days=14)
+_treasury_cache: tuple[float, TreasuryRatesResponse] | None = None
+_treasury_lock = threading.Lock()
+
+
+def _term(field: str) -> str:
+    """``month3`` -> ``3M``, ``year10`` -> ``10Y``."""
+    return field.replace("month", "") + "M" if field.startswith("month") else field.replace("year", "") + "Y"
+
+
+def _fmp_treasury_rates() -> TreasuryRatesResponse:
+    global _treasury_cache
+    with _treasury_lock:
+        if _treasury_cache is not None and _treasury_cache[0] > time.monotonic():
+            return _treasury_cache[1]
+    today = datetime.now(_EXCHANGE_TZ).date()
+    with _symbol_requests:
+        curves = FMPMarketData().get_treasury_rates(today - _TREASURY_LOOKBACK, today)
+    # The newest day with a usable curve; a day missing every maturity is skipped.
+    latest = next(
+        (curve for curve in curves if any(field in curve for field, _ in TREASURY_MATURITIES)), None
+    )
+    if latest is None:
+        raise FMPUnavailable("FMP has no Treasury rates for the last two weeks. Retry later.")
+    response = TreasuryRatesResponse(
+        date=latest["date"].isoformat(),
+        yields=[
+            TreasuryYield(term=_term(field), years=years, rate_percent=latest[field])
+            for field, years in TREASURY_MATURITIES
+            if field in latest
+        ],
+    )
+    with _treasury_lock:
+        _treasury_cache = (time.monotonic() + _TREASURY_TTL_SECONDS, response)
+    return response
+
+
+async def treasury_rates() -> TreasuryRatesResponse:
+    """The latest US Treasury yield curve from FMP, shortest maturity first.
+
+    Raises:
+        FMPUnavailable: FMP could not answer, or had no rates for two weeks.
+    """
+    return await asyncio.to_thread(_fmp_treasury_rates)
 
 
 async def candles_between(ticker: str, start: date, end: date) -> TickerCandlesResponse:
