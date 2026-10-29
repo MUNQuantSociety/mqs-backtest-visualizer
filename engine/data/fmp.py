@@ -26,6 +26,13 @@ from engine.contracts.errors import EngineError, NoMarketData
 logger = logging.getLogger(__name__)
 ENDPOINT = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 SYMBOL_ENDPOINT = "https://financialmodelingprep.com/stable/search-symbol"
+TREASURY_ENDPOINT = "https://financialmodelingprep.com/stable/treasury-rates"
+# FMP's Treasury yield fields, shortest maturity first, with each one's length in years.
+TREASURY_MATURITIES = (
+    ("month1", 1 / 12), ("month2", 2 / 12), ("month3", 3 / 12), ("month6", 6 / 12),
+    ("year1", 1), ("year2", 2), ("year3", 3), ("year5", 5), ("year7", 7),
+    ("year10", 10), ("year20", 20), ("year30", 30),
+)
 NAME_ENDPOINT = "https://financialmodelingprep.com/stable/search-name"
 INTRADAY_ENDPOINT = "https://financialmodelingprep.com/stable/historical-chart/{interval}"
 INTRADAY_INTERVALS = frozenset({"1min", "5min", "15min", "30min", "1hour"})
@@ -171,6 +178,32 @@ class FMPMarketData:
         if any(not isinstance(row.get("symbol"), str) or not row["symbol"].strip() for row in rows):
             raise FMPUnavailable(f"FMP returned invalid symbol metadata for {query}. Retry shortly.")
         return rows
+
+    def get_treasury_rates(self, start: date, end: date) -> list[dict]:
+        """US Treasury yields in percent for each day from ``start`` to ``end``, newest first.
+
+        Each row has a ``date`` and the ``TREASURY_MATURITIES`` fields. A field
+        FMP leaves out or answers with a non-number is dropped from its row
+        rather than failing the request: one missing maturity still leaves the
+        rest of the curve usable.
+        """
+        rows = self._request_list(
+            TREASURY_ENDPOINT, {"from": start.isoformat(), "to": end.isoformat()},
+            label="Treasury rates",
+        )
+        curves = []
+        for row in rows:
+            try:
+                day = date.fromisoformat(str(row["date"])[:10])
+            except (KeyError, ValueError):
+                raise FMPUnavailable("FMP returned an invalid Treasury rate row. Retry shortly.") from None
+            curve = {"date": day}
+            for field, _years in TREASURY_MATURITIES:
+                value = row.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    curve[field] = float(value)
+            curves.append(curve)
+        return sorted(curves, key=lambda curve: curve["date"], reverse=True)
 
     def symbol_exists(self, ticker: str) -> bool:
         """Recognize an exact provider symbol independently of its daily history."""
