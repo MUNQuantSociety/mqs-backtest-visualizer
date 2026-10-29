@@ -17,6 +17,7 @@ from src.schemas.market_data import (
     FmpIndicatorCatalogue,
     SymbolSearchResponse,
     TickerCandlesResponse,
+    TreasuryRatesResponse,
     TickerIndicatorSeriesResponse,
     TickerClosesResponse,
     TickerValidationResponse,
@@ -77,6 +78,21 @@ async def get_closes(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except MarketDataUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
+@router.get("/treasury-rates", response_model=TreasuryRatesResponse)
+async def get_treasury_rates(
+    _owner_id: uuid.UUID = Depends(require_current_user),
+) -> TreasuryRatesResponse:
+    """The latest US Treasury yield curve, for the financial calculator's rates.
+
+    From FMP, so gated like the other routes that spend provider quota;
+    cached for an hour. A provider failure is a 503.
+    """
+    try:
+        return await market_data_service.treasury_rates()
+    except FMPUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
 
 
