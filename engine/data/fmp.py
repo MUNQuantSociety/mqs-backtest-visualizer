@@ -13,7 +13,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -26,9 +26,52 @@ from engine.contracts.errors import EngineError, NoMarketData
 logger = logging.getLogger(__name__)
 ENDPOINT = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 SYMBOL_ENDPOINT = "https://financialmodelingprep.com/stable/search-symbol"
+TREASURY_ENDPOINT = "https://financialmodelingprep.com/stable/treasury-rates"
+# FMP's Treasury yield fields, shortest maturity first, with each one's length in years.
+TREASURY_MATURITIES = (
+    ("month1", 1 / 12), ("month2", 2 / 12), ("month3", 3 / 12), ("month6", 6 / 12),
+    ("year1", 1), ("year2", 2), ("year3", 3), ("year5", 5), ("year7", 7),
+    ("year10", 10), ("year20", 20), ("year30", 30),
+)
 NAME_ENDPOINT = "https://financialmodelingprep.com/stable/search-name"
 INTRADAY_ENDPOINT = "https://financialmodelingprep.com/stable/historical-chart/{interval}"
 INTRADAY_INTERVALS = frozenset({"1min", "5min", "15min", "30min", "1hour"})
+TECHNICAL_INDICATOR_ENDPOINT = "https://financialmodelingprep.com/stable/technical-indicators/{name}"
+# FMP's indicator name -> the row field its value arrives in.
+TECHNICAL_INDICATORS = {
+    "sma": "sma",
+    "ema": "ema",
+    "wma": "wma",
+    "dema": "dema",
+    "tema": "tema",
+    "rsi": "rsi",
+    "standarddeviation": "standardDeviation",
+    "williams": "williams",
+    "adx": "adx",
+}
+TECHNICAL_INDICATOR_MIN_PERIOD = 2
+TECHNICAL_INDICATOR_MAX_PERIOD = 250
+# FMP answers at most ~1,253 daily rows per request and silently drops the
+# oldest beyond that. A response this long may be truncated, so it is refused.
+TECHNICAL_INDICATOR_MAX_ROWS = 1250
+QUOTE_ENDPOINT = "https://financialmodelingprep.com/stable/batch-quote"
+PROFILE_ENDPOINT = "https://financialmodelingprep.com/stable/profile"
+QUOTE_MAX_SYMBOLS = 50
+# FMP quote field -> the key get_quotes() returns it under. All optional:
+# FMP leaves some empty (an index has no market cap).
+_QUOTE_NUMBERS = {
+    "change": "change",
+    "open": "open",
+    "previousClose": "previous_close",
+    "dayHigh": "day_high",
+    "dayLow": "day_low",
+    "yearHigh": "year_high",
+    "yearLow": "year_low",
+    "volume": "volume",
+    "marketCap": "market_cap",
+    "priceAvg50": "average_50",
+    "priceAvg200": "average_200",
+}
 SYMBOL_SEARCH_LIMIT = 100
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
@@ -61,6 +104,40 @@ def _day(value) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
+
+
+def _optional_number(value) -> float | None:
+    """A finite number, or None for an empty field; anything else is malformed."""
+    if value is None or value == "":
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non-finite number")
+    return number
+
+
+def _parse_quote(raw: dict) -> dict | None:
+    """One batch-quote row in this module's shape, or None when it is unusable."""
+    try:
+        symbol = str(raw["symbol"]).strip().upper()
+        price = _optional_number(raw.get("price"))
+        if not symbol or price is None or price <= 0:
+            return None
+        quote = {
+            "ticker": symbol,
+            "name": str(raw["name"]).strip() if raw.get("name") else None,
+            "exchange": str(raw["exchange"]).strip() if raw.get("exchange") else None,
+            "price": price,
+        }
+        for field, key in _QUOTE_NUMBERS.items():
+            quote[key] = _optional_number(raw.get(field))
+        percent = _optional_number(raw.get("changePercentage"))
+        quote["change_ratio"] = None if percent is None else percent / 100
+        stamp = _optional_number(raw.get("timestamp"))
+        quote["as_of"] = None if stamp is None else datetime.fromtimestamp(stamp, tz=timezone.utc)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+    return quote
 
 
 class FMPMarketData:
@@ -154,6 +231,32 @@ class FMPMarketData:
             raise FMPUnavailable(f"FMP returned invalid symbol metadata for {query}. Retry shortly.")
         return rows
 
+    def get_treasury_rates(self, start: date, end: date) -> list[dict]:
+        """US Treasury yields in percent for each day from ``start`` to ``end``, newest first.
+
+        Each row has a ``date`` and the ``TREASURY_MATURITIES`` fields. A field
+        FMP leaves out or answers with a non-number is dropped from its row
+        rather than failing the request: one missing maturity still leaves the
+        rest of the curve usable.
+        """
+        rows = self._request_list(
+            TREASURY_ENDPOINT, {"from": start.isoformat(), "to": end.isoformat()},
+            label="Treasury rates",
+        )
+        curves = []
+        for row in rows:
+            try:
+                day = date.fromisoformat(str(row["date"])[:10])
+            except (KeyError, ValueError):
+                raise FMPUnavailable("FMP returned an invalid Treasury rate row. Retry shortly.") from None
+            curve = {"date": day}
+            for field, _years in TREASURY_MATURITIES:
+                value = row.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                    curve[field] = float(value)
+            curves.append(curve)
+        return sorted(curves, key=lambda curve: curve["date"], reverse=True)
+
     def symbol_exists(self, ticker: str) -> bool:
         """Recognize an exact provider symbol independently of its daily history."""
         rows = self.search_symbols(ticker)
@@ -183,6 +286,105 @@ class FMPMarketData:
             {"symbol": ticker, "from": start.isoformat(), "to": end.isoformat()},
             label=f"{interval} history for {ticker}",
         )
+
+    def get_technical_indicator(
+        self, ticker: str, name: str, period: int, start: date, end: date
+    ) -> list[tuple[date, float]]:
+        """One daily indicator series from FMP, oldest first, both dates inclusive.
+
+        FMP seeds the calculation near ``start``, so EMA-style values (EMA,
+        RSI, ADX, ...) only settle some time after it: callers that need the
+        same number from two requests must start both well before the dates
+        they read (see ``engine.indicators.fmp_indicator``). Rows FMP leaves
+        empty (the first ``period`` sessions after a listing) are skipped.
+
+        Raises:
+            ValueError: unknown ``name``, a period outside the supported range,
+                or ``start`` after ``end``.
+            FMPUnavailable: the provider failed, answered garbage, or returned
+                so many rows that the window may have been truncated.
+        """
+        field = TECHNICAL_INDICATORS.get(name)
+        if field is None:
+            raise ValueError(
+                f"Unknown FMP indicator {name!r}; expected one of {', '.join(TECHNICAL_INDICATORS)}."
+            )
+        if not TECHNICAL_INDICATOR_MIN_PERIOD <= period <= TECHNICAL_INDICATOR_MAX_PERIOD:
+            raise ValueError(
+                f"Indicator period must be {TECHNICAL_INDICATOR_MIN_PERIOD}-"
+                f"{TECHNICAL_INDICATOR_MAX_PERIOD}, got {period}."
+            )
+        start, end = _day(start), _day(end)
+        if start > end:
+            raise ValueError("FMP indicator start must be on or before end.")
+
+        label = f"{name}({period}) for {ticker}"
+        payload = self._request_list(
+            TECHNICAL_INDICATOR_ENDPOINT.format(name=name),
+            {"symbol": ticker, "periodLength": period, "timeframe": "1day",
+             "from": start.isoformat(), "to": end.isoformat()},
+            label=label,
+        )
+        if len(payload) >= TECHNICAL_INDICATOR_MAX_ROWS:
+            raise FMPUnavailable(
+                f"FMP {label} returned {len(payload)} rows, which may be truncated. "
+                "Request a shorter window."
+            )
+        series = {}
+        for raw in payload:
+            value = raw.get(field)
+            if value is None:
+                continue
+            try:
+                day = date.fromisoformat(str(raw["date"])[:10])
+                number = float(value)
+                if not math.isfinite(number):
+                    raise ValueError("non-finite value")
+            except (KeyError, TypeError, ValueError, OverflowError):
+                raise FMPUnavailable(f"FMP returned an invalid {label} value. Retry shortly.") from None
+            if start <= day <= end:
+                series[day] = number
+        logger.info("FMP | Fetched indicator; %s window=%s..%s rows=%d", label, start, end, len(series))
+        return sorted(series.items())
+
+    def get_quotes(self, tickers: list[str]) -> list[dict]:
+        """The latest quote for each symbol FMP lists, in one request.
+
+        Symbols FMP does not list are absent from the answer, and so is a row
+        too malformed to show. FMP's ``changePercentage`` is in percent; it is
+        returned as ``change_ratio`` (-0.0142 for -1.42%) like every other
+        ratio in this API. ``as_of`` is the quote's time in UTC.
+
+        Raises:
+            ValueError: no symbols, or more than ``QUOTE_MAX_SYMBOLS``.
+            FMPUnavailable: the provider failed or did not answer with a list.
+        """
+        wanted = list(dict.fromkeys(str(t).strip().upper() for t in tickers if str(t).strip()))
+        if not 1 <= len(wanted) <= QUOTE_MAX_SYMBOLS:
+            raise ValueError(f"Ask for between 1 and {QUOTE_MAX_SYMBOLS} quotes at a time.")
+        payload = self._request_list(
+            QUOTE_ENDPOINT, {"symbols": ",".join(wanted)}, label=f"quotes for {len(wanted)} symbols"
+        )
+        quotes = []
+        for raw in payload:
+            quote = _parse_quote(raw)
+            if quote is None:
+                logger.warning("FMP | Skipped a malformed quote row for %r", raw.get("symbol"))
+            elif quote["ticker"] in wanted:
+                quotes.append(quote)
+        logger.info("FMP | Fetched quotes; asked=%d answered=%d", len(wanted), len(quotes))
+        return quotes
+
+    def is_etf(self, ticker: str) -> bool | None:
+        """Whether FMP's company profile marks ``ticker`` as an ETF.
+
+        None when FMP has no profile for it (crypto, an unknown symbol) or the
+        flag is missing. One symbol per request: the profile endpoint does not
+        accept a list.
+        """
+        rows = self._request_list(PROFILE_ENDPOINT, {"symbol": ticker}, label=f"profile for {ticker}")
+        flag = rows[0].get("isEtf") if rows else None
+        return flag if isinstance(flag, bool) else None
 
     def get_historical_data(self, tickers, from_date, to_date) -> list[dict]:
         """Daily OHLCV records for each symbol; both exchange dates inclusive."""

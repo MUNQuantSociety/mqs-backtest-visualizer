@@ -467,6 +467,7 @@ Pydantic models in `src/schemas/`.
 | `POST` | `/api/strategies/upload/check` | *nothing* | `POST /strategies/check` for a file. Same verdict semantics: `200` either way, problems listed by line. |
 | `GET` | `/api/strategies/{key}` | **Postgres** | One strategy **including the ones the catalogue hides**. `validationState` is the real lifecycle (`validating` / `active` / `failed_validation`), `validationRunId` the backtest to open for progress or the failure reason. This is how a client watches an upload. `404` if unknown. |
 | `GET` | `/api/market-data/validate-tickers` | **FMP** | Authenticated exact symbol recognition for 1–50 comma-separated `tickers`; returns `valid`/`unknown` per ticker and an `unknown` list. |
+| `GET` | `/api/market-data/candles` | **FMP** | Authenticated daily OHLCV candles for one `ticker` from `start` to `end` (inclusive, at most 15 years), oldest first; cached 15 minutes per window. The frontend's Build tab charts these. `404` for a symbol FMP rejects, `503` when FMP is unavailable. |
 | `GET` | `/api/market-data/coverage` | **FMP by default** | Historical date bounds for `tickers` or `strategyKey`; no-history is separate from symbol recognition. Explicit legacy database mode remains available for isolated tests. |
 | `GET` | `/api/live/portfolios` | *sample data* | Live portfolio list. |
 | `GET` | `/api/live/portfolios/{id}` | *sample data* | Detail — config, positions. |

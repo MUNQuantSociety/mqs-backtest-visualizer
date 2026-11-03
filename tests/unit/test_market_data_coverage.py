@@ -119,6 +119,20 @@ def test_one_ticker_is_its_own_window(stub_repo) -> None:
     assert (result.start, result.end) == ("2019-11-11", "2026-07-15")
 
 
+def test_coverage_reports_the_longest_window_a_run_accepts(stub_repo, monkeypatch) -> None:
+    """The form's presets read this, so it must be the validator's own limit."""
+    monkeypatch.setattr(
+        market_data_service,
+        "settings",
+        replace(market_data_service.settings, max_backtest_window_days=730),
+    )
+    stub_repo({"AAPL": (date(2019, 11, 11), date(2026, 7, 15))})
+
+    result = asyncio.run(market_data_service.coverage_for(["AAPL"]))
+
+    assert result.max_window_days == 730
+
+
 def test_dates_are_iso_strings_not_date_objects(stub_repo) -> None:
     """The client parses these with Zod; a date object would serialise wrong."""
     stub_repo({"AAPL": (date(2020, 1, 2), date(2026, 7, 15))})
@@ -135,7 +149,7 @@ def test_dates_are_iso_strings_not_date_objects(stub_repo) -> None:
 
 
 def test_coverage_keys_are_camel_case() -> None:
-    assert _aliases(CoverageResponse) == {"tickers", "start", "end", "missing"}
+    assert _aliases(CoverageResponse) == {"tickers", "start", "end", "missing", "maxWindowDays"}
     assert _aliases(TickerCoverage) == {"ticker", "firstBar", "lastBar"}
 
 
