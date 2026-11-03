@@ -126,6 +126,47 @@ class TickerCandlesResponse(CamelModel):
     candles: list[Candle]
 
 
+class Quote(CamelModel):
+    """One ticker's latest quote from FMP: a row of the Stock Screener.
+
+    ``change_ratio`` is a ratio like every other in this API (-0.0142 is
+    -1.42%), against ``previous_close``. ``kind`` groups the screener's rows;
+    an ``index`` (^VIX, ^GSPC) has no market cap or real volume, and FMP
+    reports those as 0. Fields FMP leaves empty are null. ``as_of`` is the
+    quote's UTC time.
+    """
+
+    ticker: str
+    name: str | None = None
+    exchange: str | None = None
+    kind: Literal["stock", "etf", "index", "crypto"]
+    price: float
+    change: float | None = None
+    change_ratio: float | None = None
+    open: float | None = None
+    previous_close: float | None = None
+    day_high: float | None = None
+    day_low: float | None = None
+    year_high: float | None = None
+    year_low: float | None = None
+    volume: float | None = None
+    market_cap: float | None = None
+    average_50: float | None = None
+    average_200: float | None = None
+    as_of: str | None = None
+
+
+class QuotesResponse(CamelModel):
+    """Quotes in the order the tickers were asked for.
+
+    ``missing`` names the tickers FMP had no quote for, so the screener can
+    say so instead of silently dropping a row.
+    """
+
+    quotes: list[Quote]
+    missing: list[str]
+
+
 class FmpIndicatorInfo(CamelModel):
     """One FMP indicator a strategy can register as ``FmpIndicator``.
 
