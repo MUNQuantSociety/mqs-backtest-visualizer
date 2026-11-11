@@ -27,7 +27,8 @@ pytz>=2024.1
 # an import statement — and the cache layer swallows the failure, so without it
 # the only symptom is that every run silently re-queries a remote database
 # instead of hitting a warm cache.
-pyarrow>=15.0
+# Capped below 26: pyarrow 26 needs NumPy 2, and numpy is pinned to 1.26 above.
+pyarrow>=15.0,<26
 
 # Not installed, listed so the omission is a decision rather than an oversight.
 # Both are imported by vendored engine code, inside the functions that need

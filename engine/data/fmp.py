@@ -13,7 +13,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -54,6 +54,24 @@ TECHNICAL_INDICATOR_MAX_PERIOD = 250
 # FMP answers at most ~1,253 daily rows per request and silently drops the
 # oldest beyond that. A response this long may be truncated, so it is refused.
 TECHNICAL_INDICATOR_MAX_ROWS = 1250
+QUOTE_ENDPOINT = "https://financialmodelingprep.com/stable/batch-quote"
+PROFILE_ENDPOINT = "https://financialmodelingprep.com/stable/profile"
+QUOTE_MAX_SYMBOLS = 50
+# FMP quote field -> the key get_quotes() returns it under. All optional:
+# FMP leaves some empty (an index has no market cap).
+_QUOTE_NUMBERS = {
+    "change": "change",
+    "open": "open",
+    "previousClose": "previous_close",
+    "dayHigh": "day_high",
+    "dayLow": "day_low",
+    "yearHigh": "year_high",
+    "yearLow": "year_low",
+    "volume": "volume",
+    "marketCap": "market_cap",
+    "priceAvg50": "average_50",
+    "priceAvg200": "average_200",
+}
 SYMBOL_SEARCH_LIMIT = 100
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
@@ -86,6 +104,40 @@ def _day(value) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
+
+
+def _optional_number(value) -> float | None:
+    """A finite number, or None for an empty field; anything else is malformed."""
+    if value is None or value == "":
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("non-finite number")
+    return number
+
+
+def _parse_quote(raw: dict) -> dict | None:
+    """One batch-quote row in this module's shape, or None when it is unusable."""
+    try:
+        symbol = str(raw["symbol"]).strip().upper()
+        price = _optional_number(raw.get("price"))
+        if not symbol or price is None or price <= 0:
+            return None
+        quote = {
+            "ticker": symbol,
+            "name": str(raw["name"]).strip() if raw.get("name") else None,
+            "exchange": str(raw["exchange"]).strip() if raw.get("exchange") else None,
+            "price": price,
+        }
+        for field, key in _QUOTE_NUMBERS.items():
+            quote[key] = _optional_number(raw.get(field))
+        percent = _optional_number(raw.get("changePercentage"))
+        quote["change_ratio"] = None if percent is None else percent / 100
+        stamp = _optional_number(raw.get("timestamp"))
+        quote["as_of"] = None if stamp is None else datetime.fromtimestamp(stamp, tz=timezone.utc)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+    return quote
 
 
 class FMPMarketData:
@@ -294,6 +346,45 @@ class FMPMarketData:
                 series[day] = number
         logger.info("FMP | Fetched indicator; %s window=%s..%s rows=%d", label, start, end, len(series))
         return sorted(series.items())
+
+    def get_quotes(self, tickers: list[str]) -> list[dict]:
+        """The latest quote for each symbol FMP lists, in one request.
+
+        Symbols FMP does not list are absent from the answer, and so is a row
+        too malformed to show. FMP's ``changePercentage`` is in percent; it is
+        returned as ``change_ratio`` (-0.0142 for -1.42%) like every other
+        ratio in this API. ``as_of`` is the quote's time in UTC.
+
+        Raises:
+            ValueError: no symbols, or more than ``QUOTE_MAX_SYMBOLS``.
+            FMPUnavailable: the provider failed or did not answer with a list.
+        """
+        wanted = list(dict.fromkeys(str(t).strip().upper() for t in tickers if str(t).strip()))
+        if not 1 <= len(wanted) <= QUOTE_MAX_SYMBOLS:
+            raise ValueError(f"Ask for between 1 and {QUOTE_MAX_SYMBOLS} quotes at a time.")
+        payload = self._request_list(
+            QUOTE_ENDPOINT, {"symbols": ",".join(wanted)}, label=f"quotes for {len(wanted)} symbols"
+        )
+        quotes = []
+        for raw in payload:
+            quote = _parse_quote(raw)
+            if quote is None:
+                logger.warning("FMP | Skipped a malformed quote row for %r", raw.get("symbol"))
+            elif quote["ticker"] in wanted:
+                quotes.append(quote)
+        logger.info("FMP | Fetched quotes; asked=%d answered=%d", len(wanted), len(quotes))
+        return quotes
+
+    def is_etf(self, ticker: str) -> bool | None:
+        """Whether FMP's company profile marks ``ticker`` as an ETF.
+
+        None when FMP has no profile for it (crypto, an unknown symbol) or the
+        flag is missing. One symbol per request: the profile endpoint does not
+        accept a list.
+        """
+        rows = self._request_list(PROFILE_ENDPOINT, {"symbol": ticker}, label=f"profile for {ticker}")
+        flag = rows[0].get("isEtf") if rows else None
+        return flag if isinstance(flag, bool) else None
 
     def get_historical_data(self, tickers, from_date, to_date) -> list[dict]:
         """Daily OHLCV records for each symbol; both exchange dates inclusive."""
