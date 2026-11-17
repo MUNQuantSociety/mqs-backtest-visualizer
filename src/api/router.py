@@ -13,6 +13,7 @@ from fastapi import APIRouter
 from src.api.routes import (
     auth,
     backtests,
+    chart_drawings,
     market_context,
     market_data,
     portfolios,
@@ -25,6 +26,7 @@ api_router.include_router(auth.router)
 api_router.include_router(backtests.router)
 api_router.include_router(strategies.router)
 api_router.include_router(market_data.router)
+api_router.include_router(chart_drawings.router)
 api_router.include_router(market_context.router)
 api_router.include_router(portfolios.router)
 api_router.include_router(system.router)
