@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
 from src.api.dependencies import current_user
-from src.api.routes import auth, backtests
+from src.api.routes import auth, backtests, chart_drawings as chart_drawings_api
 from src.api.routes import market_data as market_data_api, strategies as strategies_api
 from src.integrations.cognito import AuthenticationUnavailable, CognitoVerifier, InvalidAccessToken, get_verifier
 from src.models import AppUser, BacktestRun
@@ -167,6 +167,7 @@ def api(monkeypatch, transport):
     app.include_router(auth.router, prefix="/api")
     app.include_router(backtests.router, prefix="/api")
     app.include_router(strategies_api.router, prefix="/api")
+    app.include_router(chart_drawings_api.router, prefix="/api")
     app.include_router(market_data_api.router, prefix="/api")
     with TestClient(app) as client:
         yield client, configuration, mapping
@@ -268,7 +269,8 @@ def test_anonymous_protected_routes_reject_before_service_calls(api):
         ("get", "/api/market-data/validate-tickers?tickers=AAPL"),
         ("get", "/api/market-data/search-symbols?query=AAP"),
         ("get", "/api/market-data/candles?ticker=AAPL&start=2026-03-01&end=2026-03-31"),
-        ("get", "/api/market-data/treasury-rates")):
+        ("get", "/api/market-data/treasury-rates"),
+        ("get", "/api/chart-drawings/AAPL"), ("put", "/api/chart-drawings/AAPL")):
         assert client.request(method, path).status_code == 401, (method, path)
 
 
