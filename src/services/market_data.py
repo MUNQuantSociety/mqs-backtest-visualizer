@@ -42,6 +42,8 @@ from src.schemas.market_data import (
     FmpIndicatorCatalogue,
     FmpIndicatorInfo,
     IndicatorPoint,
+    Quote,
+    QuotesResponse,
     TickerCandlesResponse,
     TreasuryRatesResponse,
     TreasuryYield,
@@ -425,6 +427,113 @@ async def indicator_series_between(
     if not points and not await _symbol_known(wanted):
         raise FMPSymbolUnknown(f"FMP has no symbol {wanted}. Check the ticker.")
     return TickerIndicatorSeriesResponse(ticker=wanted, indicator=name, period=period, points=points)
+
+
+# Quotes for the Stock Screener. Cached per ticker, so a watchlist that gains
+# one symbol costs one fetched quote, not the whole list again. A minute keeps
+# a session's prices current without asking FMP on every refresh. A symbol
+# FMP did not answer for is remembered as missing for the same minute.
+_QUOTE_TTL_SECONDS = 60
+_QUOTE_CACHE_SIZE = 512
+_quote_cache: OrderedDict[str, tuple[float, dict | None]] = OrderedDict()
+_quote_lock = threading.Lock()
+# Whether a symbol is an ETF changes far less often than its price.
+_KIND_TTL_SECONDS = 24 * 3600
+_kind_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+_kind_lock = threading.Lock()
+_quote_clock = time.monotonic
+
+
+def _fmp_quotes(tickers: tuple[str, ...]) -> dict[str, dict | None]:
+    """Each ticker's FMP quote (None when FMP has none), fetching only stale ones."""
+    now = _quote_clock()
+    found: dict[str, dict | None] = {}
+    with _quote_lock:
+        for ticker in tickers:
+            cached = _quote_cache.get(ticker)
+            if cached is not None and cached[0] > now:
+                found[ticker] = cached[1]
+    stale = [ticker for ticker in tickers if ticker not in found]
+    if stale:
+        with _symbol_requests:
+            fetched = {quote["ticker"]: quote for quote in FMPMarketData().get_quotes(stale)}
+        expires = _quote_clock() + _QUOTE_TTL_SECONDS
+        with _quote_lock:
+            for ticker in stale:
+                found[ticker] = fetched.get(ticker)
+                _quote_cache[ticker] = (expires, found[ticker])
+                _quote_cache.move_to_end(ticker)
+            while len(_quote_cache) > _QUOTE_CACHE_SIZE:
+                _quote_cache.popitem(last=False)
+    return found
+
+
+def _asset_kind(ticker: str, exchange: str | None) -> str:
+    """``crypto`` or ``index`` from the quote's exchange, else ``etf`` or ``stock`` from FMP's profile.
+
+    A profile that cannot be read counts as ``stock`` for this response and is
+    not remembered, so the next request asks again.
+    """
+    venue = (exchange or "").upper()
+    if venue == "CRYPTO":
+        return "crypto"
+    if venue == "INDEX":
+        return "index"
+    with _kind_lock:
+        cached = _kind_cache.get(ticker)
+        if cached is not None and cached[0] > _quote_clock():
+            return cached[1]
+    try:
+        with _symbol_requests:
+            kind = "etf" if FMPMarketData().is_etf(ticker) else "stock"
+    except FMPUnavailable as exc:
+        logger.warning("QUOTES | Profile for %s unavailable; shown as a stock: %s", ticker, exc)
+        return "stock"
+    with _kind_lock:
+        _kind_cache[ticker] = (_quote_clock() + _KIND_TTL_SECONDS, kind)
+        _kind_cache.move_to_end(ticker)
+        while len(_kind_cache) > _QUOTE_CACHE_SIZE:
+            _kind_cache.popitem(last=False)
+    return kind
+
+
+async def quotes_for(tickers: list[str]) -> QuotesResponse:
+    """The latest quote for each ticker, in the order asked, for the Stock Screener.
+
+    Raises:
+        ValueError: no tickers, more than 50, or one that cannot be a symbol.
+        FMPUnavailable: FMP could not answer the quote request.
+    """
+    wanted = normalize_tickers(tickers)
+    found = await asyncio.to_thread(_fmp_quotes, tuple(wanted))
+    answered = [ticker for ticker in wanted if found[ticker] is not None]
+    kinds = await asyncio.gather(
+        *(asyncio.to_thread(_asset_kind, ticker, found[ticker]["exchange"]) for ticker in answered)
+    )
+    quotes = []
+    for ticker, kind in zip(answered, kinds):
+        raw = found[ticker]
+        quotes.append(Quote(
+            ticker=ticker,
+            name=raw["name"],
+            exchange=raw["exchange"],
+            kind=kind,
+            price=raw["price"],
+            change=raw["change"],
+            change_ratio=raw["change_ratio"],
+            open=raw["open"],
+            previous_close=raw["previous_close"],
+            day_high=raw["day_high"],
+            day_low=raw["day_low"],
+            year_high=raw["year_high"],
+            year_low=raw["year_low"],
+            volume=raw["volume"],
+            market_cap=raw["market_cap"],
+            average_50=raw["average_50"],
+            average_200=raw["average_200"],
+            as_of=raw["as_of"].isoformat() if raw["as_of"] else None,
+        ))
+    return QuotesResponse(quotes=quotes, missing=[ticker for ticker in wanted if found[ticker] is None])
 
 
 def normalize_tickers(tickers: list[str]) -> list[str]:

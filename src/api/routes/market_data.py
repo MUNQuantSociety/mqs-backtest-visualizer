@@ -15,6 +15,7 @@ from src.api.dependencies.current_user import require_current_user
 from src.schemas.market_data import (
     CoverageResponse,
     FmpIndicatorCatalogue,
+    QuotesResponse,
     SymbolSearchResponse,
     TickerCandlesResponse,
     TreasuryRatesResponse,
@@ -114,6 +115,26 @@ async def get_candles(
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except FMPSymbolUnknown as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from None
+    except FMPUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+
+@router.get("/quotes", response_model=QuotesResponse)
+async def get_quotes(
+    tickers: str = Query(max_length=1100, description="1 to 50 comma-separated tickers, e.g. AAPL,SPY."),
+    _owner_id: uuid.UUID = Depends(require_current_user),
+) -> QuotesResponse:
+    """The latest FMP quote for each ticker: the Stock Screener's rows.
+
+    Price, change against the previous close (as a ratio), day and 52-week
+    range, volume and market cap, grouped by ``kind`` (stock, ETF, index, crypto).
+    Tickers FMP has no quote for are listed in ``missing``. Gated like the
+    other routes that spend provider quota; a provider failure is a 503.
+    """
+    try:
+        return await market_data_service.quotes_for(tickers.split(","))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
     except FMPUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
 
